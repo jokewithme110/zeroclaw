@@ -87,6 +87,10 @@ impl Tool for SkillHttpTool {
         self.build_parameters_schema()
     }
 
+    fn is_skill_derived_tool(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let url = self.substitute_args(&args);
 

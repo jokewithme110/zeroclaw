@@ -888,6 +888,7 @@ pub fn skills_to_tools(
                         &skill.name,
                         tool,
                         security.clone(),
+                        skill.location.as_deref(),
                     )));
                 }
                 "http" => {
