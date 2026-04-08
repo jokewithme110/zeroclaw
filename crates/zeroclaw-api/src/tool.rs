@@ -40,4 +40,9 @@ pub trait Tool: Send + Sync {
             parameters: self.parameters_schema(),
         }
     }
+    /// True when this tool is generated from a skill `[[tools]]` entry (shell/http).
+    #[inline]
+    fn is_skill_derived_tool(&self) -> bool {
+        false
+    }
 }

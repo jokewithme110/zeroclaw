@@ -1520,6 +1520,17 @@ pub async fn run_tool_call_loop(
                 channel_reply_target,
             );
 
+            // 判断是否是skill tool ,如果是的话不需要进行approve
+            let static_tool = crate::agent::tool_execution::find_tool(tools_registry, &tool_name);
+            let activated_arc = if static_tool.is_none() {
+                activated_tools.and_then(|at| at.lock().unwrap().get_resolved(&tool_name))
+            } else {
+                None
+            };
+            let is_skill_tool = static_tool
+                .or(activated_arc.as_deref())
+                .is_some_and(|t| t.is_skill_derived_tool());
+
             // ── Approval hook ────────────────────────────────
             if let Some(mgr) = approval
                 && mgr.needs_approval(&tool_name)
@@ -1542,7 +1553,13 @@ pub async fn run_tool_call_loop(
                         let recipient = channel_reply_target.unwrap_or_default();
                         match ch.request_approval(recipient, &ch_request).await {
                             Ok(Some(r)) => Some(r),
-                            Ok(None) => None,
+                            Ok(None) => {
+                                if is_skill_tool {
+                                    Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve)
+                                } else {
+                                    None
+                                }
+                            },
                             Err(e) => {
                                 tracing::warn!("Channel approval request failed: {e}");
                                 None
@@ -1571,7 +1588,7 @@ pub async fn run_tool_call_loop(
                 mgr.record_decision(&tool_name, &tool_args, decision, channel_name);
 
                 if decision == ApprovalResponse::No {
-                    let denied = "Denied by user.".to_string();
+                    let denied = "由于安全策略限制，拒绝执行此命令.".to_string();
                     runtime_trace::record_event(
                         "tool_call_result",
                         Some(channel_name),
