@@ -10,6 +10,7 @@
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolResult};
@@ -26,6 +27,7 @@ pub struct SkillShellTool {
     command_template: String,
     args: HashMap<String, String>,
     security: Arc<SecurityPolicy>,
+    execution_dir: PathBuf,
 }
 
 impl SkillShellTool {
@@ -37,13 +39,20 @@ impl SkillShellTool {
         skill_name: &str,
         tool: &crate::skills::SkillTool,
         security: Arc<SecurityPolicy>,
+        skill_location: Option<&std::path::Path>,
     ) -> Self {
+        let execution_dir = skill_location
+            .and_then(std::path::Path::parent)
+            .map(|path| path.to_path_buf())
+            .unwrap_or_else(|| security.workspace_dir.clone());
+
         Self {
             tool_name: format!("{}__{}", skill_name, tool.name),
             tool_description: tool.description.clone(),
             command_template: tool.command.clone(),
             args: tool.args.clone(),
             security,
+            execution_dir,
         }
     }
 
@@ -98,6 +107,10 @@ impl Tool for SkillShellTool {
         self.build_parameters_schema()
     }
 
+    fn is_skill_derived_tool(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let command = self.substitute_args(&args);
 
@@ -131,7 +144,7 @@ impl Tool for SkillShellTool {
         // Build and execute the command
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c").arg(&command);
-        cmd.current_dir(&self.security.workspace_dir);
+        cmd.current_dir(&self.execution_dir);
         cmd.env_clear();
 
         // Only pass safe environment variables
@@ -339,6 +352,13 @@ mod tests {
         })
     }
 
+    fn skill_location() -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join("skills")
+            .join("my_skill")
+            .join("SKILL.toml")
+    }
+
     fn sample_skill_tool() -> SkillTool {
         let mut args = HashMap::new();
         args.insert("file".to_string(), "The file to lint".to_string());
@@ -355,6 +375,9 @@ mod tests {
             args,
             target: None,
             locked_args: HashMap::new(),
+            method: None,
+            headers: HashMap::new(),
+            body: None,
         }
     }
 
@@ -366,13 +389,25 @@ mod tests {
 
     #[test]
     fn skill_shell_tool_description() {
-        let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security());
+        let location = skill_location();
+        let tool = SkillShellTool::new(
+            "my_skill",
+            &sample_skill_tool(),
+            test_security(),
+            Some(location.as_path()),
+        );
         assert_eq!(tool.description(), "Run the linter on a file");
     }
 
     #[test]
     fn skill_shell_tool_parameters_schema() {
-        let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security());
+        let location = skill_location();
+        let tool = SkillShellTool::new(
+            "my_skill",
+            &sample_skill_tool(),
+            test_security(),
+            Some(location.as_path()),
+        );
         let schema = tool.parameters_schema();
 
         assert_eq!(schema["type"], "object");
@@ -388,7 +423,13 @@ mod tests {
 
     #[test]
     fn skill_shell_tool_substitute_args() {
-        let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security());
+        let location = skill_location();
+        let tool = SkillShellTool::new(
+            "my_skill",
+            &sample_skill_tool(),
+            test_security(),
+            Some(location.as_path()),
+        );
         let result = tool.substitute_args(&serde_json::json!({
             "file": "src/main.rs",
             "format": "json"
@@ -398,7 +439,13 @@ mod tests {
 
     #[test]
     fn skill_shell_tool_substitute_missing_arg() {
-        let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security());
+        let location = skill_location();
+        let tool = SkillShellTool::new(
+            "my_skill",
+            &sample_skill_tool(),
+            test_security(),
+            Some(location.as_path()),
+        );
         let result = tool.substitute_args(&serde_json::json!({"file": "test.rs"}));
         // Missing {{format}} placeholder stays in the command
         assert!(result.contains("{{format}}"));
@@ -415,8 +462,12 @@ mod tests {
             args: HashMap::new(),
             target: None,
             locked_args: HashMap::new(),
+            method: None,
+            headers: HashMap::new(),
+            body: None,
         };
-        let tool = SkillShellTool::new("s", &st, test_security());
+        let location = skill_location();
+        let tool = SkillShellTool::new("s", &st, test_security(), Some(location.as_path()));
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"].as_object().unwrap().is_empty());
@@ -433,8 +484,12 @@ mod tests {
             args: HashMap::new(),
             target: None,
             locked_args: HashMap::new(),
+            method: None,
+            headers: HashMap::new(),
+            body: None,
         };
-        let tool = SkillShellTool::new("test", &st, test_security());
+        let location = skill_location();
+        let tool = SkillShellTool::new("test", &st, test_security(), Some(location.as_path()));
         let result = tool.execute(serde_json::json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("hello-skill"));
@@ -442,7 +497,13 @@ mod tests {
 
     #[test]
     fn skill_shell_tool_spec_roundtrip() {
-        let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security());
+        let location = skill_location();
+        let tool = SkillShellTool::new(
+            "my_skill",
+            &sample_skill_tool(),
+            test_security(),
+            Some(location.as_path()),
+        );
         let spec = tool.spec();
         assert_eq!(spec.name, "my_skill__run_lint");
         assert_eq!(spec.description, "Run the linter on a file");

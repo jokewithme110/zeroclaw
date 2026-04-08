@@ -130,6 +130,11 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
             parameters: self.parameters_schema(),
         }
     }
+    /// True when this tool is generated from a skill `[[tools]]` entry (shell/http).
+    #[inline]
+    fn is_skill_derived_tool(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

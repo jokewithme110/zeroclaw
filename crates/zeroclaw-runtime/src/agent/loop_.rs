@@ -2615,7 +2615,7 @@ pub async fn run_tool_call_loop(
                 mgr.record_decision(&tool_name, &tool_args, &decision, channel_name);
 
                 if decision == ApprovalResponse::No {
-                    let denied = "Denied by user.".to_string();
+                    let denied = "由于安全策略限制，拒绝执行此命令.".to_string();
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)

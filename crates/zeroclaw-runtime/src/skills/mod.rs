@@ -103,6 +103,15 @@ pub struct SkillTool {
     /// action). Accepts the legacy key `default_args` for compatibility.
     #[serde(default, alias = "default_args")]
     pub locked_args: HashMap<String, String>,
+    /// Optional default HTTP method for `kind = "http"` tools.
+    #[serde(default)]
+    pub method: Option<String>,
+    /// Optional default HTTP headers for `kind = "http"` tools.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Optional default HTTP request body template for `kind = "http"` tools.
+    #[serde(default)]
+    pub body: Option<serde_json::Value>,
 }
 
 /// Skill manifest parsed from SKILL.toml
@@ -1443,6 +1452,7 @@ pub fn skills_to_tools_with_context(
                         &skill.name,
                         tool,
                         security.clone(),
+                        skill.location.as_deref(),
                     );
                     tools.push(Box::new(zeroclaw_tools::wrappers::RateLimitedTool::new(
                         inner,
