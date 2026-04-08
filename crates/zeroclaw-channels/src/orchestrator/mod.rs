@@ -5188,10 +5188,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let deferred_section = deferred_wire_out.deferred_prompt_section;
     let ch_activated_handle = deferred_wire_out.activated_tools;
 
-    let tools_registry = Arc::new(built_tools);
-
     let skills = zeroclaw_runtime::skills::load_skills_with_config(&workspace, &config);
+    zeroclaw_runtime::tools::register_skill_tools(&mut built_tools, &skills, security.clone());
 
+    let tools_registry = Arc::new(built_tools);
     // ── Load locale-aware tool descriptions ────────────────────────
     let i18n_locale = config
         .locale
