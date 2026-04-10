@@ -1013,6 +1013,19 @@ impl DelegateTool {
         self.cancellation_token.cancel();
     }
 
+    /// Skills directory for this delegate profile (scoped or workspace default).
+    fn delegate_skills_directory(
+        agent_config: &DelegateAgentConfig,
+        workspace_dir: &Path,
+    ) -> PathBuf {
+        agent_config
+            .skills_directory
+            .as_ref()
+            .filter(|s| !s.trim().is_empty())
+            .map(|dir| workspace_dir.join(dir))
+            .unwrap_or_else(|| crate::skills::skills_dir(workspace_dir))
+    }
+
     /// Build an enriched system prompt for a sub-agent by composing structured
     /// operational sections (tools, skills, workspace, datetime, shell policy)
     /// with the operator-configured `system_prompt` string.
@@ -1022,15 +1035,8 @@ impl DelegateTool {
         sub_tools: &[Box<dyn Tool>],
         workspace_dir: &Path,
     ) -> Option<String> {
-        // Resolve skills directory: scoped if configured, otherwise workspace default.
-        let skills_dir = agent_config
-            .skills_directory
-            .as_ref()
-            .filter(|s| !s.trim().is_empty())
-            .map(|dir| workspace_dir.join(dir))
-            .unwrap_or_else(|| crate::skills::skills_dir(workspace_dir));
+        let skills_dir = Self::delegate_skills_directory(agent_config, workspace_dir);
         let skills = crate::skills::load_skills_from_directory(&skills_dir, false);
-
         // Determine shell policy instructions when the `shell` tool is in the
         // effective tool list.
         let has_shell = sub_tools.iter().any(|t| t.name() == "shell");
@@ -1112,7 +1118,7 @@ impl DelegateTool {
             .filter(|name| !name.is_empty())
             .collect::<std::collections::HashSet<_>>();
 
-        let sub_tools: Vec<Box<dyn Tool>> = {
+        let mut sub_tools: Vec<Box<dyn Tool>> = {
             let parent_tools = self.parent_tools.read();
             parent_tools
                 .iter()
@@ -1132,6 +1138,10 @@ impl DelegateTool {
                 )),
             });
         }
+
+        let skills_dir = Self::delegate_skills_directory(agent_config, &self.workspace_dir);
+        let skills = crate::skills::load_skills_from_directory(&skills_dir, false);
+        crate::tools::register_skill_tools(&mut sub_tools, &skills, self.security.clone());
 
         // Build enriched system prompt with tools, skills, workspace, datetime context.
         let enriched_system_prompt =
