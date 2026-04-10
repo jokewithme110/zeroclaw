@@ -251,6 +251,9 @@ mod tests {
             kind: "shell".to_string(),
             command: "lint --file {{file}} --format {{format}}".to_string(),
             args,
+            method: None,
+            headers: HashMap::new(),
+            body: None,
         }
     }
 
@@ -339,6 +342,9 @@ mod tests {
             kind: "shell".to_string(),
             command: "echo hello".to_string(),
             args: HashMap::new(),
+            method: None,
+            headers: HashMap::new(),
+            body: None,
         };
         let location = skill_location();
         let tool = SkillShellTool::new("s", &st, test_security(), Some(location.as_path()));
@@ -356,6 +362,9 @@ mod tests {
             kind: "shell".to_string(),
             command: "echo hello-skill".to_string(),
             args: HashMap::new(),
+            method: None,
+            headers: HashMap::new(),
+            body: None,
         };
         let location = skill_location();
         let tool = SkillShellTool::new("test", &st, test_security(), Some(location.as_path()));

@@ -58,6 +58,15 @@ pub struct SkillTool {
     pub command: String,
     #[serde(default)]
     pub args: HashMap<String, String>,
+    /// Optional default HTTP method for `kind = "http"` tools.
+    #[serde(default)]
+    pub method: Option<String>,
+    /// Optional default HTTP headers for `kind = "http"` tools.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Optional default HTTP request body template for `kind = "http"` tools.
+    #[serde(default)]
+    pub body: Option<serde_json::Value>,
 }
 
 /// Skill manifest parsed from SKILL.toml
