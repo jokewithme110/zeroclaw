@@ -291,6 +291,8 @@ pub enum StreamDelta {
     Text(String),
     /// Ephemeral tool progress (not part of the response body).
     Status(String),
+    /// Model reasoning / chain-of-thought delta (from `StreamChunk::reasoning`).
+    Reasoning(String),
 }
 
 /// Backwards-compatible alias while callers are migrated.
@@ -526,6 +528,7 @@ pub fn is_model_switch_requested(err: &anyhow::Error) -> Option<(String, String)
 #[derive(Debug, Default)]
 struct StreamedChatOutcome {
     response_text: String,
+    reasoning_text: String,
     tool_calls: Vec<ToolCall>,
     forwarded_live_deltas: bool,
 }
@@ -580,6 +583,20 @@ async fn consume_provider_streaming_response(
                 // do not affect the agent's tool dispatch loop.
             }
             StreamEvent::TextDelta(chunk) => {
+                if let Some(ref reasoning_delta) = chunk.reasoning {
+                    if !reasoning_delta.is_empty() {
+                        outcome.reasoning_text.push_str(reasoning_delta);
+                        if let Some(tx) = delta_sender {
+                            if tx
+                                .send(StreamDelta::Reasoning(reasoning_delta.clone()))
+                                .await
+                                .is_err()
+                            {
+                                delta_sender = None;
+                            }
+                        }
+                    }
+                }
                 if chunk.delta.is_empty() {
                     continue;
                 }
@@ -1049,8 +1066,7 @@ pub async fn run_tool_call_loop(
         };
         let should_consume_provider_stream = on_delta.is_some()
             && provider.supports_streaming()
-            && (request_tools.is_none() || provider.supports_streaming_tool_events())
-            && channel_name != "webchat";
+            && (request_tools.is_none() || provider.supports_streaming_tool_events());
 
         tracing::debug!(
             has_on_delta = on_delta.is_some(),
@@ -1079,7 +1095,11 @@ pub async fn run_tool_call_loop(
                         text: Some(streamed.response_text),
                         tool_calls: streamed.tool_calls,
                         usage: None,
-                        reasoning_content: None,
+                        reasoning_content: if streamed.reasoning_text.is_empty() {
+                            None
+                        } else {
+                            Some(streamed.reasoning_text)
+                        },
                     })
                 }
                 Err(stream_err) => {
@@ -2784,6 +2804,14 @@ pub async fn run(
                             content_streamed_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                             print!("{text}");
                             let _ = std::io::stdout().flush();
+                        }
+                        StreamDelta::Reasoning(text) => {
+                            if is_tty {
+                                let _ = write!(std::io::stderr(), "\x1b[35m{text}\x1b[0m");
+                            } else {
+                                let _ = write!(std::io::stderr(), "{text}");
+                            }
+                            let _ = std::io::stderr().flush();
                         }
                     }
                 }
@@ -5628,6 +5656,7 @@ mod tests {
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
+                StreamDelta::Reasoning(_) => {}
             }
         }
 
@@ -5697,6 +5726,7 @@ mod tests {
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
+                DraftEvent::Reasoning(_) => {}
             }
         }
 
@@ -5773,6 +5803,7 @@ mod tests {
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
+                StreamDelta::Reasoning(_) => {}
             }
         }
 
@@ -5858,6 +5889,7 @@ mod tests {
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
+                DraftEvent::Reasoning(_) => {}
             }
         }
 

@@ -2,7 +2,6 @@ use zeroclaw_config::schema::Config;
 
 use std::fmt::Write;
 use std::path::Path;
-use zeroclaw_providers::Provider;
 use zeroclaw_runtime::agent::system_prompt::load_openclaw_bootstrap_files;
 use zeroclaw_runtime::dt_nodes_registry::{ConnectedNodeRegistry, NodeRegistry};
 use zeroclaw_runtime::skills::{load_skills_with_config, skills_to_prompt_with_mode};

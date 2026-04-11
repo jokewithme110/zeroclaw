@@ -2818,49 +2818,53 @@ async fn process_channel_message(
         }
     }
 
-    // ── Reply-intent precheck ────────────────────────────────────────
-    let reply_intent = classify_channel_reply_intent(
-        active_provider.as_ref(),
-        history[0].content.as_str(),
-        &history,
-        route.model.as_str(),
-        runtime_defaults.temperature,
-    )
-    .await
-    .unwrap_or(AssistantChannelOutcome::Reply(String::new()));
+    if ctx.prompt_config.channels.precheck_reply_intent {
+        // ── Reply-intent precheck ────────────────────────────────────────
+        let reply_intent = classify_channel_reply_intent(
+            active_provider.as_ref(),
+            history[0].content.as_str(),
+            &history,
+            route.model.as_str(),
+            runtime_defaults.temperature,
+        )
+        .await
+        .unwrap_or(AssistantChannelOutcome::Reply(String::new()));
 
-    if let AssistantChannelOutcome::NoReply { reason } = reply_intent {
-        let history_response = AssistantChannelOutcome::NoReply {
-            reason: reason.clone(),
+        if let AssistantChannelOutcome::NoReply { reason } = reply_intent {
+            let history_response = AssistantChannelOutcome::NoReply {
+                reason: reason.clone(),
+            }
+            .history_marker();
+            append_sender_turn(
+                ctx.as_ref(),
+                &history_key,
+                ChatMessage::assistant(&history_response),
+            );
+            runtime_trace::record_event(
+                "channel_message_no_reply",
+                Some(msg.channel.as_str()),
+                Some(route.provider.as_str()),
+                Some(route.model.as_str()),
+                None,
+                Some(true),
+                reason.as_deref(),
+                serde_json::json!({
+                    "sender": msg.sender,
+                    "elapsed_ms": started_at.elapsed().as_millis(),
+                    "phase": "precheck",
+                }),
+            );
+            println!(
+                "  🤖 No reply ({}ms): {}",
+                started_at.elapsed().as_millis(),
+                reason.as_deref().unwrap_or("no reason provided")
+            );
+            if let Some(channel) = target_channel.as_ref() {
+                let _ = channel.finalize_draft(&msg.reply_target, "", "").await;
+            }
+            return;
         }
-        .history_marker();
-        append_sender_turn(
-            ctx.as_ref(),
-            &history_key,
-            ChatMessage::assistant(&history_response),
-        );
-        runtime_trace::record_event(
-            "channel_message_no_reply",
-            Some(msg.channel.as_str()),
-            Some(route.provider.as_str()),
-            Some(route.model.as_str()),
-            None,
-            Some(true),
-            reason.as_deref(),
-            serde_json::json!({
-                "sender": msg.sender,
-                "elapsed_ms": started_at.elapsed().as_millis(),
-                "phase": "precheck",
-            }),
-        );
-        println!(
-            "  🤖 No reply ({}ms): {}",
-            started_at.elapsed().as_millis(),
-            reason.as_deref().unwrap_or("no reason provided")
-        );
-        return;
     }
-
     let use_draft_streaming = target_channel
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates());
@@ -2902,6 +2906,15 @@ async fn process_channel_message(
         None
     };
 
+    let target_channel_clone = target_channel.clone();
+    let webchat_support_reasoning = ctx
+        .prompt_config
+        .channels
+        .webchat
+        .as_ref()
+        .map(|wc| wc.support_reasoning)
+        .unwrap_or(false);
+
     // Spawn the appropriate handler for the delta channel.
     let draft_updater = if use_draft_streaming {
         // Partial: accumulate text and edit a single draft message.
@@ -2927,14 +2940,30 @@ async fn process_channel_message(
                                 tracing::debug!("Draft progress update failed: {e}");
                             }
                         }
-                        StreamDelta::Text(text) => {
-                            accumulated.push_str(&text);
-                            let visible = strip_think_tags_inline(&accumulated);
+                        StreamDelta::Reasoning(text) => {
                             if let Err(e) = channel
-                                .update_draft(&reply_target, &draft_id, &visible)
+                                .update_draft_reasoning(&reply_target, &draft_id, &text)
                                 .await
                             {
-                                tracing::debug!("Draft update failed: {e}");
+                                tracing::debug!("Draft reasoning update failed: {e}");
+                            }
+                        }
+                        StreamDelta::Text(text) => {
+                            if target_channel_clone
+                                .as_ref()
+                                .is_some_and(|ch| ch.name() == "webchat")
+                                && webchat_support_reasoning
+                            {
+                                let _ = channel.update_draft(&reply_target, &draft_id, &text).await;
+                            } else {
+                                accumulated.push_str(&text);
+                                let visible = strip_think_tags_inline(&accumulated);
+                                if let Err(e) = channel
+                                    .update_draft(&reply_target, &draft_id, &visible)
+                                    .await
+                                {
+                                    tracing::debug!("Draft update failed: {e}");
+                                }
                             }
                         }
                     }
@@ -4575,6 +4604,7 @@ fn collect_configured_channels(
                 wc.listen_path.clone(),
                 wc.callback_url.clone(),
                 wc.callback_auth_header.clone(),
+                wc.support_reasoning,
                 config.gateway.require_pairing,
                 config.gateway.paired_tokens.clone(),
             )),
