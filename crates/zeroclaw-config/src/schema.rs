@@ -6889,6 +6889,11 @@ pub struct ChannelsConfig {
     /// not forwarded as individual channel messages. Default: `false`.
     #[serde(default = "default_false")]
     pub show_tool_calls: bool,
+    /// Whether to run reply-intent precheck (NO_REPLY classifier) before the
+    /// main LLM/tool loop for channel messages. When `true`, precheck is enabled.
+    /// Default: `false`.
+    #[serde(default = "default_false")]
+    pub precheck_reply_intent: bool,
     /// Persist channel conversation history to JSONL files so sessions survive
     /// daemon restarts. Files are stored in `{workspace}/sessions/`. Default: `true`.
     #[serde(default = "default_true")]
@@ -7112,6 +7117,7 @@ impl Default for ChannelsConfig {
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
             show_tool_calls: false,
+            precheck_reply_intent: false,
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
@@ -7507,18 +7513,17 @@ pub struct WebchatConfig {
     /// URL path to listen on (default: `/webchat`).
     #[serde(default)]
     pub listen_path: Option<String>,
-    /// Whether streaming draft updates should be cumulative ("stacked").
-    ///
-    /// - `true`: each `update_draft` carries the full accumulated text.
-    /// - `false` (default): each `update_draft` carries only the latest delta chunk.
-    #[serde(default = "default_false")]
-    pub stack_draft_updates: bool,
     /// Optional URL to POST the final response to when not streaming.
     #[serde(default)]
     pub callback_url: Option<String>,
     /// Optional `Authorization` header value for callback requests.
     #[serde(default)]
     pub callback_auth_header: Option<String>,
+    /// When `true`, streaming/callback chunks may include model chain-of-thought
+    /// (`delta.reasoning_content`, top-level `is_thinking` on chunks from reasoning updates).
+    /// Default: `false` (only plain `content` deltas).
+    #[serde(default)]
+    pub support_reasoning: bool,
 }
 
 impl ChannelConfig for WebchatConfig {

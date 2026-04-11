@@ -2312,7 +2312,12 @@ impl Provider for OpenAiCompatibleProvider {
         };
 
         let payload = match payload {
-            Ok(payload) => payload,
+            Ok(mut payload) => {
+                if let serde_json::Value::Object(ref mut map) = payload {
+                    map.insert("enable_thinking".to_string(), serde_json::Value::Bool(true));
+                }
+                payload
+            }
             Err(error) => {
                 return stream::once(async move { Err(StreamError::Json(error)) }).boxed();
             }
