@@ -2268,7 +2268,7 @@ impl Provider for OpenAiCompatibleProvider {
 
         let tools = Self::convert_tool_specs(request.tools);
         let payload = if has_tools {
-            serde_json::to_value(NativeChatRequest {
+           serde_json::to_value(NativeChatRequest {
                 model: model.to_string(),
                 messages: Self::convert_messages_for_native(&effective_messages, !merge),
                 temperature,
@@ -2312,7 +2312,12 @@ impl Provider for OpenAiCompatibleProvider {
         };
 
         let payload = match payload {
-            Ok(payload) => payload,
+            Ok(mut payload) => {
+                if let serde_json::Value::Object(ref mut map) = payload {
+                    map.insert("enable_thinking".to_string(), serde_json::Value::Bool(true));
+                }
+                payload
+            }
             Err(error) => {
                 return stream::once(async move { Err(StreamError::Json(error)) }).boxed();
             }
