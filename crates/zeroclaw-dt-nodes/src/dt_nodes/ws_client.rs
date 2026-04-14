@@ -93,8 +93,12 @@ pub async fn run_loop(
             }
         };
         let (mut sink, mut stream) = ws_stream.split();
+        let trace_ctx = NodeTraceCtx {
+            req_id: "node_ws_session",
+            node_id: &identity.device_id,
+        };
         node_runtime_trace::ws_connected(
-            &identity.device_id,
+            &trace_ctx,
             &identity.gateway.host,
             identity.gateway.port,
             attempt,

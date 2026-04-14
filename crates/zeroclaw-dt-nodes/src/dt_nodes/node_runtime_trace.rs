@@ -8,14 +8,15 @@ pub struct NodeTraceCtx<'a> {
     pub node_id: &'a str,
 }
 
-pub fn ws_connected(node_id: &str, gateway_host: &str, gateway_port: u16, attempt: u64) {
+pub fn ws_connected(ctx: &NodeTraceCtx<'_>, gateway_host: &str, gateway_port: u16, attempt: u64) {
     zeroclaw_log::record!(
         INFO,
         zeroclaw_log::Event::new("node", zeroclaw_log::Action::Start)
             .with_category(zeroclaw_log::EventCategory::System)
             .with_outcome(zeroclaw_log::EventOutcome::Success)
             .with_attrs(json!({
-                "node_id": node_id,
+                "req_id": ctx.req_id,
+                "node_id": ctx.node_id,
                 "gateway_host": gateway_host,
                 "gateway_port": gateway_port,
                 "attempt": attempt,

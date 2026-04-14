@@ -35,6 +35,7 @@ pub mod security_ops;
 pub mod send_message_to_peer;
 pub mod shell;
 pub mod skill_http;
+pub mod skill_scan_report;
 pub mod skill_tool;
 pub mod sop_advance;
 pub mod sop_approve;
@@ -160,6 +161,7 @@ pub const REENTRANT_AGENT_TOOLS: &[&str] = &[SpawnSubagentTool::NAME, DelegateTo
 use crate::dt_nodes_registry::ConnectedNodeRegistry;
 use crate::platform::{NativeRuntime, RuntimeAdapter};
 use crate::security::{SecurityPolicy, create_sandbox};
+use crate::tools::skill_scan_report::SkillScanReportTool;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -603,6 +605,13 @@ pub fn all_tools_with_runtime(
     // model out from under the parent (the switch signal is process-wide).
     if is_subagent_caller {
         tool_arcs.retain(|tool| tool.name() != ModelSwitchTool::NAME);
+    }
+
+    if root_config.skills.scan.enabled {
+        tool_arcs.push(Arc::new(SkillScanReportTool::new(
+            workspace_dir.to_path_buf(),
+            root_config.skills.scan.clone(),
+        )));
     }
 
     // Register discord_search if any configured Discord alias has

@@ -1,5 +1,5 @@
 [workspace]
-members = [".","crates/zeroclaw-dt-nodes",  "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-spawn", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
+members = [".","crates/zeroclaw-dt-nodes","crates/zeroclaw-skill-security",  "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-spawn", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
 resolver = "2"
 exclude = ["plugins/image-gen-fal"]
 
@@ -30,6 +30,7 @@ zerocode = { path = "apps/zerocode", version = "0.8.0-beta-2" }
 aardvark-sys = { path = "crates/aardvark-sys", version = "0.1.0" }
 directories = "6.0"
 zeroclaw-dt-nodes = { path = "crates/zeroclaw-dt-nodes", version = "0.8.0" }
+zeroclaw-skill-security = { path = "crates/zeroclaw-skill-security", version = "0.8.0" }
 
 [package]
 name = "zeroclawlabs"
@@ -91,6 +92,7 @@ zeroclaw-hardware = { workspace = true, optional = true }
 zeroclaw-tool-call-parser.workspace = true
 zeroclaw-macros.workspace = true
 zeroclaw-dt-nodes.workspace = true
+zeroclaw-skill-security = { workspace = true, optional = true }
 # CLI - minimal and fast
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
@@ -262,6 +264,7 @@ default = [
 # or individual `channel-*` features.
 agent-runtime = [
     "dep:zeroclaw-runtime", "dep:zeroclaw-channels", "dep:zeroclaw-tools",
+    "dep:zeroclaw-skill-security",
     "dep:rusqlite",
     "dep:ring", "dep:lru", "dep:chrono-tz", "dep:cron", "dep:glob", "dep:which",
     "dep:ratatui", "dep:crossterm",
