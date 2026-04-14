@@ -10,6 +10,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
+use zeroclaw_config::schema::SkillsScanConfig;
+use zeroclaw_skill_security::service::skill_id_from_dir;
+use zeroclaw_skill_security::store::SkillScanStore;
+use zeroclaw_skill_security::types::ScanStatus;
 use zip::ZipArchive;
 
 pub mod audit;
@@ -141,12 +145,67 @@ pub fn load_skills_with_config(
     workspace_dir: &Path,
     config: &zeroclaw_config::schema::Config,
 ) -> Vec<Skill> {
-    load_skills_with_open_skills_config(
+    let skills = load_skills_with_open_skills_config(
         workspace_dir,
         Some(config.skills.open_skills_enabled),
         config.skills.open_skills_dir.as_deref(),
         Some(config.skills.allow_scripts),
-    )
+    );
+    filter_and_scan_skills(workspace_dir, skills, &config.skills.scan)
+}
+
+pub fn filter_and_scan_skills(
+    workspace_dir: &Path,
+    skills: Vec<Skill>,
+    scan_cfg: &SkillsScanConfig,
+) -> Vec<Skill> {
+    if !scan_cfg.enabled {
+        return skills;
+    }
+    let store = match SkillScanStore::load(workspace_dir) {
+        Ok(store) => store,
+        Err(err) => {
+            tracing::warn!("skill scan: failed to load scan state; blocking all skills: {err}");
+            return Vec::new();
+        }
+    };
+
+    let mut out = Vec::new();
+    for skill in skills {
+        let Some(skill_dir) = skill_dir_from_skill(&skill) else {
+            tracing::warn!(
+                "skill scan: unable to resolve directory for skill '{}'; skipping",
+                skill.name
+            );
+            continue;
+        };
+        if is_allowed_by_state(&skill_dir, &store) {
+            out.push(skill);
+        } else {
+            tracing::info!(
+                "skill scan: blocked '{}' until background scan allows it",
+                skill_dir.display()
+            );
+        }
+    }
+
+    if let Err(err) = store.save() {
+        tracing::warn!("skill scan: failed to persist state: {err}");
+    }
+    out
+}
+
+fn skill_dir_from_skill(skill: &Skill) -> Option<PathBuf> {
+    let location = skill.location.as_ref()?;
+    location.parent().map(Path::to_path_buf)
+}
+
+fn is_allowed_by_state(skill_dir: &Path, store: &SkillScanStore) -> bool {
+    let skill_id = skill_id_from_dir(skill_dir);
+    let Some(record) = store.get(&skill_id) else {
+        return false;
+    };
+    matches!(record.scan_status, ScanStatus::Allowed)
 }
 
 /// Load skills using explicit open-skills settings.
