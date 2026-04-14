@@ -34,6 +34,7 @@ pub mod schedule;
 pub mod security_ops;
 pub mod shell;
 pub mod skill_http;
+pub mod skill_scan_report;
 pub mod skill_tool;
 pub mod sop_advance;
 pub mod sop_approve;
@@ -146,12 +147,14 @@ pub use verifiable_intent::VerifiableIntentTool;
 use crate::dt_nodes_registry::ConnectedNodeRegistry;
 use crate::platform::{NativeRuntime, RuntimeAdapter};
 use crate::security::{SecurityPolicy, create_sandbox};
+use crate::tools::skill_scan_report::SkillScanReportTool;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use zeroclaw_config::schema::{Config, DelegateAgentConfig};
 use zeroclaw_memory::Memory;
+
 /// Shared handle to the delegate tool's parent-tools list.
 /// Callers can push additional tools (e.g. MCP wrappers) after construction.
 pub type DelegateParentToolsHandle = Arc<RwLock<Vec<Arc<dyn Tool>>>>;
@@ -386,6 +389,13 @@ pub fn all_tools_with_runtime(
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
         Arc::new(ChannelSendTool::new(config.clone(), security.clone())),
     ];
+
+    if root_config.skills.scan.enabled {
+        tool_arcs.push(Arc::new(SkillScanReportTool::new(
+            workspace_dir.to_path_buf(),
+            root_config.skills.scan.clone(),
+        )));
+    }
 
     // Register discord_search if discord_history channel is configured
     if root_config.channels.discord_history.is_some() {

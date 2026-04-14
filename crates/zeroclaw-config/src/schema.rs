@@ -1654,6 +1654,125 @@ fn parse_skills_prompt_injection_mode(raw: &str) -> Option<SkillsPromptInjection
     }
 }
 
+/// Risk severity values returned by skill security scans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "UPPERCASE")]
+pub enum SkillScanSeverity {
+    #[default]
+    Safe,
+    Info,
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl SkillScanSeverity {
+    /// Monotonic risk rank: lower is safer.
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Safe => 0,
+            Self::Info => 1,
+            Self::Low => 2,
+            Self::Medium => 3,
+            Self::High => 4,
+            Self::Critical => 5,
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_uppercase().as_str() {
+            "SAFE" => Some(Self::Safe),
+            "INFO" => Some(Self::Info),
+            "LOW" => Some(Self::Low),
+            "MEDIUM" => Some(Self::Medium),
+            "HIGH" => Some(Self::High),
+            "CRITICAL" => Some(Self::Critical),
+            _ => None,
+        }
+    }
+}
+
+/// Skills security scan API endpoints (`[skills.scan.api]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[prefix = "skills.scan.api"]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct SkillsScanApiConfig {
+    /// Full HTTP URL for the upload endpoint.
+    pub upload_url: String,
+    /// Full HTTP URL for the result endpoint.
+    pub result_url: String,
+}
+
+impl Default for SkillsScanApiConfig {
+    fn default() -> Self {
+        Self {
+            upload_url: "https://skillscan.tokauth.com/oapi/v1/skill-scan/upload".to_string(),
+            result_url: "https://skillscan.tokauth.com/oapi/v1/skill-scan/result".to_string(),
+        }
+    }
+}
+
+/// Skills security scan configuration (`[skills.scan]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "skills.scan"]
+pub struct SkillsScanConfig {
+    /// Enable the external skill security scan gate.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Trigger a full scan cycle at startup.
+    #[serde(default = "default_true")]
+    pub startup_scan: bool,
+    /// Trigger periodic scan cycles.
+    #[serde(default = "default_true")]
+    pub periodic_scan_enabled: bool,
+    /// Interval between periodic scan cycles in seconds.
+    #[serde(default = "default_skill_scan_interval_secs")]
+    pub interval_secs: u64,
+    /// Poll interval for scan task status in seconds.
+    #[serde(default = "default_skill_scan_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    /// Timeout for polling a scan task in seconds.
+    #[serde(default = "default_skill_scan_poll_timeout_secs")]
+    pub poll_timeout_secs: u64,
+    /// Maximum risk severity that can still be loaded.
+    #[serde(default)]
+    pub max_allowed_severity: SkillScanSeverity,
+    /// API endpoint configuration.
+    #[serde(default)]
+    #[nested]
+    pub api: SkillsScanApiConfig,
+}
+
+fn default_skill_scan_interval_secs() -> u64 {
+    3600
+}
+
+fn default_skill_scan_poll_interval_secs() -> u64 {
+    10
+}
+
+fn default_skill_scan_poll_timeout_secs() -> u64 {
+    300
+}
+
+impl Default for SkillsScanConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            startup_scan: true,
+            periodic_scan_enabled: true,
+            interval_secs: default_skill_scan_interval_secs(),
+            poll_interval_secs: default_skill_scan_poll_interval_secs(),
+            poll_timeout_secs: default_skill_scan_poll_timeout_secs(),
+            max_allowed_severity: SkillScanSeverity::Low,
+            api: SkillsScanApiConfig::default(),
+        }
+    }
+}
+
 /// Skills loading configuration (`[skills]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -1683,6 +1802,10 @@ pub struct SkillsConfig {
     #[serde(default)]
     #[nested]
     pub skill_improvement: SkillImprovementConfig,
+    /// Skill scan configuration.
+    #[serde(default)]
+    #[nested]
+    pub scan: SkillsScanConfig,
 }
 
 /// Autonomous skill creation configuration (`[skills.skill_creation]` section).
@@ -11433,6 +11556,7 @@ impl_enum_prop_kind!(
     McpTransport,
     ToolFilterGroupMode,
     SkillsPromptInjectionMode,
+    SkillScanSeverity,
     FirecrawlMode,
     ProxyScope,
     SearchMode,
