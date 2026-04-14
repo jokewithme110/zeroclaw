@@ -208,6 +208,22 @@ pub async fn run(
         tracing::info!("Cron disabled; scheduler supervisor not started");
     }
 
+    if config.skills.scan.enabled {
+        let scan_cfg = config.clone();
+        handles.push(spawn_component_supervisor(
+            "skill-scan",
+            initial_backoff,
+            max_backoff,
+            move || {
+                let cfg = scan_cfg.clone();
+                async move { Box::pin(run_skill_scan_worker(cfg)).await }
+            },
+        ));
+    } else {
+        crate::health::mark_component_ok("skill-scan");
+        tracing::info!("skill-scan disabled; skill-scan supervisor not started");
+    }
+
     println!("🧠 ZeroClaw daemon started");
     println!("   Gateway:  http://{host}:{port}");
     println!("   Components: gateway, channels, heartbeat, scheduler");
@@ -228,6 +244,14 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+
+async fn run_skill_scan_worker(config: Config) -> Result<()> {
+    zeroclaw_skill_security::worker::run_skill_scan_worker(config, || {
+        crate::health::mark_component_ok("skill-scan");
+    })
+    .await
 }
 
 pub fn state_file_path(config: &Config) -> PathBuf {
