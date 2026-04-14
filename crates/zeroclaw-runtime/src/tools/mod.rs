@@ -41,6 +41,7 @@ pub mod sop_execute;
 pub mod sop_list;
 pub mod sop_status;
 pub mod verifiable_intent;
+pub mod skill_scan_report;
 
 // Tool types from zeroclaw-tools (direct imports, no shims)
 pub use zeroclaw_tools::ask_user::AskUserTool;
@@ -113,6 +114,7 @@ pub use zeroclaw_tools::web_search_tool::WebSearchTool;
 pub use zeroclaw_tools::workspace_tool::WorkspaceTool;
 pub use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
 
+
 // Traits from zeroclaw-api
 pub use zeroclaw_api::schema::{CleaningStrategy, SchemaCleanr};
 pub use zeroclaw_api::tool::{Tool, ToolResult, ToolSpec};
@@ -152,6 +154,8 @@ use std::sync::Arc;
 use zeroclaw_config::schema::{Config, DelegateAgentConfig};
 use zeroclaw_memory::Memory;
 use crate::dt_nodes_registry::ConnectedNodeRegistry;
+use crate::tools::skill_scan_report::SkillScanReportTool;
+
 /// Shared handle to the delegate tool's parent-tools list.
 /// Callers can push additional tools (e.g. MCP wrappers) after construction.
 pub type DelegateParentToolsHandle = Arc<RwLock<Vec<Arc<dyn Tool>>>>;
@@ -389,6 +393,13 @@ pub fn all_tools_with_runtime(
             security.clone(),
         )),
     ];
+
+    if root_config.skills.scan.enabled {
+        tool_arcs.push(Arc::new(SkillScanReportTool::new(
+            workspace_dir.to_path_buf(),
+            root_config.skills.scan.clone(),
+        )));
+    }
 
     // Register discord_search if discord_history channel is configured
     if root_config.channels.discord_history.is_some() {

@@ -12335,8 +12335,26 @@ dependencies = [
  "zeroclaw-memory",
  "zeroclaw-plugins",
  "zeroclaw-providers",
+ "zeroclaw-skill-security",
  "zeroclaw-tool-call-parser",
  "zeroclaw-tools",
+ "zip",
+]
+
+[[package]]
+name = "zeroclaw-skill-security"
+version = "0.7.3"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "zeroclaw-config",
  "zip",
 ]
 
@@ -12503,6 +12521,7 @@ dependencies = [
  "zeroclaw-plugins",
  "zeroclaw-providers",
  "zeroclaw-runtime",
+ "zeroclaw-skill-security",
  "zeroclaw-tool-call-parser",
  "zeroclaw-tools",
  "zeroclaw-tui",
