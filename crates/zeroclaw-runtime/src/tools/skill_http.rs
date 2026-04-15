@@ -312,14 +312,22 @@ impl Tool for SkillHttpTool {
             }
         };
 
-        Ok(ToolResult {
-            success: status.is_success(),
-            output: body,
-            error: if status.is_success() {
-                None
-            } else {
+        let success = status.is_success();
+        let error = if success {
+            None
+        } else {
+            let response_body = body.trim();
+            if response_body.is_empty() {
                 Some(format!("HTTP {}", status))
-            },
+            } else {
+                Some(format!("HTTP {}\nResponse body: {}", status, response_body))
+            }
+        };
+
+        Ok(ToolResult {
+            success,
+            output: body,
+            error,
         })
     }
 }
