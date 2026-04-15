@@ -1452,13 +1452,13 @@ pub async fn run_tool_call_loop(
         // the structured call payload; relay it to draft-capable channels.
         if !display_text.is_empty() {
             if !native_tool_calls.is_empty()
-                && let Some(ref tx) = on_delta
+                && let Some(ref _tx) = on_delta
             {
                 let mut narration = display_text.clone();
                 if !narration.ends_with('\n') {
                     narration.push('\n');
                 }
-                let _ = tx.send(StreamDelta::Text(narration)).await;
+                // let _ = tx.send(StreamDelta::Text(narration)).await;
             }
             if !silent {
                 print!("{display_text}");

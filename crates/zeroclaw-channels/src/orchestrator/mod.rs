@@ -613,6 +613,7 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
     }
 }
 
+#[allow(unused)]
 fn build_channel_system_prompt(
     base_prompt: &str,
     channel_name: &str,
@@ -2452,20 +2453,6 @@ fn spawn_scoped_typing_task(
             tracing::debug!("Failed to stop typing on {}: {e}", channel.name());
         }
     })
-}
-
-fn render_channel_error(err: &anyhow::Error) -> String {
-    let raw = err.to_string();
-    // Fallback: don't dump raw provider JSON to users.
-    let lower = raw.to_lowercase();
-    if raw.contains("429")
-        || (lower.contains("too many requests") && lower.contains("429"))
-        || (lower.contains("rate") && lower.contains("limit"))
-    {
-        return "⚠️ 请求过于频繁（429）。请稍后再试。".to_string();
-    }
-
-    "⚠️ 模型调用失败，请稍后再试。".to_string()
 }
 
 async fn process_channel_message(
