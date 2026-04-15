@@ -41,7 +41,7 @@ pub async fn build_channel_system_prompt(
 
     inject_a2a_prompt(&mut prompt, config, &config.workspace_dir);
 
-    inject_runtime_prompt(&mut prompt, model, config);
+    inject_runtime_prompt(&mut prompt, model);
 
     inject_channel_delivery_instructions_prompt(&mut prompt, channel_name);
 
@@ -126,7 +126,7 @@ fn inject_current_date_time_prompt(prompt: &mut String) {
     );
 }
 
-fn inject_runtime_prompt(prompt: &mut String, model_name: &str, config: &Config) {
+fn inject_runtime_prompt(prompt: &mut String, model_name: &str) {
     let host =
         hostname::get().map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().to_string());
 

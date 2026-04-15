@@ -120,6 +120,7 @@ impl HttpRequestTool {
         result
     }
 
+    #[allow(unused)]
     fn redact_headers_for_display(headers: &[(String, String)]) -> Vec<(String, String)> {
         headers
             .iter()
