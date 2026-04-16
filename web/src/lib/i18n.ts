@@ -13,6 +13,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.dashboard': '仪表盘',
     'nav.agent': '智能体',
     'nav.tools': '工具',
+    'nav.skills': '技能',
     'nav.cron': '定时任务',
     'nav.integrations': '集成',
     'nav.memory': '记忆',
@@ -76,6 +77,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'tools.version': '版本',
     'tools.category': '类别',
     'tools.load_error': '加载工具失败',
+
+    // Skills
+    'skills.title': '技能库',
+    'skills.search': '搜索技能...',
+    'skills.empty': '暂未发现技能。',
+    'skills.count': '技能总数',
+    'skills.tools': '包含的工具',
 
     // Cron
     'cron.title': '定时任务',
@@ -441,6 +449,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.dashboard': 'Dashboard',
     'nav.agent': 'Agent',
     'nav.tools': 'Tools',
+    'nav.skills': 'Skills',
     'nav.cron': 'Scheduled Jobs',
     'nav.integrations': 'Integrations',
     'nav.memory': 'Memory',
