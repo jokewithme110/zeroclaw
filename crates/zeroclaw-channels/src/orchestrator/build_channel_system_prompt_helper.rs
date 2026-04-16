@@ -2,16 +2,24 @@ use zeroclaw_config::schema::Config;
 
 use std::fmt::Write;
 use std::path::Path;
+use zeroclaw_providers::Provider;
 use zeroclaw_runtime::agent::system_prompt::load_openclaw_bootstrap_files;
 use zeroclaw_runtime::dt_nodes_registry::{ConnectedNodeRegistry, NodeRegistry};
+use zeroclaw_runtime::skills::{load_skills_with_config, skills_to_prompt_with_mode};
 
-pub fn build_channel_system_prompt(
+pub async fn build_channel_system_prompt(
     base_prompt: &str,
     config: &Config,
     channel_name: &str,
     reply_target: &str,
+    model: &str,
 ) -> String {
     let mut prompt = String::with_capacity(8192);
+
+    let bootstrap_workspace = config.workspace_dir.clone();
+    let bootstrap_section_fut = tokio::task::spawn_blocking(move || {
+        build_bootstrap_files_prompt_section(bootstrap_workspace.as_path())
+    });
 
     prompt.push_str("You are a personal assistant running inside ZeroClaw.  \n\n");
 
@@ -19,19 +27,22 @@ pub fn build_channel_system_prompt(
 
     inject_tools_prompt(&mut prompt, config, base_prompt);
 
-    inject_skills_prompt(&mut prompt, config);
-
     inject_workspace_prompt(&mut prompt, config);
-
-    inject_bootstrap_files_prompt(&mut prompt, config);
-
-    inject_a2a_prompt(&mut prompt, config, &config.workspace_dir);
 
     inject_current_date_time_prompt(&mut prompt);
 
-    inject_runtime_prompt(&mut prompt, config);
-
     inject_connected_nodes_prompt(&mut prompt, config);
+
+    inject_skills_prompt(&mut prompt, config);
+
+    match bootstrap_section_fut.await {
+        Ok(section) => prompt.push_str(&section),
+        Err(_) => prompt.push_str(&build_bootstrap_files_prompt_section(&config.workspace_dir)),
+    }
+
+    inject_a2a_prompt(&mut prompt, config, &config.workspace_dir);
+
+    inject_runtime_prompt(&mut prompt, model, config);
 
     inject_channel_delivery_instructions_prompt(&mut prompt, channel_name);
 
@@ -46,6 +57,10 @@ fn inject_tools_prompt(prompt: &mut String, config: &Config, base_prompt: &str) 
     if config.agent.parallel_tools {
         prompt.push_str("## Tools \n\n");
         prompt.push_str("Support parallel tool calls. When tools are independent with no dependencies, call them simultaneously in one response. Only call sequentially when there is a clear dependency.\n\n");
+    }
+    if config.plannotebook.enabled {
+        prompt.push_str("## Planning Guidance\n\n");
+        prompt.push_str("For complex or multi-step tasks, prefer to create and use a structured plan before execution. Start with `plan_create`, then use `plan_start` and `plan_step_update` to execute step-by-step, and consult `plan_status` to track progress or blockers.\n\n");
     }
     if config.agent.native_deferred_loading_enabled {
         if let Some(start) = base_prompt.find("## Deferred Tools\n\n") {
@@ -112,15 +127,9 @@ fn inject_current_date_time_prompt(prompt: &mut String) {
     );
 }
 
-fn inject_runtime_prompt(prompt: &mut String, config: &Config) {
+fn inject_runtime_prompt(prompt: &mut String, model_name: &str, config: &Config) {
     let host =
         hostname::get().map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().to_string());
-
-    let model_name = config
-        .providers
-        .fallback_provider()
-        .and_then(|e| e.model.clone())
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4.6".to_string());
 
     let _ = writeln!(
         prompt,
@@ -170,18 +179,19 @@ fn inject_channel_delivery_instructions_prompt(prompt: &mut String, channel_name
     }
 }
 
-fn inject_bootstrap_files_prompt(prompt: &mut String, config: &Config) {
+fn build_bootstrap_files_prompt_section(workspace_dir: &Path) -> String {
     let bootstrap_max_chars = 6000;
-    let workspace_dir = &config.workspace_dir;
-    prompt.push_str("## Project Context\n\n");
-    load_openclaw_bootstrap_files(prompt, workspace_dir, bootstrap_max_chars);
+    let mut section = String::new();
+    section.push_str("## Project Context\n\n");
+    load_openclaw_bootstrap_files(&mut section, workspace_dir, bootstrap_max_chars);
+    section
 }
 
 fn inject_skills_prompt(prompt: &mut String, config: &Config) {
     let workspace = &config.workspace_dir;
-    let skills = zeroclaw_runtime::skills::load_skills_with_config(&workspace, &config);
+    let skills = load_skills_with_config(&workspace, &config);
     if !skills.is_empty() {
-        prompt.push_str(&zeroclaw_runtime::skills::skills_to_prompt_with_mode(
+        prompt.push_str(&skills_to_prompt_with_mode(
             &skills,
             workspace,
             config.skills.prompt_injection_mode,
