@@ -236,6 +236,54 @@ pub async fn handle_api_tools(
     Json(serde_json::json!({"tools": tools})).into_response()
 }
 
+/// GET /api/skills — list discovered skills in the workspace
+pub async fn handle_api_skills(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let skills = zeroclaw_runtime::skills::load_skills_with_config(&config.workspace_dir, &config);
+
+    let skills_json: Vec<serde_json::Value> = skills
+        .into_iter()
+        .map(|skill| {
+            let tools: Vec<serde_json::Value> = skill
+                .tools
+                .into_iter()
+                .map(|tool| {
+                    serde_json::json!({
+                        "name": tool.name,
+                        "description": tool.description,
+                        "kind": tool.kind,
+                        "command": tool.command,
+                        "args": tool.args,
+                        "method": tool.method,
+                        "headers": tool.headers,
+                        "body": tool.body,
+                    })
+                })
+                .collect();
+
+            serde_json::json!({
+                "name": skill.name,
+                "description": skill.description,
+                "version": skill.version,
+                "author": skill.author,
+                "tags": skill.tags,
+                "max_severity": "safe",
+                "tools": tools,
+                "prompts": skill.prompts,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({ "skills": skills_json })).into_response()
+}
+
 /// GET /api/cron — list cron jobs
 pub async fn handle_api_cron_list(
     State(state): State<AppState>,
