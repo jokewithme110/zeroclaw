@@ -12,6 +12,7 @@ import type {
   Session,
   ChannelDetail,
   SessionMessagesResponse,
+  Skill,
 } from '../types/api';
 import { clearToken, getToken, setToken } from './auth';
 import { apiOrigin, basePath } from './basePath';
@@ -339,5 +340,15 @@ export function getChannels(): Promise<ChannelDetail[]> {
 export function getCliTools(): Promise<CliTool[]> {
   return apiFetch<CliTool[] | { cli_tools: CliTool[] }>('/api/cli-tools').then((data) =>
     unwrapField(data, 'cli_tools'),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Skills
+// ---------------------------------------------------------------------------
+
+export function getSkills(): Promise<Skill[]> {
+  return apiFetch<Skill[] | { skills: Skill[] }>('/api/skills').then((data) =>
+    unwrapField(data, 'skills'),
   );
 }

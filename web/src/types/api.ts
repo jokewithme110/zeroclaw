@@ -169,3 +169,25 @@ export interface SessionMessagesResponse {
   messages: SessionMessageRow[];
   session_persistence: boolean;
 }
+
+export interface SkillTool {
+  name: string;
+  description: string;
+  kind: string;
+  command: string;
+  args: Record<string, string>;
+  method?: string | null;
+  headers: Record<string, string>;
+  body?: unknown;
+}
+
+export interface Skill {
+  name: string;
+  description: string;
+  version: string;
+  author?: string | null;
+  tags: string[];
+  max_severity: string;
+  tools: SkillTool[];
+  prompts: string[];
+}

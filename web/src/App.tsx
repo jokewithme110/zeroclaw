@@ -5,6 +5,7 @@ import Layout from './components/layout/Layout';
 import Dashboard from './pages/Dashboard';
 import AgentChat from './pages/AgentChat';
 import Tools from './pages/Tools';
+import Skills from './pages/Skills';
 import Cron from './pages/Cron';
 import Integrations from './pages/Integrations';
 import Memory from './pages/Memory';
@@ -231,6 +232,7 @@ function AppContent() {
             <Route path="/" element={<Dashboard />} />
             <Route path="/agent" element={<AgentChat />} />
             <Route path="/tools" element={<Tools />} />
+            <Route path="/skills" element={<Skills />} />
             <Route path="/cron" element={<Cron />} />
             <Route path="/integrations" element={<Integrations />} />
             <Route path="/memory" element={<Memory />} />
