@@ -84,7 +84,6 @@ pub mod peripherals;
 pub mod platform;
 pub mod providers;
 #[cfg(feature = "agent-runtime")]
-pub mod dt_nodes_registry;
 pub mod rag;
 #[cfg(feature = "agent-runtime")]
 pub mod routines;

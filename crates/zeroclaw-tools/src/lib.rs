@@ -73,3 +73,8 @@ pub mod web_search_provider_routing;
 pub mod web_search_tool;
 pub mod workspace_tool;
 pub mod wrappers;
+pub mod plannotebook;
+pub mod plan_create;
+pub mod plan_start;
+pub mod plan_status;
+pub mod plan_step_update;

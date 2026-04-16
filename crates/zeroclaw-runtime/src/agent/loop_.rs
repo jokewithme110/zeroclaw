@@ -3055,13 +3055,12 @@ pub async fn process_message(
     };
     tools_registry.extend(peripheral_tools);
 
-    let deferred_wire_pm =
-        crate::tools::deferred_wire::wire_deferred_tool_surfaces(
-            &config,
-            &mut tools_registry,
-            delegate_handle_pm.as_ref(),
-        )
-        .await;
+    let deferred_wire_pm = crate::tools::deferred_wire::wire_deferred_tool_surfaces(
+        &config,
+        &mut tools_registry,
+        delegate_handle_pm.as_ref(),
+    )
+    .await;
     let deferred_section = deferred_wire_pm.deferred_prompt_section;
     let activated_handle_pm = deferred_wire_pm.activated_tools;
 

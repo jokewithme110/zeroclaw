@@ -273,6 +273,11 @@ pub struct Config {
     #[nested]
     pub web_fetch: WebFetchConfig,
 
+    /// Plan notebook tool configuration (`[plannotebook]`).
+    #[serde(default)]
+    #[nested]
+    pub plannotebook: PlanNotebookConfig,
+
     /// Link enricher configuration (`[link_enricher]`).
     #[serde(default)]
     #[nested]
@@ -3070,6 +3075,25 @@ pub struct WebFetchConfig {
     #[serde(default)]
     #[nested]
     pub firecrawl: FirecrawlConfig,
+}
+
+/// Plan notebook tool configuration (`[plannotebook]` section).
+///
+/// Controls whether the plan-driven execution tools are exposed to the model:
+/// `plan_create`, `plan_start`, `plan_step_update`, and `plan_status`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "plannotebook"]
+pub struct PlanNotebookConfig {
+    /// Enable PlanNotebook tools (default: false)
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl Default for PlanNotebookConfig {
+    fn default() -> Self {
+        Self { enabled: false }
+    }
 }
 
 /// Firecrawl fallback mode: scrape a single page or crawl linked pages.
@@ -9513,6 +9537,7 @@ impl Default for Config {
             multimodal: MultimodalConfig::default(),
             media_pipeline: MediaPipelineConfig::default(),
             web_fetch: WebFetchConfig::default(),
+            plannotebook: PlanNotebookConfig::default(),
             link_enricher: LinkEnricherConfig::default(),
             text_browser: TextBrowserConfig::default(),
             web_search: WebSearchConfig::default(),
@@ -12128,6 +12153,7 @@ auto_save = true
             multimodal: MultimodalConfig::default(),
             media_pipeline: MediaPipelineConfig::default(),
             web_fetch: WebFetchConfig::default(),
+            plannotebook: PlanNotebookConfig::default(),
             link_enricher: LinkEnricherConfig::default(),
             text_browser: TextBrowserConfig::default(),
             web_search: WebSearchConfig::default(),

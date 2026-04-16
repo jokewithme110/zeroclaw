@@ -187,7 +187,12 @@ fn argv_json_for_trace(argv: &[String]) -> (Value, bool, bool, usize) {
         any_element_truncated |= truncated;
         arr.push(Value::String(piece));
     }
-    (Value::Array(arr), list_truncated, any_element_truncated, total)
+    (
+        Value::Array(arr),
+        list_truncated,
+        any_element_truncated,
+        total,
+    )
 }
 
 fn truncate_trace_arg(s: &str) -> (String, bool) {

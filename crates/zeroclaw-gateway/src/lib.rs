@@ -16,7 +16,6 @@ pub mod api_plugins;
 pub mod api_webauthn;
 pub mod auth_rate_limit;
 pub mod canvas;
-pub mod dt_nodes_registry;
 pub mod hardware_context;
 pub mod mdns;
 pub mod node_tool;
@@ -26,8 +25,9 @@ pub mod sse;
 pub mod static_files;
 pub mod tls;
 pub mod ws;
+pub mod nodes_server;
 
-use dt_nodes_registry::handle_ws_node;
+use nodes_server::handle_ws_node;
 use anyhow::{Context, Result};
 use axum::{
     Router,
