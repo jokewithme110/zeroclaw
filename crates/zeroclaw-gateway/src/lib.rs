@@ -16,11 +16,11 @@ pub mod api_plugins;
 pub mod api_webauthn;
 pub mod auth_rate_limit;
 pub mod canvas;
-pub mod dt_nodes_registry;
 pub mod hardware_context;
 pub mod mdns;
 pub mod node_tool;
 pub mod nodes;
+pub mod nodes_server;
 pub mod session_queue;
 pub mod sse;
 pub mod static_files;
@@ -36,7 +36,8 @@ use axum::{
     response::{IntoResponse, Json},
     routing::{delete, get, post, put},
 };
-use dt_nodes_registry::handle_ws_node;
+
+use nodes_server::handle_ws_node;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};

@@ -85,6 +85,7 @@ pub mod peripherals;
 #[cfg(feature = "agent-runtime")]
 pub mod platform;
 pub mod providers;
+#[cfg(feature = "agent-runtime")]
 pub mod rag;
 #[cfg(feature = "agent-runtime")]
 pub mod routines;

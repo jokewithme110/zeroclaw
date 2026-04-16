@@ -12,7 +12,8 @@ use tokio::fs;
 use zeroclaw_config::schema::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
     HeartbeatConfig, IMessageConfig, LarkConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
-    RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig, WebhookConfig,
+    PlanNotebookConfig, RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig,
+    WebhookConfig,
 };
 use zeroclaw_config::schema::{
     DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, NextcloudTalkConfig, QQConfig,
@@ -160,6 +161,7 @@ pub async fn run_wizard(force: bool, callbacks: WizardCallbacks) -> Result<Confi
     // ── Build config ──
     // Defaults: SQLite memory, supervised autonomy, workspace-scoped, native runtime
     let config = Config {
+        plannotebook: PlanNotebookConfig::default(),
         workspace_dir: workspace_dir.clone(),
         config_path: config_path.clone(),
         schema_version: zeroclaw_config::migration::CURRENT_SCHEMA_VERSION,
@@ -640,6 +642,7 @@ async fn run_quick_setup_with_home(
     let memory_config = memory_config_defaults_for_backend(&memory_backend_name);
 
     let config = Config {
+        plannotebook: PlanNotebookConfig::default(),
         workspace_dir: workspace_dir.clone(),
         config_path: config_path.clone(),
         schema_version: zeroclaw_config::migration::CURRENT_SCHEMA_VERSION,

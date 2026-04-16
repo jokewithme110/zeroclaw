@@ -97,6 +97,11 @@ pub use zeroclaw_tools::opencode_cli::OpenCodeCliTool;
 #[cfg(feature = "rag-pdf")]
 pub use zeroclaw_tools::pdf_read::PdfReadTool;
 pub use zeroclaw_tools::pipeline::PipelineTool;
+pub use zeroclaw_tools::plan_create::PlanCreateTool;
+pub use zeroclaw_tools::plan_start::PlanStartTool;
+pub use zeroclaw_tools::plan_status::PlanStatusTool;
+pub use zeroclaw_tools::plan_step_update::PlanStepUpdateTool;
+pub use zeroclaw_tools::plannotebook::PlanNotebookEngine;
 pub use zeroclaw_tools::poll::PollTool;
 pub use zeroclaw_tools::project_intel::ProjectIntelTool;
 pub use zeroclaw_tools::proxy_config::ProxyConfigTool;
@@ -748,6 +753,17 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(&sop_engine))));
         tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(&sop_engine))));
         tool_arcs.push(Arc::new(SopStatusTool::new(Arc::clone(&sop_engine))));
+    }
+
+    // Plan notebook tools (config-gated, default disabled)
+    if root_config.plannotebook.enabled {
+        let plan_engine = Arc::new(std::sync::Mutex::new(PlanNotebookEngine::new(
+            workspace_dir,
+        )));
+        tool_arcs.push(Arc::new(PlanCreateTool::new(Arc::clone(&plan_engine))));
+        tool_arcs.push(Arc::new(PlanStartTool::new(Arc::clone(&plan_engine))));
+        tool_arcs.push(Arc::new(PlanStepUpdateTool::new(Arc::clone(&plan_engine))));
+        tool_arcs.push(Arc::new(PlanStatusTool::new(Arc::clone(&plan_engine))));
     }
 
     if let Some(key) = composio_key
