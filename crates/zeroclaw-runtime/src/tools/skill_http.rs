@@ -254,7 +254,8 @@ impl Tool for SkillHttpTool {
             }
         };
 
-        let args_log = serde_json::to_string(&args).unwrap_or_else(|e| format!("<serialize args: {e}>"));
+        let args_log =
+            serde_json::to_string(&args).unwrap_or_else(|e| format!("<serialize args: {e}>"));
         tracing::info!(
             tool = %self.tool_name,
             http_method = %method,
@@ -423,7 +424,9 @@ mod tests {
     #[test]
     fn parse_method_accepts_post() {
         let tool = SkillHttpTool::new("weather_skill", &sample_http_tool());
-        let method = tool.parse_method(&serde_json::json!({"method": "post"})).unwrap();
+        let method = tool
+            .parse_method(&serde_json::json!({"method": "post"}))
+            .unwrap();
         assert_eq!(method, reqwest::Method::POST);
     }
 
@@ -440,13 +443,14 @@ mod tests {
     #[test]
     fn parse_headers_accepts_string_values() {
         let tool = SkillHttpTool::new("weather_skill", &sample_http_tool());
-        let headers = tool.parse_headers(&serde_json::json!({
-            "headers": {
-                "Authorization": "Bearer token",
-                "Content-Type": "application/json"
-            }
-        }))
-        .unwrap();
+        let headers = tool
+            .parse_headers(&serde_json::json!({
+                "headers": {
+                    "Authorization": "Bearer token",
+                    "Content-Type": "application/json"
+                }
+            }))
+            .unwrap();
         assert_eq!(headers.len(), 2);
     }
 
@@ -465,10 +469,10 @@ mod tests {
         let tool = SkillHttpTool::new("weather_skill", &sample_http_tool());
         let body = tool
             .parse_body(&serde_json::json!({
-            "body": {"city": "London", "unit": "metric"}
-        }))
-        .unwrap()
-        .unwrap();
+                "body": {"city": "London", "unit": "metric"}
+            }))
+            .unwrap()
+            .unwrap();
         assert!(body.contains("\"city\":\"London\""));
     }
 

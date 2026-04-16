@@ -514,7 +514,8 @@ impl OpenAiCompatibleProvider {
 
     fn reasoning_effort_for_model(&self, model: &str) -> Option<String> {
         let id = model.rsplit('/').next().unwrap_or(model);
-        let supports_reasoning_effort = id.starts_with("gpt-5") || id.contains("codex") || id.contains("doubao");
+        let supports_reasoning_effort =
+            id.starts_with("gpt-5") || id.contains("codex") || id.contains("doubao");
         supports_reasoning_effort
             .then(|| self.reasoning_effort.clone())
             .flatten()
@@ -1530,11 +1531,9 @@ impl OpenAiCompatibleProvider {
             if message.role == "assistant" {
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content) {
                     if let Some(tool_calls_value) = value.get("tool_calls") {
-                        if let Ok(parsed_calls) =
-                            serde_json::from_value::<Vec<ProviderToolCall>>(
-                                tool_calls_value.clone(),
-                            )
-                        {
+                        if let Ok(parsed_calls) = serde_json::from_value::<Vec<ProviderToolCall>>(
+                            tool_calls_value.clone(),
+                        ) {
                             for tc in &parsed_calls {
                                 seen_tool_call_ids.insert(tc.id.clone());
                             }

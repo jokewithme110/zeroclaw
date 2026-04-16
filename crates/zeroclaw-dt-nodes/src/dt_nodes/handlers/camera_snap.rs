@@ -72,7 +72,6 @@ fn read_with_retry(path: &PathBuf, attempts: usize, delay: Duration) -> std::io:
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "snapshot not found")
-    }))
+    Err(last_err
+        .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "snapshot not found")))
 }

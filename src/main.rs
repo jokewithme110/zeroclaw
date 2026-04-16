@@ -43,6 +43,7 @@ use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
+use zeroclaw_dt_nodes::dt_nodes;
 
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
@@ -97,8 +98,6 @@ mod cron;
 mod daemon;
 #[cfg(feature = "agent-runtime")]
 mod doctor;
-mod dt_nodes;
-mod dt_nodes_registry;
 #[cfg(feature = "gateway")]
 mod gateway;
 #[cfg(feature = "agent-runtime")]

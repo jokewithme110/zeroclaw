@@ -2775,7 +2775,8 @@ async fn process_channel_message(
         &ctx.prompt_config,
         &msg.channel,
         &msg.reply_target,
-    );
+        route.model.as_str(),
+    ).await;
 
     if !memory_context.is_empty() {
         let _ = write!(system_prompt, "\n\n{memory_context}");

@@ -113,6 +113,11 @@ pub use zeroclaw_tools::web_fetch::WebFetchTool;
 pub use zeroclaw_tools::web_search_tool::WebSearchTool;
 pub use zeroclaw_tools::workspace_tool::WorkspaceTool;
 pub use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
+pub use zeroclaw_tools::plannotebook::PlanNotebookEngine;
+pub use zeroclaw_tools::plan_create::PlanCreateTool;
+pub use zeroclaw_tools::plan_start::PlanStartTool;
+pub use zeroclaw_tools::plan_step_update::PlanStepUpdateTool;
+pub use zeroclaw_tools::plan_status::PlanStatusTool;
 
 
 // Traits from zeroclaw-api
@@ -752,6 +757,17 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(&sop_engine))));
         tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(&sop_engine))));
         tool_arcs.push(Arc::new(SopStatusTool::new(Arc::clone(&sop_engine))));
+    }
+
+    // Plan notebook tools (config-gated, default disabled)
+    if root_config.plannotebook.enabled {
+        let plan_engine = Arc::new(std::sync::Mutex::new(
+            PlanNotebookEngine::new(workspace_dir),
+        ));
+        tool_arcs.push(Arc::new(PlanCreateTool::new(Arc::clone(&plan_engine))));
+        tool_arcs.push(Arc::new(PlanStartTool::new(Arc::clone(&plan_engine))));
+        tool_arcs.push(Arc::new(PlanStepUpdateTool::new(Arc::clone(&plan_engine))));
+        tool_arcs.push(Arc::new(PlanStatusTool::new(Arc::clone(&plan_engine))));
     }
 
     if let Some(key) = composio_key

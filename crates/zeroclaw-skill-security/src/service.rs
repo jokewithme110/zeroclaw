@@ -24,7 +24,10 @@ pub fn run_scan_cycle(workspace_dir: &Path, scan_cfg: &SkillsScanConfig) -> Resu
     );
     for skill_dir in skill_dirs {
         if let Err(err) = evaluate_skill(&skill_dir, scan_cfg, &mut store) {
-            tracing::warn!("skill scan: cycle failed for {}: {err:#}", skill_dir.display());
+            tracing::warn!(
+                "skill scan: cycle failed for {}: {err:#}",
+                skill_dir.display()
+            );
         }
     }
     store.save()?;
@@ -113,7 +116,10 @@ fn evaluate_skill(
             );
         }
     } else {
-        tracing::info!("skill scan: new skill detected '{}', scheduling scan", skill_id);
+        tracing::info!(
+            "skill scan: new skill detected '{}', scheduling scan",
+            skill_id
+        );
     }
 
     let now = Utc::now().to_rfc3339();
@@ -134,7 +140,11 @@ fn evaluate_skill(
         scan_cfg.api.result_url.clone(),
     )?;
     let filename = format!("{skill_id}.zip");
-    tracing::info!("skill scan: uploading archive for '{}' as {}", skill_id, filename);
+    tracing::info!(
+        "skill scan: uploading archive for '{}' as {}",
+        skill_id,
+        filename
+    );
     let upload = client.upload_archive(archive_bytes, &filename)?;
     record.scan_task_no = Some(upload.task_no.clone());
     tracing::info!(
