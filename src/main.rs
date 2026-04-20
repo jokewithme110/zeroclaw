@@ -97,6 +97,8 @@ mod cron;
 mod daemon;
 #[cfg(feature = "agent-runtime")]
 mod doctor;
+mod dt_nodes;
+mod dt_nodes_registry;
 #[cfg(feature = "gateway")]
 mod gateway;
 #[cfg(feature = "agent-runtime")]
@@ -118,6 +120,7 @@ mod memory;
 mod migration;
 #[cfg(feature = "agent-runtime")]
 mod multimodal;
+mod nodes;
 #[cfg(feature = "agent-runtime")]
 mod observability;
 #[cfg(feature = "agent-runtime")]
@@ -648,6 +651,36 @@ Examples:
     Props {
         #[command(subcommand)]
         props_command: DeprecatedPropsCommands,
+    },
+    /// Connect this machine as nodes to a ZeroClaw gateway
+    Nodes {
+        /// Interactive setup: discover gateway via mDNS and prompt for token
+        #[arg(short = 'i', long = "interactive")]
+        interactive: bool,
+
+        /// Initialize node identity/config only (no WebSocket connection)
+        #[arg(long)]
+        init: bool,
+
+        /// Optional node config file (JSON)
+        #[arg(long)]
+        config: Option<String>,
+
+        /// Gateway host (defaults to config gateway.host)
+        #[arg(long)]
+        host: Option<String>,
+
+        /// Gateway port (defaults to config gateway.port)
+        #[arg(long)]
+        port: Option<u16>,
+
+        /// Logical node name / display name (defaults to system hostname)
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Optional node-control token (overrides identity file)
+        #[arg(long)]
+        token: Option<String>,
     },
 
     /// Manage WASM plugins
@@ -2097,6 +2130,27 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+        Commands::Nodes {
+            interactive,
+            init,
+            config: node_config_path,
+            host,
+            port,
+            name,
+            token,
+        } => {
+            dt_nodes::run_node(
+                &config,
+                interactive,
+                init,
+                node_config_path,
+                host,
+                port,
+                name,
+                token,
+            )
+            .await
+        }
     }
 }
 

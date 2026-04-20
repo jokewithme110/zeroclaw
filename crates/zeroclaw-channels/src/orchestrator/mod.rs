@@ -19,6 +19,7 @@
 pub mod acp_server;
 pub mod media_pipeline;
 pub mod mqtt;
+pub mod build_channel_system_prompt_helper;
 
 // Channel types imported directly from source crates (no shim files)
 pub use crate::bluesky::BlueskyChannel;
@@ -99,7 +100,8 @@ use zeroclaw_runtime::platform;
 use zeroclaw_runtime::security::{AutonomyLevel, SecurityPolicy};
 use zeroclaw_runtime::tools::{self, Tool};
 use zeroclaw_runtime::util::truncate_with_ellipsis;
-
+use crate::bot_service::BotServiceChannel;
+use crate::webchat::WebchatChannel;
 /// Observer wrapper that forwards tool-call events to a channel sender
 /// for real-time threaded notifications.
 struct ChannelNotifyObserver {
@@ -2452,6 +2454,20 @@ fn spawn_scoped_typing_task(
     })
 }
 
+fn render_channel_error(err: &anyhow::Error) -> String {
+    let raw = err.to_string();
+    // Fallback: don't dump raw provider JSON to users.
+    let lower = raw.to_lowercase();
+    if raw.contains("429")
+        || (lower.contains("too many requests") && lower.contains("429"))
+        || (lower.contains("rate") && lower.contains("limit"))
+    {
+        return "⚠️ 请求过于频繁（429）。请稍后再试。".to_string();
+    }
+
+    "⚠️ 模型调用失败，请稍后再试。".to_string()
+}
+
 async fn process_channel_message(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
@@ -2754,12 +2770,13 @@ async fn process_channel_message(
     } else {
         refreshed_new_session_system_prompt(ctx.as_ref())
     };
-    let mut system_prompt = build_channel_system_prompt(
+    let mut system_prompt =crate::orchestrator::build_channel_system_prompt_helper::build_channel_system_prompt(
         &base_system_prompt,
+        &ctx.prompt_config,
         &msg.channel,
         &msg.reply_target,
-        &msg.sender,
     );
+
     if !memory_context.is_empty() {
         let _ = write!(system_prompt, "\n\n{memory_context}");
     }
@@ -4533,6 +4550,34 @@ fn collect_configured_channels(
         }
     }
 
+    if let Some(ref bs) = config.channels.bot_service {
+        if bs.ws_url.trim().is_empty() {
+            tracing::warn!(
+                target: "bot_service",
+                "BotService channel configured but ws_url is empty; skipping"
+            );
+        } else {
+            channels.push(ConfiguredChannel {
+                display_name: "BotService",
+                channel: Arc::new(BotServiceChannel::new(bs.clone())),
+            });
+        }
+    }
+
+    if let Some(ref wc) = config.channels.webchat {
+        channels.push(ConfiguredChannel {
+            display_name: "Webchat",
+            channel: Arc::new(WebchatChannel::new(
+                wc.port,
+                wc.listen_path.clone(),
+                wc.callback_url.clone(),
+                wc.callback_auth_header.clone(),
+                config.gateway.require_pairing,
+                config.gateway.paired_tokens.clone(),
+            )),
+        });
+    }
+
     if let Some(ref wa) = config.channels.whatsapp {
         if wa.enabled {
             if wa.is_ambiguous_config() {
@@ -5133,70 +5178,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // Wire MCP tools into the registry before freezing — non-fatal.
     // When `deferred_loading` is enabled, MCP tools are NOT added eagerly.
     // Instead, a `tool_search` built-in is registered for on-demand loading.
-    let mut deferred_section = String::new();
-    let mut ch_activated_handle: Option<
-        std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::tools::ActivatedToolSet>>,
-    > = None;
-    if config.mcp.enabled && !config.mcp.servers.is_empty() {
-        tracing::info!(
-            "Initializing MCP client — {} server(s) configured",
-            config.mcp.servers.len()
-        );
-        match zeroclaw_runtime::tools::McpRegistry::connect_all(&config.mcp.servers).await {
-            Ok(registry) => {
-                let registry = std::sync::Arc::new(registry);
-                if config.mcp.deferred_loading {
-                    let deferred_set = zeroclaw_runtime::tools::DeferredMcpToolSet::from_registry(
-                        std::sync::Arc::clone(&registry),
-                    )
-                    .await;
-                    tracing::info!(
-                        "MCP deferred: {} tool stub(s) from {} server(s)",
-                        deferred_set.len(),
-                        registry.server_count()
-                    );
-                    deferred_section =
-                        zeroclaw_runtime::tools::build_deferred_tools_section(&deferred_set);
-                    let activated = std::sync::Arc::new(std::sync::Mutex::new(
-                        zeroclaw_runtime::tools::ActivatedToolSet::new(),
-                    ));
-                    ch_activated_handle = Some(std::sync::Arc::clone(&activated));
-                    built_tools.push(Box::new(zeroclaw_runtime::tools::ToolSearchTool::new(
-                        deferred_set,
-                        activated,
-                    )));
-                } else {
-                    let names = registry.tool_names();
-                    let mut registered = 0usize;
-                    for name in names {
-                        if let Some(def) = registry.get_tool_def(&name).await {
-                            let wrapper: std::sync::Arc<dyn Tool> =
-                                std::sync::Arc::new(zeroclaw_runtime::tools::McpToolWrapper::new(
-                                    name,
-                                    def,
-                                    std::sync::Arc::clone(&registry),
-                                ));
-                            if let Some(ref handle) = delegate_handle_ch {
-                                handle.write().push(std::sync::Arc::clone(&wrapper));
-                            }
-                            built_tools
-                                .push(Box::new(zeroclaw_runtime::tools::ArcToolRef(wrapper)));
-                            registered += 1;
-                        }
-                    }
-                    tracing::info!(
-                        "MCP: {} tool(s) registered from {} server(s)",
-                        registered,
-                        registry.server_count()
-                    );
-                }
-            }
-            Err(e) => {
-                // Non-fatal — daemon continues with the tools registered above.
-                tracing::error!("MCP registry failed to initialize: {e:#}");
-            }
-        }
-    }
+    let deferred_wire_out =
+        zeroclaw_runtime::tools::deferred_wire::wire_deferred_tool_surfaces(
+            &config, &mut built_tools,
+            delegate_handle_ch.as_ref()
+        ).await;
+    let deferred_section = deferred_wire_out.deferred_prompt_section;
+    let ch_activated_handle = deferred_wire_out.activated_tools;
 
     let tools_registry = Arc::new(built_tools);
 
@@ -5699,6 +5687,37 @@ pub async fn deliver_announcement(
             zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
                 .await?;
         }
+        "mattermost" => {
+            let mm = config
+                .channels
+                .mattermost
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("mattermost channel not configured"))?;
+            let channel = MattermostChannel::new(
+                mm.url.clone(),
+                mm.bot_token.clone(),
+                mm.channel_id.clone(),
+                mm.allowed_users.clone(),
+                mm.thread_replies.unwrap_or(true),
+                mm.mention_only.unwrap_or(false),
+            );
+            channel
+                .send(&SendMessage::new(safe_output.as_str(), target))
+                .await?;
+        }
+        "dingtalk" => {
+            let dt = config
+                .channels
+                .dingtalk
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("dingtalk channel not configured"))?;
+            let channel = DingTalkChannel::new(
+                dt.client_id.clone(),
+                dt.client_secret.clone(),
+                dt.allowed_users.clone(),
+            );
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
         "signal" => {
             let sg = config
                 .channels
@@ -5715,6 +5734,57 @@ pub async fn deliver_announcement(
             );
             zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
                 .await?;
+        }
+        "qq" => {
+            let qq = config
+                .channels
+                .qq
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("qq channel not configured"))?;
+            let channel = QQChannel::new(
+                qq.app_id.clone(),
+                qq.app_secret.clone(),
+                qq.allowed_users.clone(),
+            );
+            channel
+                .send(&SendMessage::new(safe_output.as_str(), target))
+                .await?;
+        }
+        "lark" => {
+            #[cfg(feature = "channel-lark")]
+            {
+                let lk = config
+                    .channels
+                    .lark
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("lark channel not configured"))?;
+                let channel = LarkChannel::from_lark_config(lk);
+                channel
+                    .send(&SendMessage::new(safe_output.as_str(), target))
+                    .await?;
+            }
+            #[cfg(not(feature = "channel-lark"))]
+            {
+                anyhow::bail!("lark delivery channel requires `channel-lark` feature");
+            }
+        }
+        "feishu" => {
+            #[cfg(feature = "channel-lark")]
+            {
+                let fs = config
+                    .channels
+                    .feishu
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("feishu channel not configured"))?;
+                let channel = LarkChannel::from_feishu_config(fs);
+                channel
+                    .send(&SendMessage::new(safe_output.as_str(), target))
+                    .await?;
+            }
+            #[cfg(not(feature = "channel-lark"))]
+            {
+                anyhow::bail!("feishu delivery channel requires `channel-lark` feature");
+            }
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }

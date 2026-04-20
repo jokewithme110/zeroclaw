@@ -1489,6 +1489,15 @@ pub struct AgentConfig {
     /// behavior). Default: `2`.
     #[serde(default = "default_keep_tool_context_turns")]
     pub keep_tool_context_turns: usize,
+    /// When true, most built-in tools are listed as deferred stubs; the model must
+    /// call `tool_search` before invoking them. Default: `false`.
+    #[serde(default)]
+    pub native_deferred_loading_enabled: bool,
+    /// Built-in tool names to keep eagerly loaded when
+    /// [`Self::native_deferred_loading_enabled`] is true. Default: `[]` (only the
+    /// default always-on native tools remain eagerly loaded).
+    #[serde(default)]
+    pub native_active_tools: Vec<String>,
 }
 
 fn default_max_tool_result_chars() -> usize {
@@ -1539,6 +1548,8 @@ impl Default for AgentConfig {
             context_compression: crate::scattered_types::ContextCompressionConfig::default(),
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
+            native_deferred_loading_enabled: false,
+            native_active_tools: Vec::new(),
         }
     }
 }
@@ -2220,6 +2231,160 @@ pub struct GatewayConfig {
     #[serde(default)]
     #[nested]
     pub tls: Option<GatewayTlsConfig>,
+    /// mDNS advertisement for local network discovery (`[gateway.mdns]`).
+    #[serde(default)]
+    #[nested]
+    pub mdns: GatewayMdnsConfig,
+    /// Enable node control (WebSocket nodes + nodes tool)
+    #[serde(default)]
+    #[nested]
+    pub node_control: NodeControlConfig,
+    /// Agent-to-Agent integration switches (`[gateway.a2a]` section).
+    #[serde(default)]
+    #[nested]
+    pub a2a: A2aConfig,
+}
+
+
+/// Gateway mDNS advertisement configuration (`[gateway.mdns]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "gateway.mdns"]
+pub struct GatewayMdnsConfig {
+    /// Enable mDNS advertisement (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+    /// mDNS service type to advertise (default: "_zeroclaw-gw._tcp.local.").
+    /// Must end with `.local.` for standard mDNS.
+    #[serde(default = "default_gateway_mdns_service_type")]
+    pub service_type: String,
+    /// Optional instance name override shown in mDNS browsers.
+    /// When empty, defaults to "<hostname>-zeroclaw".
+    #[serde(default)]
+    pub instance_name: Option<String>,
+    /// Include the gateway base URL path prefix in TXT (default: true).
+    #[serde(default = "default_true")]
+    pub include_path_prefix: bool,
+    /// Include the node WebSocket path in TXT (default: true).
+    #[serde(default = "default_true")]
+    pub include_ws_path: bool,
+    /// Also include a best-effort local IPv4/IPv6 in TXT (default: true).
+    /// Note: standard mDNS resolution already yields addresses; this is mainly
+    /// for debugging and minimal clients.
+    #[serde(default = "default_true")]
+    pub include_local_ip_txt: bool,
+}
+
+fn default_gateway_mdns_service_type() -> String {
+    "_zeroclaw-gw._tcp.local.".into()
+}
+
+impl Default for GatewayMdnsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            service_type: default_gateway_mdns_service_type(),
+            instance_name: None,
+            include_path_prefix: true,
+            include_ws_path: true,
+            include_local_ip_txt: true,
+        }
+    }
+}
+
+/// Node control configuration (`[gateway.node_control]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "gateway.node_control"]
+pub struct NodeControlConfig {
+    /// Enable node control (WebSocket nodes + nodes tool)
+    #[serde(default)]
+    pub enabled: bool,
+    /// Allowed node IDs for node control
+    #[serde(default)]
+    pub allowed_node_ids: Vec<String>,
+    /// Optional shared secret for node-control HTTP/WebSocket APIs.
+    /// When set, inbound requests must include `X-Node-Control-Token`.
+    #[serde(default)]
+    pub auth_token: Option<String>,
+}
+
+impl Default for NodeControlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_node_ids: Vec::new(),
+            auth_token: None,
+        }
+    }
+}
+
+/// Manually declared skill on the A2A agent card (`[[gateway.a2a.agent_skills]]` in TOML).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct A2aAgentSkillEntry {
+    /// Stable skill id (unique on the card).
+    pub id: String,
+    /// Short human-readable title.
+    pub name: String,
+    /// Capability description for remote peers (not tool parameter schemas).
+    pub description: String,
+    /// Optional keywords for discovery.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Optional example user prompts.
+    #[serde(default)]
+    pub examples: Vec<String>,
+}
+
+/// Agent-to-Agent integration configuration (`[gateway.a2a]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "gateway.a2a"]
+pub struct A2aConfig {
+    /// Enable A2A endpoints.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Optional A2A agent card display name.
+    /// Empty/whitespace values fall back to built-in defaults.
+    #[serde(default)]
+    pub agent_card_name: Option<String>,
+    /// Optional A2A agent card description.
+    /// Empty/whitespace values fall back to built-in defaults.
+    #[serde(default)]
+    pub agent_card_description: Option<String>,
+    /// Enable A2A streaming surface.
+    #[serde(default = "default_a2a_stream_enabled")]
+    pub stream_enabled: bool,
+    /// Reserved auth switch. Keep false in MVP.
+    #[serde(default)]
+    pub auth_enabled: bool,
+    /// Optional skill filter for A2A card generation.
+    /// - Empty: include all discovered skills under `<workspace>/skills` (excluding `a2a-setup`).
+    /// - Non-empty: include only discovered skills whose id/name matches one of these values.
+    #[serde(default)]
+    pub skills: Vec<String>,
+    /// Extra agent-card skills defined in config (merged after workspace `skills/`; duplicate ids are skipped).
+    #[serde(default)]
+    pub agent_skills: Vec<A2aAgentSkillEntry>,
+}
+
+fn default_a2a_stream_enabled() -> bool {
+    true
+}
+
+impl Default for A2aConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            agent_card_name: None,
+            agent_card_description: None,
+            stream_enabled: default_a2a_stream_enabled(),
+            auth_enabled: false,
+            skills: Vec::new(),
+            agent_skills: Vec::new(),
+        }
+    }
 }
 
 fn default_gateway_port() -> u16 {
@@ -2278,6 +2443,9 @@ impl Default for GatewayConfig {
             pairing_dashboard: PairingDashboardConfig::default(),
             web_dist_dir: None,
             tls: None,
+            mdns: GatewayMdnsConfig::default(),
+            node_control: NodeControlConfig::default(),
+            a2a: A2aConfig::default(),
         }
     }
 }
@@ -2715,6 +2883,10 @@ pub struct HttpRequestConfig {
     /// Default: false (deny private hosts for SSRF protection).
     #[serde(default)]
     pub allow_private_hosts: bool,
+    /// URL placeholder replacements used by `http_request`.
+    /// Example: `{"WEATHER_API_KEY": "xxx"}` enables replacing `{{WEATHER_API_KEY}}`.
+    #[serde(default)]
+    pub url_placeholders: HashMap<String, String>,
 }
 
 impl Default for HttpRequestConfig {
@@ -2725,6 +2897,7 @@ impl Default for HttpRequestConfig {
             max_response_size: default_http_max_response_size(),
             timeout_secs: default_http_timeout_secs(),
             allow_private_hosts: false,
+            url_placeholders: HashMap::new(),
         }
     }
 }
@@ -6452,6 +6625,8 @@ impl<T: ChannelConfig> crate::traits::ConfigHandle for ConfigWrapper<T> {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels"]
 pub struct ChannelsConfig {
+    #[nested]
+    pub bot_service: Option<BotServiceConfig>,
     /// Enable the CLI interactive channel. Default: `true`.
     #[serde(default = "default_true")]
     pub cli: bool,
@@ -6473,6 +6648,9 @@ pub struct ChannelsConfig {
     /// Webhook channel configuration.
     #[nested]
     pub webhook: Option<WebhookConfig>,
+    /// Webchat channel configuration (HTTP server + optional SSE streaming).
+    #[nested]
+    pub webchat: Option<WebchatConfig>,
     /// iMessage channel configuration (macOS only).
     #[nested]
     pub imessage: Option<IMessageConfig>,
@@ -6717,6 +6895,10 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(self.mqtt.as_ref())),
                 self.mqtt.is_some(),
             ),
+            (
+                Box::new(ConfigWrapper::new(self.webchat.as_ref())),
+                self.webchat.is_some(),
+            ),
         ]
     }
 
@@ -6725,6 +6907,10 @@ impl ChannelsConfig {
         ret.push((
             Box::new(ConfigWrapper::new(self.webhook.as_ref())),
             self.webhook.is_some(),
+        ));
+        ret.push((
+            Box::new(ConfigWrapper::new(self.webchat.as_ref())),
+            self.webchat.is_some(),
         ));
         ret
     }
@@ -6741,6 +6927,7 @@ fn default_session_backend() -> String {
 impl Default for ChannelsConfig {
     fn default() -> Self {
         Self {
+            bot_service: None,
             cli: true,
             telegram: None,
             discord: None,
@@ -6748,6 +6935,7 @@ impl Default for ChannelsConfig {
             slack: None,
             mattermost: None,
             webhook: None,
+            webchat: None,
             imessage: None,
             matrix: None,
             signal: None,
@@ -6815,6 +7003,38 @@ fn default_telegram_approval_timeout_secs() -> u64 {
 
 fn default_matrix_draft_update_interval_ms() -> u64 {
     1500
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.bot_service"]
+pub struct BotServiceConfig {
+    /// Base WebSocket URL for iCenter BotService (e.g. "ws://host:port/zte-icenter-igpt-coclaw/clawbot").
+    pub ws_url: String,
+    /// Optional secret key appended as ?key= when not already present in ws_url.
+    #[serde(default)]
+    pub secret_key: Option<String>,
+    /// Optional account identifier forwarded via X-Emp-No header during WebSocket handshake.
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
+    pub http_proxy: Option<String>,
+    /// Allowed chat UUIDs or "*" for all. Values are matched against inbound `chatUuid`.
+    #[serde(default)]
+    pub allowed_from: Vec<String>,
+    /// Optional reasoning-channel identifier for future routing customization.
+    #[serde(default)]
+    pub reasoning_channel_id: Option<String>,
+}
+
+impl ChannelConfig for BotServiceConfig {
+    fn name() -> &'static str {
+        "BotService"
+    }
+    fn desc() -> &'static str {
+        "iCenter BotService WebSocket channel"
+    }
 }
 
 /// Telegram bot channel configuration.
@@ -7119,6 +7339,50 @@ impl ChannelConfig for WebhookConfig {
     }
     fn desc() -> &'static str {
         "HTTP endpoint"
+    }
+}
+
+
+/// Webchat channel configuration.
+///
+/// Exposes an OpenAI-compatible HTTP endpoint (`/v1/chat/completions`-style subset):
+/// request fields include `model`, `messages`, `stream`, and `session_id`.
+///
+/// - `stream = true`: returns OpenAI-style SSE chunks + `[DONE]` when callback is not configured.
+/// - `stream = false`: returns OpenAI `chat.completion` JSON when callback is not configured.
+///
+/// When `callback_url` is configured, both stream and non-stream outputs are posted
+/// to callback instead of using the request connection as the primary response channel.
+#[derive(Debug, Clone, Serialize, Deserialize,Default,Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.webchat"]
+
+pub struct WebchatConfig {
+    /// Port to listen on for incoming webchat messages.
+    pub port: u16,
+    /// URL path to listen on (default: `/webchat`).
+    #[serde(default)]
+    pub listen_path: Option<String>,
+    /// Whether streaming draft updates should be cumulative ("stacked").
+    ///
+    /// - `true`: each `update_draft` carries the full accumulated text.
+    /// - `false` (default): each `update_draft` carries only the latest delta chunk.
+    #[serde(default = "default_false")]
+    pub stack_draft_updates: bool,
+    /// Optional URL to POST the final response to when not streaming.
+    #[serde(default)]
+    pub callback_url: Option<String>,
+    /// Optional `Authorization` header value for callback requests.
+    #[serde(default)]
+    pub callback_auth_header: Option<String>,
+}
+
+impl ChannelConfig for WebchatConfig {
+    fn name() -> &'static str {
+        "Webchat"
+    }
+    fn desc() -> &'static str {
+        "HTTP + SSE endpoint"
     }
 }
 
@@ -11669,6 +11933,8 @@ auto_save = true
             },
             cron: CronConfig::default(),
             channels: ChannelsConfig {
+                webchat: None,
+                bot_service: None,
                 cli: true,
                 telegram: Some(TelegramConfig {
                     enabled: true,

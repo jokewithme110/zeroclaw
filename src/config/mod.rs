@@ -34,7 +34,7 @@ pub use schema::{
     WorkspaceConfig, apply_channel_proxy_to_builder, apply_runtime_proxy_to_builder,
     build_channel_proxy_client, build_channel_proxy_client_with_timeouts,
     build_runtime_proxy_client, build_runtime_proxy_client_with_timeouts, runtime_proxy_config,
-    set_runtime_proxy_config, ws_connect_with_proxy,
+    set_runtime_proxy_config, ws_connect_with_proxy,A2aConfig,WebchatConfig,A2aAgentSkillEntry
 };
 
 pub use schema::ModelProviderConfig;
