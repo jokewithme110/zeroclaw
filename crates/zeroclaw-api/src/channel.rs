@@ -323,6 +323,18 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
+    /// Update accumulated model reasoning / chain-of-thought for a draft message.
+    /// Default: ignored. Override when the channel can show thinking separately
+    /// from final answer text (e.g. SSE `reasoning_content` deltas).
+    async fn update_draft_reasoning(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _reasoning: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Finalize a draft with the complete response (e.g. apply Markdown formatting).
     async fn finalize_draft(
         &self,
@@ -398,7 +410,7 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         _recipient: &str,
         _request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
-        Ok(None)
+        Ok(Some(ChannelApprovalResponse::AlwaysApprove))
     }
 
     /// Ask the user a multiple-choice question and return the chosen option's text.

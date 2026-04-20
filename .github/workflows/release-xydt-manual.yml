@@ -1,0 +1,230 @@
+name: Build Co-Claw-Embedded Version
+
+# 手动触发：构建前端 → 交叉编译 → 上传 GitHub Release。
+on:
+  push:
+    tags:
+      - "Co-Claw-EmbeddedV1.26.*"
+      - "Co-Claw-EmbeddedV1.26.*.*"   # e.g. Co-Claw-EmbeddedV1.26.11 / .11.01
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "分支名（可选，默认使用 Run workflow 选择的分支）"
+        required: false
+        type: string
+      version:
+        description: "覆盖版本号（可选，默认使用 Cargo.toml）。格式 X.Y.Z"
+        required: false
+        type: string
+
+concurrency:
+  group: release-xydt-${{ github.event.inputs.branch || github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_CARGO_FEATURES: channel-lark
+
+jobs:
+  validate:
+    name: Validate Version
+    runs-on: ubuntu-latest
+    outputs:
+      source_ref: ${{ steps.resolve.outputs.source_ref }}
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - name: Resolve source branch
+        id: resolve
+        shell: bash
+        env:
+          INPUT_BRANCH: ${{ github.event.inputs.branch || '' }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$INPUT_BRANCH" ]]; then
+            source_ref="$INPUT_BRANCH"
+          elif [[ "$EVENT_NAME" == "push" ]]; then
+            # Tag-triggered run: use commit SHA as release target_commitish
+            source_ref="$COMMIT_SHA"
+          else
+            source_ref="${GITHUB_REF_NAME}"
+          fi
+          echo "source_ref=${source_ref}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ steps.resolve.outputs.source_ref }}
+      - name: Resolve version and tag
+        id: check
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version || '' }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cargo_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            # Tag trigger: use the pushed tag name directly for release
+            resolved_tag="$REF_NAME"
+          else
+            if [[ -n "$INPUT_VERSION" ]]; then
+              input_version="$INPUT_VERSION"
+            else
+              input_version="$cargo_version"
+            fi
+            if [[ ! "$input_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Version must be semver (X.Y.Z). Got: ${input_version}"
+              exit 1
+            fi
+            if [[ -n "$INPUT_VERSION" && "$cargo_version" != "$input_version" ]]; then
+              echo "::error::Cargo.toml version (${cargo_version}) does not match input (${input_version})."
+              exit 1
+            fi
+            # Manual trigger: use the version value for release tag
+            resolved_tag="$input_version"
+          fi
+          echo "tag=${resolved_tag}" >> "$GITHUB_OUTPUT"
+
+  web:
+    name: Build Web Dashboard
+    needs: [validate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.source_ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build web dashboard
+        run: cd web && npm ci && npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist/
+          retention-days: 1
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [validate, web]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 三个 musl 目标：用 Zig + cargo-zigbuild（避免 musl.cc 对 GHA 的封锁）
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            artifact: zeroclaw
+            ext: tar.gz
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-musl
+            artifact: zeroclaw
+            ext: tar.gz
+          - os: ubuntu-22.04
+            target: armv7-unknown-linux-musleabihf
+            artifact: zeroclaw
+            ext: tar.gz
+            skip_prometheus: true
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.validate.outputs.source_ref }}
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.92.0
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          prefix-key: ${{ matrix.os }}-${{ matrix.target }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist/
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Build release
+        shell: bash
+        run: |
+          if [ "${{ matrix.skip_prometheus || 'false' }}" = "true" ]; then
+            cargo zigbuild --release --locked --no-default-features --features "${{ env.RELEASE_CARGO_FEATURES }},channel-nostr,skill-creation" --target ${{ matrix.target }}
+          else
+            cargo zigbuild --release --locked --features "${{ env.RELEASE_CARGO_FEATURES }}" --target ${{ matrix.target }}
+          fi
+
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }}
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: zeroclaw-${{ matrix.target }}
+          path: zeroclaw-${{ matrix.target }}.${{ matrix.ext }}
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub Release
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.validate.outputs.source_ref }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: zeroclaw-*
+          path: artifacts
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          find . -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec sha256sum {} + | sed 's|  \./[^/]*/|  |' > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Collect release assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name 'SHA256SUMS' \) -exec cp {} release-assets/ \;
+          cp install.sh release-assets/ 2>/dev/null || true
+          echo "--- Assets ---"
+          ls -lh release-assets/
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GH_RELEASE_TOKEN || github.token }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          SOURCE_REF: ${{ needs.validate.outputs.source_ref }}
+        run: |
+          set -euo pipefail
+          NOTES_FILE=$(mktemp)
+          printf '%s\n' "XYDT 构建（分支 \`${SOURCE_REF}\`，commit ${{ github.sha }}）。" > "$NOTES_FILE"
+          REPO="${{ github.repository }}"
+          if gh release view "$TAG" --repo "$REPO" &>/dev/null; then
+            gh release upload "$TAG" release-assets/* --clobber --repo "$REPO"
+            gh release edit "$TAG" --notes-file "$NOTES_FILE" --title "$TAG (${SOURCE_REF})" --repo "$REPO"
+          else
+            gh release create "$TAG" release-assets/* \
+              --repo "$REPO" \
+              --title "$TAG (${SOURCE_REF})" \
+              --notes-file "$NOTES_FILE" \
+              --target "$SOURCE_REF"
+          fi

@@ -15,6 +15,7 @@
 //! To add a new tool, implement [`Tool`] in a new submodule and register it in
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
+pub mod a2a_client;
 pub mod attribution;
 pub mod cron_add;
 pub(crate) mod cron_common;
@@ -24,8 +25,10 @@ pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
+pub mod dt_nodes_tool;
 pub mod file_read;
 pub mod model_switch;
+pub mod native_deferred;
 pub mod read_skill;
 pub mod schedule;
 pub mod security_ops;
@@ -122,6 +125,7 @@ pub use zeroclaw_api::schema::{CleaningStrategy, SchemaCleanr};
 pub use zeroclaw_api::tool::{Tool, ToolResult, ToolSpec};
 
 // Local tool re-exports (tools with root deps, kept in misc)
+pub use a2a_client::A2aClientTool;
 pub use cron_add::CronAddTool;
 pub use cron_list::CronListTool;
 pub use cron_remove::CronRemoveTool;
@@ -129,6 +133,7 @@ pub use cron_run::CronRunTool;
 pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
+pub use dt_nodes_tool::NodesTool;
 pub use file_read::FileReadTool;
 pub use model_switch::ModelSwitchTool;
 pub use read_skill::ReadSkillTool;
@@ -152,6 +157,7 @@ pub use verifiable_intent::VerifiableIntentTool;
 /// repeat. Unioned with config-provided exemptions in the tool-call loop.
 pub const REENTRANT_AGENT_TOOLS: &[&str] = &[SpawnSubagentTool::NAME, DelegateTool::NAME];
 
+use crate::dt_nodes_registry::ConnectedNodeRegistry;
 use crate::platform::{NativeRuntime, RuntimeAdapter};
 use crate::security::{SecurityPolicy, create_sandbox};
 use async_trait::async_trait;
@@ -511,6 +517,7 @@ pub fn all_tools_with_runtime(
             ),
             security.clone(),
         )),
+        Arc::new(A2aClientTool::new(security.clone())),
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
                 FileReadTool::new_with_persistence(security.clone(), persistent_writes),
@@ -648,6 +655,13 @@ pub fn all_tools_with_runtime(
             root_config.skills.open_skills_enabled,
             root_config.skills.open_skills_dir.clone(),
             root_config.skills.allow_scripts,
+        )));
+    }
+
+    if config.gateway.node_control.enabled {
+        tool_arcs.push(Arc::new(NodesTool::new(
+            ConnectedNodeRegistry::global(),
+            workspace_dir,
         )));
     }
 

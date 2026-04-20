@@ -12,6 +12,7 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+pub mod a2a;
 pub mod acp;
 pub mod api;
 pub mod api_browse;
@@ -31,6 +32,7 @@ pub mod canvas;
 pub mod hardware_context;
 pub mod node_tool;
 pub mod nodes;
+pub mod nodes_server;
 pub mod openapi;
 pub mod session_queue;
 pub mod sse;
@@ -59,6 +61,7 @@ use axum::{
     response::{IntoResponse, Json},
     routing::{delete, get, post},
 };
+use nodes_server::handle_ws_node;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -421,6 +424,13 @@ fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
         fallback.max(1)
     } else {
         configured
+    }
+}
+
+fn normalize_advertised_host(host: &str) -> &str {
+    match host {
+        "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
+        other => other,
     }
 }
 
@@ -1237,6 +1247,22 @@ pub async fn run_gateway(
         }
     }
 
+    let a2a_public_base = tunnel_url.clone().unwrap_or_else(|| {
+        let advertised_host = normalize_advertised_host(host);
+        format!(
+            "http://{advertised_host}:{actual_port}{}",
+            path_prefix.unwrap_or("")
+        )
+    });
+    if config.gateway.a2a.enabled {
+        a2a::init(
+            &config,
+            &a2a_public_base,
+            tools_registry.as_ref().as_slice(),
+        )
+        .context("initialize A2A (agent card / JSON-RPC)")?;
+    }
+
     // Resolve web_dist_dir: explicit config (when valid) → auto-detect.
     // Treat the configured path as advisory — if it doesn't contain
     // index.html on this machine (stale/leaked path from another host,
@@ -1494,6 +1520,12 @@ pub async fn run_gateway(
         },
     };
 
+    let a2a_router = if config.gateway.a2a.enabled {
+        a2a::router()
+    } else {
+        Router::new()
+    };
+
     // Build router with middleware
     let inner = Router::new()
         // ── Admin routes (for CLI management) ──
@@ -1729,6 +1761,7 @@ pub async fn run_gateway(
 
     let inner = inner
         // ── SSE event stream ──
+        .route("/", get(handle_ws_node))
         .route("/api/events", get(sse::handle_sse_events))
         .route("/api/events/history", get(sse::handle_events_history))
         // ── ACP client bridge ──
@@ -1741,6 +1774,7 @@ pub async fn run_gateway(
         .route("/ws/nodes", get(nodes::handle_ws_nodes))
         // ── Static assets (web dashboard) ──
         .route("/_app/{*path}", get(static_files::handle_static))
+        .merge(a2a_router)
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback))
         .with_state(state.clone())

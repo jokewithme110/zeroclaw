@@ -493,6 +493,8 @@ pub enum StreamDelta {
     Text(String),
     /// Ephemeral tool progress (not part of the response body).
     Status(String),
+    /// Model reasoning / chain-of-thought delta (from `StreamChunk::reasoning`).
+    Reasoning(String),
 }
 
 /// Backwards-compatible alias while callers are migrated.
@@ -1288,12 +1290,19 @@ async fn consume_provider_streaming_response(
                 // request with a 400. Reasoning is never forwarded as a
                 // visible response delta — it is the model's internal
                 // monologue, kept for replay only.
-                if let Some(reasoning) = chunk.reasoning.as_deref()
+                if let Some(ref reasoning) = chunk.reasoning
                     && !reasoning.is_empty()
                 {
                     outcome.reasoning_content.push_str(reasoning);
+                    if let Some(tx) = delta_sender
+                        && tx
+                            .send(StreamDelta::Reasoning(reasoning.clone()))
+                            .await
+                            .is_err()
+                    {
+                        delta_sender = None;
+                    }
                 }
-
                 if chunk.delta.is_empty() {
                     continue;
                 }
@@ -1843,9 +1852,9 @@ pub async fn run_tool_call_loop(
         // ── Progress: LLM thinking ────────────────────────────
         if let Some(ref tx) = on_delta {
             let phase = if iteration == 0 {
-                "\u{1f914} Thinking...\n".to_string()
+                "\u{1f914} 思考中...\n".to_string()
             } else {
-                format!("\u{1f914} Thinking (round {})...\n", iteration + 1)
+                format!("\u{1f914} 进行第{}次推理......\n", iteration + 1)
             };
             let _ = tx.send(StreamDelta::Status(phase)).await;
         }
@@ -1909,7 +1918,7 @@ pub async fn run_tool_call_loop(
 
         // Unified path via ModelProvider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
-        let request_tools = if use_native_tools {
+        let request_tools = if !tool_specs.is_empty() {
             Some(tool_specs.as_slice())
         } else {
             None
@@ -2377,8 +2386,9 @@ pub async fn run_tool_call_loop(
             if !tool_calls.is_empty() {
                 let _ = tx
                     .send(StreamDelta::Status(format!(
-                        "\u{1f4ac} Got {} tool call(s) ({llm_secs}s)\n",
-                        tool_calls.len()
+                        "\u{1f4ac} 我需要先调用 {} 个工具来获取更多信息 , (本次推理耗时 {} 秒)\n",
+                        tool_calls.len(),
+                        llm_secs
                     )))
                     .await;
             }
@@ -2430,7 +2440,7 @@ pub async fn run_tool_call_loop(
             }
 
             history.push(ChatMessage::assistant(response_text.clone()));
-            return Ok(accumulated_display_text);
+            return Ok(display_text.clone());
         }
 
         // Do not accumulate intermediate-turn display text into the final
@@ -2443,13 +2453,13 @@ pub async fn run_tool_call_loop(
         // the structured call payload; relay it to draft-capable channels.
         if !display_text.is_empty() {
             if !native_tool_calls.is_empty()
-                && let Some(ref tx) = on_delta
+                && let Some(ref _tx) = on_delta
             {
                 let mut narration = display_text.clone();
                 if !narration.ends_with('\n') {
                     narration.push('\n');
                 }
-                let _ = tx.send(StreamDelta::Text(narration)).await;
+                // let _ = tx.send(StreamDelta::Text(narration)).await;
             }
             if !silent {
                 print!("{display_text}");
@@ -4492,6 +4502,7 @@ pub async fn run(
                                 print!("{text}");
                                 let _ = std::io::stdout().flush();
                             }
+                            StreamDelta::Reasoning(_text) => {}
                         }
                     }
                 });
@@ -10485,9 +10496,7 @@ This is an example, not an invocation."#;
 
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
-            if let StreamDelta::Text(text) = delta {
-                visible_deltas.push_str(&text);
-            }
+            visible_deltas.push_str(&text);
         }
 
         assert!(outcome.response_text.contains("\"toolcalls\""));
@@ -10561,6 +10570,7 @@ This is an example, not an invocation."#;
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
+                StreamDelta::Reasoning(_) => {}
             }
         }
 
@@ -10701,6 +10711,7 @@ This is an example, not an invocation."#;
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
+                DraftEvent::Reasoning(_) => {}
             }
         }
 

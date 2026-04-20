@@ -61,6 +61,19 @@ pub struct DeferredMcpToolSet {
 }
 
 impl DeferredMcpToolSet {
+    /// Empty MCP deferred catalog (for wiring `tool_search` with native-only deferred tools).
+    pub async fn empty() -> Self {
+        let registry = Arc::new(
+            McpRegistry::connect_all(&[])
+                .await
+                .expect("McpRegistry::connect_all with zero servers"),
+        );
+        Self {
+            stubs: Vec::new(),
+            registry,
+        }
+    }
+
     /// Build the set from a connected [`McpRegistry`].
     pub async fn from_registry(registry: Arc<McpRegistry>) -> Self {
         let names = registry.tool_names();

@@ -75,6 +75,9 @@ toml_edit = "0.25"
 rustls-pemfile = "2"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 
+# a2a
+ra2a = { version = "0.8.1", default-features = false, features = ["client", "server", "axum"] }
+
 [dev-dependencies]
 rand = "0.10"
 rcgen = "0.13"

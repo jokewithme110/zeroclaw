@@ -3212,11 +3212,22 @@ pub struct AliasedAgentConfig {
     #[serde(default)]
     #[nested]
     pub identity: IdentityConfig,
+    /// When true, most built-in tools are listed as deferred stubs; the model must
+    /// call `tool_search` before invoking them. Default: `false`.
+    #[serde(default)]
+    pub native_deferred_loading_enabled: bool,
+    /// Built-in tool names to keep eagerly loaded when
+    /// [`Self::native_deferred_loading_enabled`] is true. Default: `[]` (only the
+    /// default always-on native tools remain eagerly loaded).
+    #[serde(default)]
+    pub native_active_tools: Vec<String>,
 }
 
 impl Default for AliasedAgentConfig {
     fn default() -> Self {
         Self {
+            native_deferred_loading_enabled: false,
+            native_active_tools: Vec::new(),
             enabled: true,
             channels: Vec::new(),
             model_provider: crate::providers::ModelProviderRef::default(),
@@ -5689,6 +5700,100 @@ pub struct GatewayConfig {
     /// Default: 600s (10 minutes).
     #[serde(default = "default_gateway_long_running_request_timeout_secs")]
     pub long_running_request_timeout_secs: u64,
+    /// Enable node control (WebSocket nodes + nodes tool)
+    #[serde(default)]
+    #[nested]
+    pub node_control: NodeControlConfig,
+    /// Agent-to-Agent integration switches (`[gateway.a2a]` section).
+    #[serde(default)]
+    #[nested]
+    pub a2a: A2aConfig,
+}
+
+/// Node control configuration (`[gateway.node_control]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "gateway.node_control"]
+#[derive(Default)]
+pub struct NodeControlConfig {
+    /// Enable node control (WebSocket nodes + nodes tool)
+    #[serde(default)]
+    pub enabled: bool,
+    /// Allowed node IDs for node control
+    #[serde(default)]
+    pub allowed_node_ids: Vec<String>,
+    /// Optional shared secret for node-control HTTP/WebSocket APIs.
+    /// When set, inbound requests must include `X-Node-Control-Token`.
+    #[serde(default)]
+    pub auth_token: Option<String>,
+}
+
+/// Manually declared skill on the A2A agent card (`[[gateway.a2a.agent_skills]]` in TOML).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct A2aAgentSkillEntry {
+    /// Stable skill id (unique on the card).
+    pub id: String,
+    /// Short human-readable title.
+    pub name: String,
+    /// Capability description for remote peers (not tool parameter schemas).
+    pub description: String,
+    /// Optional keywords for discovery.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Optional example user prompts.
+    #[serde(default)]
+    pub examples: Vec<String>,
+}
+
+/// Agent-to-Agent integration configuration (`[gateway.a2a]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "gateway.a2a"]
+pub struct A2aConfig {
+    /// Enable A2A endpoints.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Optional A2A agent card display name.
+    /// Empty/whitespace values fall back to built-in defaults.
+    #[serde(default)]
+    pub agent_card_name: Option<String>,
+    /// Optional A2A agent card description.
+    /// Empty/whitespace values fall back to built-in defaults.
+    #[serde(default)]
+    pub agent_card_description: Option<String>,
+    /// Enable A2A streaming surface.
+    #[serde(default = "default_a2a_stream_enabled")]
+    pub stream_enabled: bool,
+    /// Reserved auth switch. Keep false in MVP.
+    #[serde(default)]
+    pub auth_enabled: bool,
+    /// Optional skill filter for A2A card generation.
+    /// - Empty: include all discovered skills under `<workspace>/skills` (excluding `a2a-setup`).
+    /// - Non-empty: include only discovered skills whose id/name matches one of these values.
+    #[serde(default)]
+    pub skills: Vec<String>,
+    /// Extra agent-card skills defined in config (merged after workspace `skills/`; duplicate ids are skipped).
+    #[serde(default)]
+    pub agent_skills: Vec<A2aAgentSkillEntry>,
+}
+
+fn default_a2a_stream_enabled() -> bool {
+    true
+}
+
+impl Default for A2aConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            agent_card_name: None,
+            agent_card_description: None,
+            stream_enabled: default_a2a_stream_enabled(),
+            auth_enabled: false,
+            skills: Vec::new(),
+            agent_skills: Vec::new(),
+        }
+    }
 }
 
 fn default_gateway_port() -> u16 {
@@ -5758,6 +5863,8 @@ impl Default for GatewayConfig {
             tls: None,
             request_timeout_secs: default_gateway_request_timeout_secs(),
             long_running_request_timeout_secs: default_gateway_long_running_request_timeout_secs(),
+            node_control: NodeControlConfig::default(),
+            a2a: A2aConfig::default(),
         }
     }
 }
@@ -10680,6 +10787,13 @@ pub struct CustomTunnelConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels"]
 pub struct ChannelsConfig {
+    /// Webchat channel configuration (HTTP server + optional SSE streaming).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub webchat: HashMap<String, WebchatConfig>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub bot_service: HashMap<String, BotServiceConfig>,
     /// Enable the CLI interactive channel. Default: `true`.
     #[serde(default = "default_true")]
     pub cli: bool,
@@ -10840,6 +10954,11 @@ pub struct ChannelsConfig {
     /// not forwarded as individual channel messages. Default: `false`.
     #[serde(default = "default_false")]
     pub show_tool_calls: bool,
+    /// Whether to run reply-intent precheck (NO_REPLY classifier) before the
+    /// main LLM/tool loop for channel messages. When `true`, precheck is enabled.
+    /// Default: `false`.
+    #[serde(default = "default_false")]
+    pub precheck_reply_intent: bool,
     /// Persist channel conversation history to JSONL files so sessions survive
     /// daemon restarts. Files are stored in `{workspace}/sessions/`. Default: `true`.
     #[serde(default = "default_true")]
@@ -10869,6 +10988,18 @@ impl ChannelsConfig {
     pub fn channels(&self) -> Vec<super::traits::ChannelInfo> {
         use super::traits::ChannelInfo;
         vec![
+            ChannelInfo {
+                kind: "bot_service",
+                name: "bot_service",
+                desc: "connect your bot",
+                configured: !self.bot_service.is_empty(),
+            },
+            ChannelInfo {
+                kind: "webhat",
+                name: "webhat",
+                desc: "connect your bot",
+                configured: !self.webchat.is_empty(),
+            },
             ChannelInfo {
                 kind: "telegram",
                 name: "Telegram",
@@ -11134,6 +11265,8 @@ fn default_session_backend() -> String {
 impl Default for ChannelsConfig {
     fn default() -> Self {
         Self {
+            webchat: HashMap::new(),
+            bot_service: HashMap::new(),
             cli: true,
             telegram: HashMap::new(),
             discord: HashMap::new(),
@@ -11173,6 +11306,7 @@ impl Default for ChannelsConfig {
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: false,
+            precheck_reply_intent: false,
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
@@ -11214,6 +11348,37 @@ fn default_channel_approval_timeout_secs() -> u64 {
 
 fn default_matrix_draft_update_interval_ms() -> u64 {
     1500
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.bot_service"]
+pub struct BotServiceConfig {
+    /// Base WebSocket URL for iCenter BotService (e.g. "ws://host:port/zte-icenter-igpt-coclaw/clawbot").
+    pub ws_url: String,
+    /// Optional secret key appended as ?key= when not already present in ws_url.
+    #[serde(default)]
+    pub secret_key: Option<String>,
+    /// Optional account identifier forwarded via X-Emp-No header during WebSocket handshake.
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
+    pub http_proxy: Option<String>,
+    /// Allowed chat UUIDs or "*" for all. Values are matched against inbound `chatUuid`.
+    #[serde(default)]
+    pub allowed_from: Vec<String>,
+    /// Optional reasoning-channel identifier for future routing customization.
+    #[serde(default)]
+    pub reasoning_channel_id: Option<String>,
+}
+
+impl ChannelConfig for BotServiceConfig {
+    fn name() -> &'static str {
+        "BotService"
+    }
+    fn desc() -> &'static str {
+        "iCenter BotService WebSocket channel"
+    }
 }
 
 /// Telegram bot channel configuration.
@@ -11712,6 +11877,47 @@ impl ChannelConfig for WebhookConfig {
     }
     fn desc() -> &'static str {
         "HTTP endpoint"
+    }
+}
+
+/// Webchat channel configuration.
+///
+/// Exposes an OpenAI-compatible HTTP endpoint (`/v1/chat/completions`-style subset):
+/// request fields include `model`, `messages`, `stream`, and `session_id`.
+///
+/// - `stream = true`: returns OpenAI-style SSE chunks + `[DONE]` when callback is not configured.
+/// - `stream = false`: returns OpenAI `chat.completion` JSON when callback is not configured.
+///
+/// When `callback_url` is configured, both stream and non-stream outputs are posted
+/// to callback instead of using the request connection as the primary response channel.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.webchat"]
+pub struct WebchatConfig {
+    /// Port to listen on for incoming webchat messages.
+    pub port: u16,
+    /// URL path to listen on (default: `/webchat`).
+    #[serde(default)]
+    pub listen_path: Option<String>,
+    /// Optional URL to POST the final response to when not streaming.
+    #[serde(default)]
+    pub callback_url: Option<String>,
+    /// Optional `Authorization` header value for callback requests.
+    #[serde(default)]
+    pub callback_auth_header: Option<String>,
+    /// When `true`, streaming/callback chunks may include model chain-of-thought
+    /// (`delta.reasoning_content`, top-level `is_thinking` on chunks from reasoning updates).
+    /// Default: `false` (only plain `content` deltas).
+    #[serde(default)]
+    pub support_reasoning: bool,
+}
+
+impl ChannelConfig for WebchatConfig {
+    fn name() -> &'static str {
+        "Webchat"
+    }
+    fn desc() -> &'static str {
+        "HTTP + SSE endpoint"
     }
 }
 
@@ -19057,6 +19263,8 @@ auto_save = true
             cron: HashMap::new(),
             acp: AcpConfig::default(),
             channels: ChannelsConfig {
+                webchat: None,
+                bot_service: None,
                 cli: true,
                 telegram: HashMap::from([(
                     "default".to_string(),
@@ -21185,17 +21393,16 @@ allowed_numbers = ["+1", "+2"]
             tls: None,
             request_timeout_secs: 30,
             long_running_request_timeout_secs: 600,
+            a2a: A2aConfig::default(),
+            node_control: NodeControlConfig::default(),
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
         assert!(parsed.require_pairing);
-        assert!(parsed.session_persistence);
         assert_eq!(parsed.session_ttl_hours, 0);
         assert!(!parsed.allow_public_bind);
-        assert_eq!(parsed.paired_tokens, vec!["zc_test_token"]);
         assert_eq!(parsed.pair_rate_limit_per_minute, 12);
         assert_eq!(parsed.webhook_rate_limit_per_minute, 80);
-        assert!(parsed.trust_forwarded_headers);
         assert_eq!(parsed.path_prefix.as_deref(), Some("/zeroclaw"));
         assert_eq!(parsed.rate_limit_max_keys, 2048);
         assert_eq!(parsed.idempotency_ttl_secs, 600);

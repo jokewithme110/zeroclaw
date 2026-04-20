@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// Boilerplate-collapsing macro: pair a concrete `Tool` impl with a
 /// matching `Attributable` impl that surfaces the supplied `ToolKind`
@@ -86,6 +87,17 @@ pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
+}
+
+impl fmt::Display for ToolSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let payload = serde_json::json!({
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.parameters,
+        });
+        write!(f, "<function>{payload}</function>")
+    }
 }
 
 /// Core tool trait — implement for any capability.

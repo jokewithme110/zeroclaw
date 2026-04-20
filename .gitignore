@@ -68,7 +68,8 @@ credentials.json
 
 # Skill eval workspaces (test outputs, transcripts, grading)
 .claude/skills/*-workspace/
-
+.icodemate/
+.claude/skills/*.json
 # Claude Code agent worktrees (temporary isolated workspaces)
 .claude/worktrees/
 

@@ -19,6 +19,7 @@
 
 #[cfg(feature = "channel-acp-server")]
 pub mod acp_server;
+pub mod build_channel_system_prompt_helper;
 pub mod media_pipeline;
 #[cfg(feature = "channel-mqtt")]
 pub mod mqtt;
@@ -103,6 +104,8 @@ pub use zeroclaw_infra::session_backend::SessionBackend;
 pub use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 pub use zeroclaw_infra::stall_watchdog::StallWatchdog;
 
+use crate::bot_service::BotServiceChannel;
+use crate::webchat::WebchatChannel;
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use portable_atomic::{AtomicU64, Ordering};
@@ -1109,8 +1112,10 @@ fn supports_runtime_model_switch(channel_name: &str) -> bool {
 }
 
 fn is_explicitly_addressed_channel_message(channel_name: &str, content: &str) -> bool {
-    channel_name == "wecom_ws"
-        && content.contains("[WeCom group message addressed to this bot via @")
+    channel_name == "qq"
+        || channel_name == "webchat"
+        || (channel_name == "wecom_ws"
+            && content.contains("[WeCom group message addressed to this bot via @"))
 }
 
 fn is_matrix_channel_name(channel_name: &str) -> bool {
@@ -4243,7 +4248,14 @@ async fn process_channel_message_body(
                     )
                 );
             }
+            println!(
+                "  🤖 No reply [{kind:?}] ({}ms): {}",
+                started_at.elapsed().as_millis(),
+                reason.as_deref().unwrap_or("no reason provided")
+            );
+            return;
         }
+
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
@@ -4260,7 +4272,6 @@ async fn process_channel_message_body(
         );
         return;
     }
-
     let use_draft_streaming = target_channel
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates());
@@ -4302,6 +4313,8 @@ async fn process_channel_message_body(
         None
     };
 
+    let target_channel_clone = target_channel.clone();
+
     // Spawn the appropriate handler for the delta channel.
     let draft_updater = if use_draft_streaming {
         // Partial: accumulate text and edit a single draft message.
@@ -4335,11 +4348,9 @@ async fn process_channel_message_body(
                                 );
                             }
                         }
-                        StreamDelta::Text(text) => {
-                            accumulated.push_str(&text);
-                            let visible = strip_think_tags_inline(&accumulated);
+                        StreamDelta::Reasoning(text) => {
                             if let Err(e) = channel
-                                .update_draft(&reply_target, &draft_id, &visible)
+                                .update_draft_reasoning(&reply_target, &draft_id, &text)
                                 .await
                             {
                                 ::zeroclaw_log::record!(
@@ -4351,6 +4362,33 @@ async fn process_channel_message_body(
                                     .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                                     "Draft update failed"
                                 );
+                            }
+                        }
+                        StreamDelta::Text(text) => {
+                            if target_channel_clone
+                                .as_ref()
+                                .is_some_and(|ch| ch.name() == "webchat")
+                            {
+                                let _ = channel.update_draft(&reply_target, &draft_id, &text).await;
+                            } else {
+                                accumulated.push_str(&text);
+                                let visible = strip_think_tags_inline(&accumulated);
+                                if let Err(e) = channel
+                                    .update_draft(&reply_target, &draft_id, &visible)
+                                    .await
+                                {
+                                    ::zeroclaw_log::record!(
+                                        DEBUG,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_attrs(
+                                            ::serde_json::json!({"error": format!("{}", e)})
+                                        ),
+                                        "Draft update failed"
+                                    );
+                                }
                             }
                         }
                     }
@@ -6782,6 +6820,32 @@ fn collect_configured_channels(
             "iMessage channel is configured but this build was compiled without \
              `channel-imessage`; skipping iMessage."
         );
+    }
+
+    for (alias, bs) in &config.channels.bot_service {
+        if !bs.ws_url.trim().is_empty() {
+            channels.push(ConfiguredChannel {
+                display_name: "BotService",
+                alias: Some(alias.clone()),
+                channel: Arc::new(BotServiceChannel::new(bs.clone())),
+            });
+        }
+    }
+
+    for (alias, wc) in &config.channels.webchat {
+        channels.push(ConfiguredChannel {
+            display_name: "Webchat",
+            alias: Some(alias.clone()),
+            channel: Arc::new(WebchatChannel::new(
+                wc.port,
+                wc.listen_path.clone(),
+                wc.callback_url.clone(),
+                wc.callback_auth_header.clone(),
+                wc.support_reasoning,
+                config.gateway.require_pairing,
+                config.gateway.paired_tokens.clone(),
+            )),
+        });
     }
 
     #[cfg(feature = "channel-matrix")]

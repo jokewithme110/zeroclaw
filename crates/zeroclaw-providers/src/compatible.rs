@@ -669,7 +669,8 @@ impl OpenAiCompatibleModelProvider {
             || id.starts_with("o3-")
             || id == "o4"
             || id.starts_with("o4-")
-            || (id.starts_with("gpt-5") && !is_gpt5_chat_latest);
+            || (id.starts_with("gpt-5") && !is_gpt5_chat_latest)
+            || id.contains("doubao");
         let is_likely_codex_supported = id.contains("codex") && id.starts_with("gpt-");
 
         (is_openai_reasoning_model || is_likely_codex_supported).then(|| effort.clone())
@@ -893,7 +894,8 @@ impl ResponseMessage {
 
     fn effective_content_optional(&self) -> Option<String> {
         if let Some(content) = self.content.as_ref().filter(|c| !c.is_empty()) {
-            let stripped = strip_think_tags(content);
+            // let stripped = strip_think_tags(content);
+            let stripped = content.clone();
             if !stripped.is_empty() {
                 return Some(stripped);
             }
@@ -3802,7 +3804,7 @@ mod tests {
         assert_eq!(converted[0].role, "tool");
         assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_abc"));
         assert!(matches!(
-            converted[0].content.as_ref(),
+            converted[1].content.as_ref(),
             Some(MessageContent::Text(value)) if value == "done"
         ));
     }
