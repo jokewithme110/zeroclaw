@@ -12,6 +12,7 @@ pub mod cost;
 pub mod cron;
 pub mod daemon;
 pub mod doctor;
+pub mod dt_nodes_registry;
 pub mod health;
 pub mod heartbeat;
 pub mod hooks;

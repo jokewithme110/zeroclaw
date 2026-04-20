@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolResult};
@@ -13,6 +14,7 @@ pub struct HttpRequestTool {
     max_response_size: usize,
     timeout_secs: u64,
     allow_private_hosts: bool,
+    url_placeholders: HashMap<String, String>,
 }
 
 impl HttpRequestTool {
@@ -22,6 +24,7 @@ impl HttpRequestTool {
         max_response_size: usize,
         timeout_secs: u64,
         allow_private_hosts: bool,
+        url_placeholders: HashMap<String, String>,
     ) -> Self {
         Self {
             security,
@@ -29,7 +32,31 @@ impl HttpRequestTool {
             max_response_size,
             timeout_secs,
             allow_private_hosts,
+            url_placeholders,
         }
+    }
+
+    fn apply_url_placeholders(&self, raw_url: &str) -> anyhow::Result<String> {
+        let mut resolved = raw_url.to_string();
+        while let Some(start) = resolved.find("{{") {
+            let search_start = start + 2;
+            let tail = &resolved[search_start..];
+            let Some(end_rel) = tail.find("}}") else {
+                anyhow::bail!("Invalid URL placeholder syntax: missing '}}'");
+            };
+            let end = search_start + end_rel;
+            let key = resolved[search_start..end].trim();
+            if key.is_empty() {
+                anyhow::bail!("Invalid URL placeholder syntax: empty placeholder");
+            }
+            let value = self
+                .url_placeholders
+                .get(key)
+                .ok_or_else(|| anyhow::anyhow!("Missing URL placeholder value for '{key}'"))?;
+            let token = format!("{{{{{key}}}}}");
+            resolved = resolved.replacen(&token, value, 1);
+        }
+        Ok(resolved)
     }
 
     fn validate_url(&self, raw_url: &str) -> anyhow::Result<String> {
@@ -93,7 +120,6 @@ impl HttpRequestTool {
         result
     }
 
-    #[cfg(test)]
     fn redact_headers_for_display(headers: &[(String, String)]) -> Vec<(String, String)> {
         headers
             .iter()
@@ -229,7 +255,18 @@ impl Tool for HttpRequestTool {
             });
         }
 
-        let url = match self.validate_url(url) {
+        let resolved_url = match self.apply_url_placeholders(url) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(e.to_string()),
+                });
+            }
+        };
+
+        let url = match self.validate_url(&resolved_url) {
             Ok(v) => v,
             Err(e) => {
                 return Ok(ToolResult {
@@ -459,7 +496,6 @@ fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
 mod tests {
     use super::*;
     use zeroclaw_config::autonomy::AutonomyLevel;
-    use zeroclaw_config::policy::SecurityPolicy;
 
     fn test_tool(allowed_domains: Vec<&str>) -> HttpRequestTool {
         test_tool_with_private(allowed_domains, false)
@@ -479,6 +515,7 @@ mod tests {
             1_000_000,
             30,
             allow_private_hosts,
+            HashMap::new(),
         )
     }
 
@@ -586,7 +623,7 @@ mod tests {
     #[test]
     fn validate_requires_allowlist() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = HttpRequestTool::new(security, vec![], 1_000_000, 30, false);
+        let tool = HttpRequestTool::new(security, vec![], 1_000_000, 30, false, HashMap::new());
         let err = tool
             .validate_url("https://example.com")
             .unwrap_err()
@@ -702,7 +739,14 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30, false);
+        let tool = HttpRequestTool::new(
+            security,
+            vec!["example.com".into()],
+            1_000_000,
+            30,
+            false,
+            HashMap::new(),
+        );
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -717,7 +761,14 @@ mod tests {
             max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         });
-        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30, false);
+        let tool = HttpRequestTool::new(
+            security,
+            vec!["example.com".into()],
+            1_000_000,
+            30,
+            false,
+            HashMap::new(),
+        );
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -741,6 +792,7 @@ mod tests {
             10,
             30,
             false,
+            HashMap::new(),
         );
         let text = "hello world this is long";
         let truncated = tool.truncate_response(text);
@@ -756,6 +808,7 @@ mod tests {
             0, // max_response_size = 0 means no limit
             30,
             false,
+            HashMap::new(),
         );
         let text = "a".repeat(10_000_000);
         assert_eq!(tool.truncate_response(&text), text);
@@ -769,6 +822,7 @@ mod tests {
             5,
             30,
             false,
+            HashMap::new(),
         );
         let text = "hello world";
         let truncated = tool.truncate_response(text);
@@ -801,6 +855,34 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == "Content-Type" && v == "application/json")
         );
+    }
+
+    #[test]
+    fn apply_url_placeholders_replaces_configured_tokens() {
+        let mut placeholders = HashMap::new();
+        placeholders.insert("WEATHER_API_KEY".to_string(), "secret-key".to_string());
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["api.example.com".into()],
+            1_000_000,
+            30,
+            false,
+            placeholders,
+        );
+        let got = tool
+            .apply_url_placeholders("https://api.example.com/data?key={{WEATHER_API_KEY}}")
+            .unwrap();
+        assert_eq!(got, "https://api.example.com/data?key=secret-key");
+    }
+
+    #[test]
+    fn apply_url_placeholders_errors_when_missing_mapping() {
+        let tool = test_tool(vec!["example.com"]);
+        let err = tool
+            .apply_url_placeholders("https://example.com?key={{MISSING_KEY}}")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Missing URL placeholder value"));
     }
 
     #[test]

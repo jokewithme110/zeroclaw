@@ -15,15 +15,20 @@
 //! To add a new tool, implement [`Tool`] in a new submodule and register it in
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
+pub mod a2a_client;
+pub mod channel_send;
 pub mod cron_add;
 pub mod cron_list;
 pub mod cron_remove;
 pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
+pub mod deferred_wire;
 pub mod delegate;
+pub mod dt_nodes_tool;
 pub mod file_read;
 pub mod model_switch;
+pub mod native_deferred;
 pub mod read_skill;
 pub mod schedule;
 pub mod security_ops;
@@ -113,6 +118,8 @@ pub use zeroclaw_api::schema::{CleaningStrategy, SchemaCleanr};
 pub use zeroclaw_api::tool::{Tool, ToolResult, ToolSpec};
 
 // Local tool re-exports (tools with root deps, kept in misc)
+pub use a2a_client::A2aClientTool;
+pub use channel_send::ChannelSendTool;
 pub use cron_add::CronAddTool;
 pub use cron_list::CronListTool;
 pub use cron_remove::CronRemoveTool;
@@ -120,6 +127,7 @@ pub use cron_run::CronRunTool;
 pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
+pub use dt_nodes_tool::NodesTool;
 pub use file_read::FileReadTool;
 pub use model_switch::ModelSwitchTool;
 pub use read_skill::ReadSkillTool;
@@ -135,6 +143,7 @@ pub use sop_list::SopListTool;
 pub use sop_status::SopStatusTool;
 pub use verifiable_intent::VerifiableIntentTool;
 
+use crate::dt_nodes_registry::ConnectedNodeRegistry;
 use crate::platform::{NativeRuntime, RuntimeAdapter};
 use crate::security::{SecurityPolicy, create_sandbox};
 use async_trait::async_trait;
@@ -143,7 +152,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use zeroclaw_config::schema::{Config, DelegateAgentConfig};
 use zeroclaw_memory::Memory;
-
 /// Shared handle to the delegate tool's parent-tools list.
 /// Callers can push additional tools (e.g. MCP wrappers) after construction.
 pub type DelegateParentToolsHandle = Arc<RwLock<Vec<Arc<dyn Tool>>>>;
@@ -341,6 +349,7 @@ pub fn all_tools_with_runtime(
             ),
             security.clone(),
         )),
+        Arc::new(A2aClientTool::new(security.clone())),
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(FileEditTool::new(security.clone())),
@@ -375,6 +384,7 @@ pub fn all_tools_with_runtime(
         Arc::new(CalculatorTool::new()),
         Arc::new(WeatherTool::new()),
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
+        Arc::new(ChannelSendTool::new(config.clone(), security.clone())),
     ];
 
     // Register discord_search if discord_history channel is configured
@@ -431,6 +441,13 @@ pub fn all_tools_with_runtime(
         )));
     }
 
+    if config.gateway.node_control.enabled {
+        tool_arcs.push(Arc::new(NodesTool::new(
+            ConnectedNodeRegistry::global(),
+            workspace_dir,
+        )));
+    }
+
     if browser_config.enabled {
         // Add legacy browser_open tool for simple URL opening
         tool_arcs.push(Arc::new(BrowserOpenTool::new(
@@ -479,6 +496,7 @@ pub fn all_tools_with_runtime(
             http_config.max_response_size,
             http_config.timeout_secs,
             http_config.allow_private_hosts,
+            http_config.url_placeholders.clone(),
         )));
     }
 

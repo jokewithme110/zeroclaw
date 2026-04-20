@@ -29,7 +29,7 @@ impl RuntimeTraceStorageMode {
     }
 }
 
-/// Structured runtime trace event for tool-call and model-reply diagnostics.
+/// Structured runtime trace event for tool-call, model-reply, and dt-node diagnostics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeTraceEvent {
     pub id: String,

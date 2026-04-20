@@ -5,8 +5,8 @@ pub mod traits;
 pub mod workspace;
 
 pub use schema::{
-    AgentConfig, AssemblyAiSttConfig, AuditConfig, AutonomyConfig, BackupConfig,
-    BrowserComputerUseConfig, BrowserConfig, BuiltinHooksConfig, ChannelsConfig,
+    A2aAgentSkillEntry, A2aConfig, AgentConfig, AssemblyAiSttConfig, AuditConfig, AutonomyConfig,
+    BackupConfig, BrowserComputerUseConfig, BrowserConfig, BuiltinHooksConfig, ChannelsConfig,
     ClassificationRule, ClaudeCodeConfig, ClaudeCodeRunnerConfig, CloudOpsConfig, CodexCliConfig,
     ComposioConfig, Config, ConversationalAiConfig, CostConfig, CronConfig, CronJobDecl,
     CronScheduleDecl, DEFAULT_GWS_SERVICES, DataRetentionConfig, DeepgramSttConfig,
@@ -30,11 +30,12 @@ pub use schema::{
     SlackConfig, SopConfig, StorageConfig, StorageProviderConfig, StorageProviderSection,
     StreamMode, SwarmConfig, SwarmStrategy, TelegramConfig, TextBrowserConfig, ToolFilterGroup,
     ToolFilterGroupMode, TranscriptionConfig, TtsConfig, TunnelConfig, VerifiableIntentConfig,
-    WebFetchConfig, WebSearchConfig, WebhookConfig, WhatsAppChatPolicy, WhatsAppWebMode,
-    WorkspaceConfig, apply_channel_proxy_to_builder, apply_runtime_proxy_to_builder,
-    build_channel_proxy_client, build_channel_proxy_client_with_timeouts,
-    build_runtime_proxy_client, build_runtime_proxy_client_with_timeouts, runtime_proxy_config,
-    set_runtime_proxy_config, ws_connect_with_proxy,
+    WebFetchConfig, WebSearchConfig, WebchatConfig, WebhookConfig, WhatsAppChatPolicy,
+    WhatsAppWebMode, WorkspaceConfig, apply_channel_proxy_to_builder,
+    apply_runtime_proxy_to_builder, build_channel_proxy_client,
+    build_channel_proxy_client_with_timeouts, build_runtime_proxy_client,
+    build_runtime_proxy_client_with_timeouts, runtime_proxy_config, set_runtime_proxy_config,
+    ws_connect_with_proxy,
 };
 
 pub use schema::ModelProviderConfig;

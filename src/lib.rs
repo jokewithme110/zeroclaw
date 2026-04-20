@@ -55,6 +55,8 @@ pub mod cron;
 pub(crate) mod daemon;
 #[cfg(feature = "agent-runtime")]
 pub(crate) mod doctor;
+#[cfg(feature = "agent-runtime")]
+pub mod dt_nodes_registry;
 #[cfg(feature = "gateway")]
 pub mod gateway;
 #[cfg(feature = "agent-runtime")]
@@ -83,7 +85,6 @@ pub mod peripherals;
 #[cfg(feature = "agent-runtime")]
 pub mod platform;
 pub mod providers;
-#[cfg(feature = "agent-runtime")]
 pub mod rag;
 #[cfg(feature = "agent-runtime")]
 pub mod routines;

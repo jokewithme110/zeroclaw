@@ -7,6 +7,7 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+pub mod a2a;
 pub mod api;
 pub mod api_pairing;
 #[cfg(feature = "plugins-wasm")]
@@ -15,7 +16,9 @@ pub mod api_plugins;
 pub mod api_webauthn;
 pub mod auth_rate_limit;
 pub mod canvas;
+pub mod dt_nodes_registry;
 pub mod hardware_context;
+pub mod mdns;
 pub mod node_tool;
 pub mod nodes;
 pub mod session_queue;
@@ -33,6 +36,7 @@ use axum::{
     response::{IntoResponse, Json},
     routing::{delete, get, post, put},
 };
+use dt_nodes_registry::handle_ws_node;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -325,6 +329,13 @@ fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
     }
 }
 
+fn normalize_advertised_host(host: &str) -> &str {
+    match host {
+        "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
+        other => other,
+    }
+}
+
 /// Shared state for all axum handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -421,6 +432,25 @@ pub async fn run_gateway(
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
 
+    // ── Optional mDNS advertisement (LAN discovery) ────────────────
+    if config.gateway.mdns.enabled
+        && (host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost"))
+    {
+        tracing::warn!(
+            "gateway.mdns.enabled=true but gateway is bound to {host}; other LAN devices may not be able to connect. Consider binding to 0.0.0.0 or a LAN IP."
+        );
+    }
+    let path_prefix = config
+        .gateway
+        .path_prefix
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    let _mdns_advertiser =
+        mdns::start_gateway_mdns(&config.gateway.mdns, actual_port, &path_prefix)
+            .context("start gateway mDNS advertisement")?;
+
     let fallback = config.providers.fallback_provider();
     let provider: Arc<dyn Provider> =
         Arc::from(zeroclaw_providers::create_resilient_provider_with_options(
@@ -488,59 +518,12 @@ pub async fn run_gateway(
 
     // ── Wire MCP tools into the gateway tool registry (non-fatal) ───
     // Without this, the `/api/tools` endpoint misses MCP tools.
-    if config.mcp.enabled && !config.mcp.servers.is_empty() {
-        tracing::info!(
-            "Gateway: initializing MCP client — {} server(s) configured",
-            config.mcp.servers.len()
-        );
-        match tools::McpRegistry::connect_all(&config.mcp.servers).await {
-            Ok(registry) => {
-                let registry = std::sync::Arc::new(registry);
-                if config.mcp.deferred_loading {
-                    let deferred_set =
-                        tools::DeferredMcpToolSet::from_registry(std::sync::Arc::clone(&registry))
-                            .await;
-                    tracing::info!(
-                        "Gateway MCP deferred: {} tool stub(s) from {} server(s)",
-                        deferred_set.len(),
-                        registry.server_count()
-                    );
-                    let activated =
-                        std::sync::Arc::new(std::sync::Mutex::new(tools::ActivatedToolSet::new()));
-                    tools_registry_raw.push(Box::new(tools::ToolSearchTool::new(
-                        deferred_set,
-                        activated,
-                    )));
-                } else {
-                    let names = registry.tool_names();
-                    let mut registered = 0usize;
-                    for name in names {
-                        if let Some(def) = registry.get_tool_def(&name).await {
-                            let wrapper: std::sync::Arc<dyn tools::Tool> =
-                                std::sync::Arc::new(tools::McpToolWrapper::new(
-                                    name,
-                                    def,
-                                    std::sync::Arc::clone(&registry),
-                                ));
-                            if let Some(ref handle) = delegate_handle_gw {
-                                handle.write().push(std::sync::Arc::clone(&wrapper));
-                            }
-                            tools_registry_raw.push(Box::new(tools::ArcToolRef(wrapper)));
-                            registered += 1;
-                        }
-                    }
-                    tracing::info!(
-                        "Gateway MCP: {} tool(s) registered from {} server(s)",
-                        registered,
-                        registry.server_count()
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::error!("Gateway MCP registry failed to initialize: {e:#}");
-            }
-        }
-    }
+    let _deferred_wire_gw = tools::deferred_wire::wire_deferred_tool_surfaces(
+        &config,
+        &mut tools_registry_raw,
+        delegate_handle_gw.as_ref(),
+    )
+    .await;
 
     let tools_registry: Arc<Vec<ToolSpec>> =
         Arc::new(tools_registry_raw.iter().map(|t| t.spec()).collect());
@@ -750,6 +733,22 @@ pub async fn run_gateway(
         }
     }
 
+    let a2a_public_base = tunnel_url.clone().unwrap_or_else(|| {
+        let advertised_host = normalize_advertised_host(host);
+        format!(
+            "http://{advertised_host}:{actual_port}{}",
+            path_prefix.unwrap_or("")
+        )
+    });
+    if config.gateway.a2a.enabled {
+        a2a::init(
+            &config,
+            &a2a_public_base,
+            tools_registry.as_ref().as_slice(),
+        )
+        .context("initialize A2A (agent card / JSON-RPC)")?;
+    }
+
     // Resolve web_dist_dir: explicit config → auto-detect common locations
     let web_dist_dir: Option<std::path::PathBuf> = config
         .gateway
@@ -931,6 +930,11 @@ pub async fn run_gateway(
         },
     };
 
+    let a2a_router = if config.gateway.a2a.enabled {
+        a2a::router()
+    } else {
+        Router::new()
+    };
     // Config PUT needs larger body limit (1MB)
     let config_put_router = Router::new()
         .route("/api/config", put(api::handle_api_config_put))
@@ -1054,6 +1058,7 @@ pub async fn run_gateway(
 
     let inner = inner
         // ── SSE event stream ──
+        .route("/", get(handle_ws_node))
         .route("/api/events", get(sse::handle_sse_events))
         .route("/api/events/history", get(sse::handle_events_history))
         // ── WebSocket agent chat ──
@@ -1066,6 +1071,7 @@ pub async fn run_gateway(
         .route("/_app/{*path}", get(static_files::handle_static))
         // ── Config PUT with larger body limit ──
         .merge(config_put_router)
+        .merge(a2a_router)
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback))
         .with_state(state)

@@ -1,0 +1,25 @@
+[package]
+name = "zeroclaw-dt-nodes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+dialoguer = { version = "0.12", features = ["fuzzy-select"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+hostname = "0.4.2"
+mdns-sd = "0.18.2"
+rand = "0.10"
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process", "io-std", "fs", "signal"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+tracing = { version = "0.1", default-features = false }
+uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
+zeroclaw-config.workspace = true
+zeroclaw-runtime.workspace = true
