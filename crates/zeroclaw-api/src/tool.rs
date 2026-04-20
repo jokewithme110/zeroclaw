@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// Result of a tool execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,6 +16,17 @@ pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
+}
+
+impl fmt::Display for ToolSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let payload = serde_json::json!({
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.parameters,
+        });
+        write!(f, "<function>{payload}</function>")
+    }
 }
 
 /// Core tool trait — implement for any capability

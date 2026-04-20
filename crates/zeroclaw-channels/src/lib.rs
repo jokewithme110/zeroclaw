@@ -4,10 +4,12 @@ pub mod orchestrator;
 pub mod util;
 
 // Always-compiled channels and utilities (no feature gate)
+pub mod bot_service;
 pub mod cli;
 pub mod link_enricher;
 pub mod transcription;
 pub mod tts;
+pub mod webchat;
 
 // Feature-gated channels
 #[cfg(feature = "channel-bluesky")]
