@@ -992,9 +992,9 @@ pub async fn run_tool_call_loop(
         // ── Progress: LLM thinking ────────────────────────────
         if let Some(ref tx) = on_delta {
             let phase = if iteration == 0 {
-                "\u{1f914} Thinking...\n".to_string()
+                "\u{1f914} 思考中...\n".to_string()
             } else {
-                format!("\u{1f914} Thinking (round {})...\n", iteration + 1)
+                format!("\u{1f914} 进行第{}次推理......\n", iteration + 1)
             };
             let _ = tx.send(StreamDelta::Status(phase)).await;
         }
@@ -1042,14 +1042,16 @@ pub async fn run_tool_call_loop(
 
         // Unified path via Provider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
-        let request_tools = if use_native_tools {
+        let request_tools = if !tool_specs.is_empty() {
             Some(tool_specs.as_slice())
         } else {
             None
         };
         let should_consume_provider_stream = on_delta.is_some()
             && provider.supports_streaming()
-            && (request_tools.is_none() || provider.supports_streaming_tool_events());
+            && (request_tools.is_none() || provider.supports_streaming_tool_events())
+            && channel_name != "webchat";
+
         tracing::debug!(
             has_on_delta = on_delta.is_some(),
             supports_streaming = provider.supports_streaming(),
@@ -1366,8 +1368,9 @@ pub async fn run_tool_call_loop(
             if !tool_calls.is_empty() {
                 let _ = tx
                     .send(StreamDelta::Status(format!(
-                        "\u{1f4ac} Got {} tool call(s) ({llm_secs}s)\n",
-                        tool_calls.len()
+                        "\u{1f4ac} 我需要先调用 {} 个工具来获取更多信息 , (本次推理耗时 {} 秒)\n",
+                        tool_calls.len(),
+                        llm_secs
                     )))
                     .await;
             }
@@ -2114,69 +2117,15 @@ pub async fn run(
     // When `deferred_loading` is enabled, MCP tools are NOT added to the registry
     // eagerly. Instead, a `tool_search` built-in is registered so the LLM can
     // fetch schemas on demand. This reduces context window waste.
-    let mut deferred_section = String::new();
-    let mut activated_handle: Option<
-        std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
-    > = None;
-    if config.mcp.enabled && !config.mcp.servers.is_empty() {
-        tracing::info!(
-            "Initializing MCP client — {} server(s) configured",
-            config.mcp.servers.len()
-        );
-        match crate::tools::McpRegistry::connect_all(&config.mcp.servers).await {
-            Ok(registry) => {
-                let registry = std::sync::Arc::new(registry);
-                if config.mcp.deferred_loading {
-                    // Deferred path: build stubs and register tool_search
-                    let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
-                        std::sync::Arc::clone(&registry),
-                    )
-                    .await;
-                    tracing::info!(
-                        "MCP deferred: {} tool stub(s) from {} server(s)",
-                        deferred_set.len(),
-                        registry.server_count()
-                    );
-                    deferred_section = crate::tools::build_deferred_tools_section(&deferred_set);
-                    let activated = std::sync::Arc::new(std::sync::Mutex::new(
-                        crate::tools::ActivatedToolSet::new(),
-                    ));
-                    activated_handle = Some(std::sync::Arc::clone(&activated));
-                    tools_registry.push(Box::new(crate::tools::ToolSearchTool::new(
-                        deferred_set,
-                        activated,
-                    )));
-                } else {
-                    // Eager path: register all MCP tools directly
-                    let names = registry.tool_names();
-                    let mut registered = 0usize;
-                    for name in names {
-                        if let Some(def) = registry.get_tool_def(&name).await {
-                            let wrapper: std::sync::Arc<dyn Tool> =
-                                std::sync::Arc::new(crate::tools::McpToolWrapper::new(
-                                    name,
-                                    def,
-                                    std::sync::Arc::clone(&registry),
-                                ));
-                            if let Some(ref handle) = delegate_handle {
-                                handle.write().push(std::sync::Arc::clone(&wrapper));
-                            }
-                            tools_registry.push(Box::new(crate::tools::ArcToolRef(wrapper)));
-                            registered += 1;
-                        }
-                    }
-                    tracing::info!(
-                        "MCP: {} tool(s) registered from {} server(s)",
-                        registered,
-                        registry.server_count()
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::error!("MCP registry failed to initialize: {e:#}");
-            }
-        }
-    }
+    let deferred_wire_out =
+        crate::tools::deferred_wire::wire_deferred_tool_surfaces(
+            &config,
+            &mut tools_registry,
+            delegate_handle.as_ref(),
+        )
+        .await;
+    let deferred_section = deferred_wire_out.deferred_prompt_section;
+    let activated_handle = deferred_wire_out.activated_tools;
 
     // ── Resolve provider ─────────────────────────────────────────
     let mut provider_name = provider_override
@@ -2365,6 +2314,17 @@ pub async fn run(
             "Query connected hardware for reported GPIO pins and LED pin. Use when: user asks what pins are available.",
         ));
     }
+
+    // For non-CLI callers (daemon / cron / gateway-style runs), apply the
+    // non_cli_excluded_tools allowlist so these tools are neither advertised
+    // in the system prompt nor callable at runtime.
+    if !interactive {
+        let excluded = &config.autonomy.non_cli_excluded_tools;
+        if !excluded.is_empty() {
+            tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
+        }
+    }
+
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
@@ -3078,71 +3038,15 @@ pub async fn process_message(
     };
     tools_registry.extend(peripheral_tools);
 
-    // ── Wire MCP tools (non-fatal) — process_message path ────────
-    // NOTE: Same ordering contract as the CLI path above — MCP tools must be
-    // injected after filter_primary_agent_tools_or_fail (or equivalent built-in
-    // tool allow/deny filtering) to avoid MCP tools being silently dropped.
-    let mut deferred_section = String::new();
-    let mut activated_handle_pm: Option<
-        std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
-    > = None;
-    if config.mcp.enabled && !config.mcp.servers.is_empty() {
-        tracing::info!(
-            "Initializing MCP client — {} server(s) configured",
-            config.mcp.servers.len()
-        );
-        match crate::tools::McpRegistry::connect_all(&config.mcp.servers).await {
-            Ok(registry) => {
-                let registry = std::sync::Arc::new(registry);
-                if config.mcp.deferred_loading {
-                    let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
-                        std::sync::Arc::clone(&registry),
-                    )
-                    .await;
-                    tracing::info!(
-                        "MCP deferred: {} tool stub(s) from {} server(s)",
-                        deferred_set.len(),
-                        registry.server_count()
-                    );
-                    deferred_section = crate::tools::build_deferred_tools_section(&deferred_set);
-                    let activated = std::sync::Arc::new(std::sync::Mutex::new(
-                        crate::tools::ActivatedToolSet::new(),
-                    ));
-                    activated_handle_pm = Some(std::sync::Arc::clone(&activated));
-                    tools_registry.push(Box::new(crate::tools::ToolSearchTool::new(
-                        deferred_set,
-                        activated,
-                    )));
-                } else {
-                    let names = registry.tool_names();
-                    let mut registered = 0usize;
-                    for name in names {
-                        if let Some(def) = registry.get_tool_def(&name).await {
-                            let wrapper: std::sync::Arc<dyn Tool> =
-                                std::sync::Arc::new(crate::tools::McpToolWrapper::new(
-                                    name,
-                                    def,
-                                    std::sync::Arc::clone(&registry),
-                                ));
-                            if let Some(ref handle) = delegate_handle_pm {
-                                handle.write().push(std::sync::Arc::clone(&wrapper));
-                            }
-                            tools_registry.push(Box::new(crate::tools::ArcToolRef(wrapper)));
-                            registered += 1;
-                        }
-                    }
-                    tracing::info!(
-                        "MCP: {} tool(s) registered from {} server(s)",
-                        registered,
-                        registry.server_count()
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::error!("MCP registry failed to initialize: {e:#}");
-            }
-        }
-    }
+    let deferred_wire_pm =
+        crate::tools::deferred_wire::wire_deferred_tool_surfaces(
+            &config,
+            &mut tools_registry,
+            delegate_handle_pm.as_ref(),
+        )
+        .await;
+    let deferred_section = deferred_wire_pm.deferred_prompt_section;
+    let activated_handle_pm = deferred_wire_pm.activated_tools;
 
     let provider_name = config.providers.fallback.as_deref().unwrap_or("openrouter");
     let model_name = fallback_provider_pm

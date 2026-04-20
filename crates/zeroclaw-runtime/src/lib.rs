@@ -11,6 +11,7 @@ pub mod approval;
 pub mod cost;
 pub mod cron;
 pub mod daemon;
+pub mod dt_nodes_registry;
 pub mod doctor;
 pub mod health;
 pub mod heartbeat;

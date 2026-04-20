@@ -5,6 +5,8 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_config::schema::Config;
+use zeroclaw_config::secrets::SecretStore;
 
 /// Web search tool for searching the internet.
 /// Supports multiple providers: DuckDuckGo (free), Brave (requires API key),
@@ -77,11 +79,10 @@ impl WebSearchTool {
     /// absent.
     fn resolve_brave_api_key(&self) -> anyhow::Result<String> {
         // Fast path: boot-time key is present and usable (not an encrypted blob).
-        if let Some(ref key) = self.boot_brave_api_key
-            && !key.is_empty()
-            && !zeroclaw_config::secrets::SecretStore::is_encrypted(key)
-        {
-            return Ok(key.clone());
+        if let Some(ref key) = self.boot_brave_api_key {
+            if !key.is_empty() && !SecretStore::is_encrypted(key) {
+                return Ok(key.clone());
+            }
         }
 
         // Slow path: re-read config.toml to pick up keys set/rotated after boot.
@@ -97,7 +98,7 @@ impl WebSearchTool {
             )
         })?;
 
-        let config: zeroclaw_config::schema::Config = toml::from_str(&contents).map_err(|e| {
+        let config: Config = toml::from_str(&contents).map_err(|e| {
             anyhow::anyhow!(
                 "Failed to parse config file {} for Brave API key: {e}",
                 self.config_path.display()
@@ -111,10 +112,9 @@ impl WebSearchTool {
             .ok_or_else(|| anyhow::anyhow!("Brave API key not configured"))?;
 
         // Decrypt if necessary.
-        if zeroclaw_config::secrets::SecretStore::is_encrypted(&raw_key) {
+        if SecretStore::is_encrypted(&raw_key) {
             let zeroclaw_dir = self.config_path.parent().unwrap_or_else(|| Path::new("."));
-            let store =
-                zeroclaw_config::secrets::SecretStore::new(zeroclaw_dir, self.secrets_encrypt);
+            let store = SecretStore::new(zeroclaw_dir, self.secrets_encrypt);
             let plaintext = store.decrypt(&raw_key)?;
             if plaintext.is_empty() {
                 anyhow::bail!("Brave API key not configured (decrypted value is empty)");
@@ -150,23 +150,38 @@ impl WebSearchTool {
     }
 
     fn parse_duckduckgo_results(&self, html: &str, query: &str) -> anyhow::Result<String> {
-        // Extract result links: <a class="result__a" href="...">Title</a>
-        let link_regex = Regex::new(
-            r#"<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>"#,
-        )?;
+        // Match all anchors first, then inspect attributes so class/href order changes
+        // in upstream HTML do not break extraction.
+        let anchor_regex = Regex::new(r#"<a([^>]*)>([\s\S]*?)</a>"#)?;
+        let class_regex = Regex::new(r#"class\s*=\s*["']([^"']*)["']"#)?;
+        let href_regex = Regex::new(r#"href\s*=\s*["']([^"']*)["']"#)?;
 
-        // Extract snippets: <a class="result__snippet">...</a>
-        let snippet_regex = Regex::new(r#"<a class="result__snippet[^"]*"[^>]*>([\s\S]*?)</a>"#)?;
+        let mut link_matches: Vec<(String, String)> = Vec::new();
+        let mut snippet_matches: Vec<String> = Vec::new();
 
-        let link_matches: Vec<_> = link_regex
-            .captures_iter(html)
-            .take(self.max_results + 2)
-            .collect();
+        for caps in anchor_regex.captures_iter(html) {
+            let attrs = caps.get(1).map_or("", |m| m.as_str());
+            let body = caps.get(2).map_or("", |m| m.as_str());
+            let classes = class_regex
+                .captures(attrs)
+                .and_then(|c| c.get(1))
+                .map(|m| m.as_str())
+                .unwrap_or("");
 
-        let snippet_matches: Vec<_> = snippet_regex
-            .captures_iter(html)
-            .take(self.max_results + 2)
-            .collect();
+            if classes.contains("result__a") {
+                if let Some(href) = href_regex
+                    .captures(attrs)
+                    .and_then(|c| c.get(1))
+                    .map(|m| m.as_str().to_string())
+                {
+                    link_matches.push((href, body.to_string()));
+                }
+            }
+
+            if classes.contains("result__snippet") {
+                snippet_matches.push(body.to_string());
+            }
+        }
 
         if link_matches.is_empty() {
             return Ok(format!("No results found for: {}", query));
@@ -177,16 +192,16 @@ impl WebSearchTool {
         let count = link_matches.len().min(self.max_results);
 
         for i in 0..count {
-            let caps = &link_matches[i];
-            let url_str = decode_ddg_redirect_url(&caps[1]);
-            let title = strip_tags(&caps[2]);
+            let (href, title_html) = &link_matches[i];
+            let url_str = decode_ddg_redirect_url(href);
+            let title = strip_tags(title_html);
 
             lines.push(format!("{}. {}", i + 1, title.trim()));
             lines.push(format!("   {}", url_str.trim()));
 
             // Add snippet if available
             if i < snippet_matches.len() {
-                let snippet = strip_tags(&snippet_matches[i][1]);
+                let snippet = strip_tags(&snippet_matches[i]);
                 let snippet = snippet.trim();
                 if !snippet.is_empty() {
                     lines.push(format!("   {}", snippet));
@@ -263,10 +278,10 @@ impl WebSearchTool {
     /// Resolve the SearXNG instance URL from the boot-time config or by
     /// re-reading `config.toml` at runtime.
     fn resolve_searxng_instance_url(&self) -> anyhow::Result<String> {
-        if let Some(ref url) = self.searxng_instance_url
-            && !url.is_empty()
-        {
-            return Ok(url.clone());
+        if let Some(ref url) = self.searxng_instance_url {
+            if !url.is_empty() {
+                return Ok(url.clone());
+            }
         }
 
         // Slow path: re-read config.toml to pick up values set after boot.
@@ -277,7 +292,7 @@ impl WebSearchTool {
             )
         })?;
 
-        let config: zeroclaw_config::schema::Config = toml::from_str(&contents).map_err(|e| {
+        let config: Config = toml::from_str(&contents).map_err(|e| {
             anyhow::anyhow!(
                 "Failed to parse config file {} for SearXNG instance URL: {e}",
                 self.config_path.display()
@@ -503,6 +518,19 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_duckduckgo_results_handles_attribute_order_changes() {
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let html = r#"
+            <a href="https://example.com/order" class="result__a extra">Order Title</a>
+            <a href="https://example.com/order" class="result__snippet">Order snippet text</a>
+        "#;
+        let result = tool.parse_duckduckgo_results(html, "order test").unwrap();
+        assert!(result.contains("Order Title"));
+        assert!(result.contains("https://example.com/order"));
+        assert!(result.contains("Order snippet text"));
+    }
+
+    #[test]
     fn test_constructor_clamps_web_search_limits() {
         let tool = WebSearchTool::new("duckduckgo".to_string(), None, 0, 0);
         let html = r#"
@@ -574,7 +602,7 @@ mod tests {
     #[test]
     fn test_resolve_brave_api_key_decrypts_encrypted_key() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let store = zeroclaw_config::secrets::SecretStore::new(tmp.path(), true);
+        let store = SecretStore::new(tmp.path(), true);
         let encrypted = store.encrypt("brave-secret-key").unwrap();
 
         let config_path = tmp.path().join("config.toml");

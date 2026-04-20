@@ -7,27 +7,121 @@
 
 use std::fmt::Write;
 use std::sync::{Arc, Mutex};
-
+use std::collections::HashSet;
 use async_trait::async_trait;
 
-use crate::mcp_deferred::{ActivatedToolSet, DeferredMcpToolSet};
+use crate::mcp_deferred::{ActivatedToolSet, DeferredMcpToolSet, DeferredMcpToolStub};
+use crate::native_deferred::{DeferredNativeToolSet, DeferredNativeToolStub};
 use zeroclaw_api::tool::{Tool, ToolResult};
 
 /// Default maximum number of search results.
 const DEFAULT_MAX_RESULTS: usize = 5;
 
-/// Built-in tool that fetches full schemas for deferred MCP tools.
+enum DeferredHit<'a> {
+    Mcp(&'a DeferredMcpToolStub),
+    Native(&'a DeferredNativeToolStub),
+}
+
+/// Built-in tool that discovers and activates deferred MCP and/or built-in tools.
 pub struct ToolSearchTool {
-    deferred: DeferredMcpToolSet,
+    mcp: DeferredMcpToolSet,
+    native: DeferredNativeToolSet,
     activated: Arc<Mutex<ActivatedToolSet>>,
 }
 
 impl ToolSearchTool {
-    pub fn new(deferred: DeferredMcpToolSet, activated: Arc<Mutex<ActivatedToolSet>>) -> Self {
+    pub fn new(
+        mcp: DeferredMcpToolSet,
+        native: DeferredNativeToolSet,
+        activated: Arc<Mutex<ActivatedToolSet>>,
+    ) -> Self {
         Self {
-            deferred,
+            mcp,
+            native,
             activated,
         }
+    }
+
+    fn combined_search(&self, query: &str, max_results: usize) -> Vec<DeferredHit<'_>> {
+        let mcp_hits = self.mcp.search(query, max_results);
+        let mut out: Vec<DeferredHit<'_>> = mcp_hits.into_iter().map(DeferredHit::Mcp).collect();
+        let mut seen: HashSet<String> = out
+            .iter()
+            .filter_map(|h| match h {
+                DeferredHit::Mcp(s) => Some(s.prefixed_name.clone()),
+                DeferredHit::Native(s) => Some(s.name.clone()),
+            })
+            .collect();
+
+        for s in self.native.search(query, max_results) {
+            if out.len() >= max_results {
+                break;
+            }
+            if seen.contains(&s.name) {
+                continue;
+            }
+            seen.insert(s.name.clone());
+            out.push(DeferredHit::Native(s));
+        }
+        out
+    }
+
+    fn tool_spec_any(&self, name: &str) -> Option<zeroclaw_api::tool::ToolSpec> {
+        self.mcp
+            .tool_spec(name)
+            .or_else(|| self.native.tool_spec(name))
+    }
+
+    fn select_tools(&self, names: &[&str]) -> anyhow::Result<ToolResult> {
+        let mut output = String::from("<functions>\n");
+        let mut not_found = Vec::new();
+        let mut activated_count = 0;
+        let mut guard = self.activated.lock().unwrap();
+
+        for name in names {
+            if name.is_empty() {
+                continue;
+            }
+            if let Some(spec) = self.tool_spec_any(name) {
+                if !guard.is_activated(name) {
+                    if let Some(tool) = self.mcp.activate(name) {
+                        guard.activate(String::from(*name), Arc::from(tool));
+                        activated_count += 1;
+                    } else if let Some(arc) = self.native.activate_arc(name) {
+                        guard.activate(String::from(*name), arc);
+                        activated_count += 1;
+                    }
+                }
+                let _ = writeln!(
+                    output,
+                    "<function>{{\"name\": \"{}\", \"description\": \"{}\", \"parameters\": {}}}</function>",
+                    spec.name,
+                    spec.description.replace('"', "\\\""),
+                    spec.parameters
+                );
+            } else {
+                not_found.push(*name);
+            }
+        }
+
+        output.push_str("</functions>\n");
+        drop(guard);
+
+        if !not_found.is_empty() {
+            let _ = write!(output, "\nNot found: {}", not_found.join(", "));
+        }
+
+        tracing::debug!(
+            "tool_search select: requested={}, activated={activated_count}, not_found={}",
+            names.len(),
+            not_found.len()
+        );
+
+        Ok(ToolResult {
+            success: true,
+            output,
+            error: None,
+        })
     }
 }
 
@@ -38,7 +132,7 @@ impl Tool for ToolSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch full schema definitions for deferred MCP tools so they can be called. \
+        "Fetch full schema definitions for deferred tools (MCP and/or built-in) so they can be called. \
          Use \"select:name1,name2\" for exact match or keywords to search."
     }
 
@@ -81,15 +175,12 @@ impl Tool for ToolSearchTool {
             });
         }
 
-        // Parse query mode
         if let Some(names_str) = query.strip_prefix("select:") {
-            // Exact selection mode
             let names: Vec<&str> = names_str.split(',').map(str::trim).collect();
             return self.select_tools(&names);
         }
 
-        // Keyword search mode
-        let results = self.deferred.search(query, max_results);
+        let results = self.combined_search(query, max_results);
         if results.is_empty() {
             return Ok(ToolResult {
                 success: true,
@@ -98,26 +189,43 @@ impl Tool for ToolSearchTool {
             });
         }
 
-        // Activate and return full specs
         let mut output = String::from("<functions>\n");
         let mut activated_count = 0;
         let mut guard = self.activated.lock().unwrap();
 
-        for stub in &results {
-            if let Some(spec) = self.deferred.tool_spec(&stub.prefixed_name) {
-                if !guard.is_activated(&stub.prefixed_name)
-                    && let Some(tool) = self.deferred.activate(&stub.prefixed_name)
-                {
-                    guard.activate(stub.prefixed_name.clone(), Arc::from(tool));
-                    activated_count += 1;
+        for hit in &results {
+            match hit {
+                DeferredHit::Mcp(stub) => {
+                    if let Some(spec) = self.mcp.tool_spec(&stub.prefixed_name) {
+                        if !guard.is_activated(&stub.prefixed_name) {
+                            if let Some(tool) = self.mcp.activate(&stub.prefixed_name) {
+                                guard.activate(stub.prefixed_name.clone(), Arc::from(tool));
+                                activated_count += 1;
+                            }
+                        }
+                        let _ = writeln!(
+                            output,
+                            "<function>{{\"name\": \"{}\", \"description\": \"{}\", \"parameters\": {}}}</function>",
+                            spec.name,
+                            spec.description.replace('"', "\\\""),
+                            spec.parameters
+                        );
+                    }
                 }
-                let _ = writeln!(
-                    output,
-                    "<function>{{\"name\": \"{}\", \"description\": \"{}\", \"parameters\": {}}}</function>",
-                    spec.name,
-                    spec.description.replace('"', "\\\""),
-                    spec.parameters
-                );
+                DeferredHit::Native(stub) => {
+                    let spec = stub.spec();
+                    if !guard.is_activated(&stub.name) {
+                        guard.activate(stub.name.clone(), stub.tool_arc());
+                        activated_count += 1;
+                    }
+                    let _ = writeln!(
+                        output,
+                        "<function>{{\"name\": \"{}\", \"description\": \"{}\", \"parameters\": {}}}</function>",
+                        spec.name,
+                        spec.description.replace('"', "\\\""),
+                        spec.parameters
+                    );
+                }
             }
         }
 
@@ -137,68 +245,16 @@ impl Tool for ToolSearchTool {
     }
 }
 
-impl ToolSearchTool {
-    fn select_tools(&self, names: &[&str]) -> anyhow::Result<ToolResult> {
-        let mut output = String::from("<functions>\n");
-        let mut not_found = Vec::new();
-        let mut activated_count = 0;
-        let mut guard = self.activated.lock().unwrap();
-
-        for name in names {
-            if name.is_empty() {
-                continue;
-            }
-            match self.deferred.tool_spec(name) {
-                Some(spec) => {
-                    if !guard.is_activated(name)
-                        && let Some(tool) = self.deferred.activate(name)
-                    {
-                        guard.activate(String::from(*name), Arc::from(tool));
-                        activated_count += 1;
-                    }
-                    let _ = writeln!(
-                        output,
-                        "<function>{{\"name\": \"{}\", \"description\": \"{}\", \"parameters\": {}}}</function>",
-                        spec.name,
-                        spec.description.replace('"', "\\\""),
-                        spec.parameters
-                    );
-                }
-                None => {
-                    not_found.push(*name);
-                }
-            }
-        }
-
-        output.push_str("</functions>\n");
-        drop(guard);
-
-        if !not_found.is_empty() {
-            let _ = write!(output, "\nNot found: {}", not_found.join(", "));
-        }
-
-        tracing::debug!(
-            "tool_search select: requested={}, activated={activated_count}, not_found={}",
-            names.len(),
-            not_found.len()
-        );
-
-        Ok(ToolResult {
-            success: true,
-            output,
-            error: None,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mcp_client::McpRegistry;
     use crate::mcp_deferred::DeferredMcpToolStub;
     use crate::mcp_protocol::McpToolDef;
+    use crate::native_deferred::DeferredNativeToolStub;
+    use async_trait::async_trait;
 
-    async fn make_deferred_set(stubs: Vec<DeferredMcpToolStub>) -> DeferredMcpToolSet {
+    async fn make_mcp_set(stubs: Vec<DeferredMcpToolStub>) -> DeferredMcpToolSet {
         let registry = Arc::new(McpRegistry::connect_all(&[]).await.unwrap());
         DeferredMcpToolSet { stubs, registry }
     }
@@ -212,10 +268,47 @@ mod tests {
         DeferredMcpToolStub::new(name.to_string(), def)
     }
 
+    struct NamedTool {
+        n: &'static str,
+        d: &'static str,
+    }
+
+    #[async_trait]
+    impl Tool for NamedTool {
+        fn name(&self) -> &str {
+            self.n
+        }
+        fn description(&self) -> &str {
+            self.d
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{"x":{"type":"string"}}})
+        }
+        async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: String::new(),
+                error: None,
+            })
+        }
+    }
+
+    fn make_native_set(names: &[(&'static str, &'static str)]) -> DeferredNativeToolSet {
+        let stubs: Vec<_> = names
+            .iter()
+            .map(|&(n, d)| {
+                let arc: Arc<dyn Tool> = Arc::new(NamedTool { n, d });
+                DeferredNativeToolStub::new(arc)
+            })
+            .collect();
+        DeferredNativeToolSet { stubs }
+    }
+
     #[tokio::test]
     async fn tool_metadata() {
         let tool = ToolSearchTool::new(
-            make_deferred_set(vec![]).await,
+            make_mcp_set(vec![]).await,
+            DeferredNativeToolSet::empty(),
             Arc::new(Mutex::new(ActivatedToolSet::new())),
         );
         assert_eq!(tool.name(), "tool_search");
@@ -226,7 +319,8 @@ mod tests {
     #[tokio::test]
     async fn empty_query_returns_error() {
         let tool = ToolSearchTool::new(
-            make_deferred_set(vec![]).await,
+            make_mcp_set(vec![]).await,
+            DeferredNativeToolSet::empty(),
             Arc::new(Mutex::new(ActivatedToolSet::new())),
         );
         let result = tool
@@ -239,7 +333,8 @@ mod tests {
     #[tokio::test]
     async fn select_nonexistent_tool_reports_not_found() {
         let tool = ToolSearchTool::new(
-            make_deferred_set(vec![]).await,
+            make_mcp_set(vec![]).await,
+            DeferredNativeToolSet::empty(),
             Arc::new(Mutex::new(ActivatedToolSet::new())),
         );
         let result = tool
@@ -253,7 +348,8 @@ mod tests {
     #[tokio::test]
     async fn keyword_search_no_matches() {
         let tool = ToolSearchTool::new(
-            make_deferred_set(vec![make_stub("fs__read", "Read file")]).await,
+            make_mcp_set(vec![make_stub("fs__read", "Read file")]).await,
+            DeferredNativeToolSet::empty(),
             Arc::new(Mutex::new(ActivatedToolSet::new())),
         );
         let result = tool
@@ -268,7 +364,8 @@ mod tests {
     async fn keyword_search_finds_match() {
         let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
         let tool = ToolSearchTool::new(
-            make_deferred_set(vec![make_stub("fs__read", "Read a file from disk")]).await,
+            make_mcp_set(vec![make_stub("fs__read", "Read a file from disk")]).await,
+            DeferredNativeToolSet::empty(),
             Arc::clone(&activated),
         );
         let result = tool
@@ -278,12 +375,36 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains("<function>"));
         assert!(result.output.contains("fs__read"));
-        // Tool should now be activated
         assert!(activated.lock().unwrap().is_activated("fs__read"));
     }
 
-    /// Verify tool_search works with stubs from multiple MCP servers,
-    /// simulating a daemon-mode setup where several servers are deferred.
+    #[tokio::test]
+    async fn native_deferred_keyword_search() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let native = make_native_set(&[("weather_tool", "Get weather forecast for a city")]);
+        let tool = ToolSearchTool::new(make_mcp_set(vec![]).await, native, Arc::clone(&activated));
+        let result = tool
+            .execute(serde_json::json!({"query": "weather forecast"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("weather_tool"));
+        assert!(activated.lock().unwrap().is_activated("weather_tool"));
+    }
+
+    #[tokio::test]
+    async fn native_select_mode() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let native = make_native_set(&[("pdf_read", "Read PDF files")]);
+        let tool = ToolSearchTool::new(make_mcp_set(vec![]).await, native, Arc::clone(&activated));
+        let result = tool
+            .execute(serde_json::json!({"query": "select:pdf_read"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(activated.lock().unwrap().is_activated("pdf_read"));
+    }
+
     #[tokio::test]
     async fn multiple_servers_stubs_all_searchable() {
         let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
@@ -293,9 +414,12 @@ mod tests {
             make_stub("server_b__query_db", "Query database on server B"),
             make_stub("server_b__insert_row", "Insert row on server B"),
         ];
-        let tool = ToolSearchTool::new(make_deferred_set(stubs).await, Arc::clone(&activated));
+        let tool = ToolSearchTool::new(
+            make_mcp_set(stubs).await,
+            DeferredNativeToolSet::empty(),
+            Arc::clone(&activated),
+        );
 
-        // Search should find tools across both servers
         let result = tool
             .execute(serde_json::json!({"query": "file"}))
             .await
@@ -304,7 +428,6 @@ mod tests {
         assert!(result.output.contains("server_a__list_files"));
         assert!(result.output.contains("server_a__read_file"));
 
-        // Server B tools should also be searchable
         let result = tool
             .execute(serde_json::json!({"query": "database query"}))
             .await
@@ -313,8 +436,6 @@ mod tests {
         assert!(result.output.contains("server_b__query_db"));
     }
 
-    /// Verify select mode activates tools and they stay activated across calls,
-    /// matching the daemon-mode pattern where a single ActivatedToolSet persists.
     #[tokio::test]
     async fn select_activates_and_persists_across_calls() {
         let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
@@ -322,9 +443,12 @@ mod tests {
             make_stub("srv__tool_a", "Tool A"),
             make_stub("srv__tool_b", "Tool B"),
         ];
-        let tool = ToolSearchTool::new(make_deferred_set(stubs).await, Arc::clone(&activated));
+        let tool = ToolSearchTool::new(
+            make_mcp_set(stubs).await,
+            DeferredNativeToolSet::empty(),
+            Arc::clone(&activated),
+        );
 
-        // Activate tool_a
         let result = tool
             .execute(serde_json::json!({"query": "select:srv__tool_a"}))
             .await
@@ -333,26 +457,24 @@ mod tests {
         assert!(activated.lock().unwrap().is_activated("srv__tool_a"));
         assert!(!activated.lock().unwrap().is_activated("srv__tool_b"));
 
-        // Activate tool_b in a separate call
         let result = tool
             .execute(serde_json::json!({"query": "select:srv__tool_b"}))
             .await
             .unwrap();
         assert!(result.success);
 
-        // Both should remain activated
         let guard = activated.lock().unwrap();
         assert!(guard.is_activated("srv__tool_a"));
         assert!(guard.is_activated("srv__tool_b"));
         assert_eq!(guard.tool_specs().len(), 2);
     }
 
-    /// Verify re-activating an already-activated tool does not duplicate it.
     #[tokio::test]
     async fn reactivation_is_idempotent() {
         let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
         let tool = ToolSearchTool::new(
-            make_deferred_set(vec![make_stub("srv__tool", "A tool")]).await,
+            make_mcp_set(vec![make_stub("srv__tool", "A tool")]).await,
+            DeferredNativeToolSet::empty(),
             Arc::clone(&activated),
         );
 

@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "crates/zeroclaw-tui", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri"]
+members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "crates/zeroclaw-tui", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "crates/zeroclaw-dt-nodes", "apps/tauri"]
 resolver = "2"
 
 [workspace.package]
@@ -24,6 +24,7 @@ zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.7.3" }
 zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.7.3" }
 zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.7.3" }
 zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.7.3" }
+zeroclaw-dt-nodes = { path = "crates/zeroclaw-dt-nodes", version = "0.7.3" }
 aardvark-sys = { path = "crates/aardvark-sys", version = "0.1.0" }
 
 [package]
@@ -78,6 +79,7 @@ zeroclaw-gateway = { workspace = true, optional = true }
 zeroclaw-hardware = { workspace = true, optional = true }
 zeroclaw-tool-call-parser.workspace = true
 zeroclaw-macros.workspace = true
+zeroclaw-dt-nodes.workspace = true
 # CLI - minimal and fast
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
@@ -111,7 +113,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
-# URL encoding for web search
+# URL handling / encoding for web search and proxies
+url = "2.5"
 urlencoding = "2.1"
 
 # HTML to plain text conversion (web_fetch tool)
@@ -222,6 +225,13 @@ mime_guess = { version = "2", optional = true }
 # Use the blocking HTTP exporter client to avoid Tokio-reactor panics in
 # non-Tokio contexts.
 
+# Serial port for peripheral communication (STM32, etc.)
+tokio-serial = { version = "5", default-features = false, optional = true }
+ra2a = { version = "0.8.1", default-features = false, features = ["client", "server", "axum"] }
+mdns-sd = "0.18.2"
+local-ip-address = "0.6.11"
+
+# USB device enumeration (hardware discovery) — only on platforms nusb supports
 # (Linux, macOS, Windows). Android/Termux uses target_os="android" and is excluded.
 
 # Uses wa-rs for Bot and Client, wa-rs-core for storage traits, custom rusqlite backend avoids Diesel conflict.

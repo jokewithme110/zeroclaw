@@ -21,9 +21,14 @@ pub mod cron_remove;
 pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
+pub mod a2a_client;
+pub mod channel_send;
+pub mod deferred_wire;
 pub mod delegate;
+pub mod dt_nodes_tool;
 pub mod file_read;
 pub mod model_switch;
+pub mod native_deferred;
 pub mod read_skill;
 pub mod schedule;
 pub mod security_ops;
@@ -119,7 +124,10 @@ pub use cron_remove::CronRemoveTool;
 pub use cron_run::CronRunTool;
 pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
+pub use a2a_client::A2aClientTool;
+pub use channel_send::ChannelSendTool;
 pub use delegate::DelegateTool;
+pub use dt_nodes_tool::NodesTool;
 pub use file_read::FileReadTool;
 pub use model_switch::ModelSwitchTool;
 pub use read_skill::ReadSkillTool;
@@ -143,7 +151,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use zeroclaw_config::schema::{Config, DelegateAgentConfig};
 use zeroclaw_memory::Memory;
-
+use crate::dt_nodes_registry::ConnectedNodeRegistry;
 /// Shared handle to the delegate tool's parent-tools list.
 /// Callers can push additional tools (e.g. MCP wrappers) after construction.
 pub type DelegateParentToolsHandle = Arc<RwLock<Vec<Arc<dyn Tool>>>>;
@@ -341,6 +349,7 @@ pub fn all_tools_with_runtime(
             ),
             security.clone(),
         )),
+        Arc::new(A2aClientTool::new(security.clone())),
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(FileEditTool::new(security.clone())),
@@ -375,6 +384,10 @@ pub fn all_tools_with_runtime(
         Arc::new(CalculatorTool::new()),
         Arc::new(WeatherTool::new()),
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
+        Arc::new(ChannelSendTool::new(
+            config.clone(),
+            security.clone(),
+        )),
     ];
 
     // Register discord_search if discord_history channel is configured
@@ -431,6 +444,13 @@ pub fn all_tools_with_runtime(
         )));
     }
 
+    if config.gateway.node_control.enabled {
+        tool_arcs.push(Arc::new(NodesTool::new(
+            ConnectedNodeRegistry::global(),
+            workspace_dir,
+        )));
+    }
+
     if browser_config.enabled {
         // Add legacy browser_open tool for simple URL opening
         tool_arcs.push(Arc::new(BrowserOpenTool::new(
@@ -479,6 +499,7 @@ pub fn all_tools_with_runtime(
             http_config.max_response_size,
             http_config.timeout_secs,
             http_config.allow_private_hosts,
+            http_config.url_placeholders.clone(),
         )));
     }
 
