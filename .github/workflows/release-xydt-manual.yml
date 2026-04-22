@@ -164,7 +164,7 @@ jobs:
         shell: bash
         run: |
           if [ "${{ matrix.skip_prometheus || 'false' }}" = "true" ]; then
-            cargo zigbuild --release --locked --no-default-features --features "${{ env.RELEASE_CARGO_FEATURES }},channel-nostr,skill-creation" --target ${{ matrix.target }}
+            cargo zigbuild --release --locked --no-default-features --features "${{ env.RELEASE_CARGO_FEATURES }},channel-nostr" --target ${{ matrix.target }}
           else
             cargo zigbuild --release --locked --features "${{ env.RELEASE_CARGO_FEATURES }}" --target ${{ matrix.target }}
           fi
