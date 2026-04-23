@@ -134,7 +134,6 @@ jobs:
             target: armv7-unknown-linux-musleabihf
             artifact: zeroclaw
             ext: tar.gz
-            skip_prometheus: true
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -164,7 +163,7 @@ jobs:
         shell: bash
         run: |
           if [ "${{ matrix.skip_prometheus || 'false' }}" = "true" ]; then
-            cargo zigbuild --release --locked --no-default-features --features "${{ env.RELEASE_CARGO_FEATURES }},channel-nostr,skill-creation" --target ${{ matrix.target }}
+            cargo zigbuild --release --locked --no-default-features --features "${{ env.RELEASE_CARGO_FEATURES }},channel-nostr" --target ${{ matrix.target }}
           else
             cargo zigbuild --release --locked --features "${{ env.RELEASE_CARGO_FEATURES }}" --target ${{ matrix.target }}
           fi
