@@ -5,10 +5,11 @@ use super::store::SkillScanStore;
 use super::types::{ScanStatus, SkillScanRecord};
 use anyhow::{Context, Result};
 use chrono::Utc;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::thread;
-use std::time::{Duration, Instant};
 use zeroclaw_config::schema::{SkillScanSeverity, SkillsScanConfig};
+
+const MAX_UPLOAD_THREADS: usize = 4;
 
 pub fn run_scan_cycle(workspace_dir: &Path, scan_cfg: &SkillsScanConfig) -> Result<()> {
     if !scan_cfg.enabled {
@@ -16,95 +17,163 @@ pub fn run_scan_cycle(workspace_dir: &Path, scan_cfg: &SkillsScanConfig) -> Resu
     }
     let mut store = SkillScanStore::load(workspace_dir)?;
     let skill_dirs = list_workspace_skill_dirs(workspace_dir)?;
-    tracing::info!(
+    tracing::debug!(
         "skill scan cycle: discovered {} skill directories under {}",
         skill_dirs.len(),
         workspace_dir.join("skills").display()
     );
+    let active_skill_ids: HashSet<String> = skill_dirs
+        .iter()
+        .map(|dir| skill_id_from_dir(dir))
+        .collect();
+    let pruned = store.prune_missing_skills(&active_skill_ids);
+    if pruned > 0 {
+        tracing::info!("skill scan: removed {pruned} stale records for deleted skills");
+    }
+    run_parallel_upload_phase(&skill_dirs, scan_cfg, &mut store)?;
     for skill_dir in skill_dirs {
-        if let Err(err) = evaluate_skill(&skill_dir, scan_cfg, &mut store) {
-            tracing::warn!(
-                "skill scan: cycle failed for {}: {err:#}",
-                skill_dir.display()
-            );
+        let skill_id = skill_id_from_dir(&skill_dir);
+        if let Err(err) = poll_skill_once(&skill_id, scan_cfg, &mut store) {
+            tracing::warn!("skill scan: poll failed for '{skill_id}': {err:#}");
         }
     }
     store.save()?;
     Ok(())
 }
 
-fn evaluate_skill(
-    skill_dir: &Path,
+#[derive(Debug)]
+enum UploadOutcome {
+    Skipped {
+        skill_id: String,
+    },
+    Uploaded {
+        skill_id: String,
+        archive_sha: String,
+        task_no: String,
+    },
+    Failed {
+        skill_id: String,
+        archive_sha: String,
+        error: String,
+    },
+}
+
+fn run_parallel_upload_phase(
+    skill_dirs: &[PathBuf],
     scan_cfg: &SkillsScanConfig,
     store: &mut SkillScanStore,
-) -> Result<bool> {
+) -> Result<()> {
+    for chunk in skill_dirs.chunks(MAX_UPLOAD_THREADS) {
+        let mut handles = Vec::with_capacity(chunk.len());
+        for skill_dir in chunk {
+            let skill_dir = skill_dir.clone();
+            let scan_cfg = scan_cfg.clone();
+            let existing = store.get(&skill_id_from_dir(&skill_dir)).cloned();
+            let handle = std::thread::spawn(move || {
+                prepare_and_upload_skill(&skill_dir, &scan_cfg, existing)
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            let outcome = match handle.join() {
+                Ok(outcome) => outcome,
+                Err(_) => UploadOutcome::Failed {
+                    skill_id: "<unknown>".to_string(),
+                    archive_sha: String::new(),
+                    error: "upload worker thread panicked".to_string(),
+                },
+            };
+            match outcome {
+                UploadOutcome::Skipped { skill_id } => {
+                    tracing::debug!("skill scan: skip upload for '{skill_id}'");
+                }
+                UploadOutcome::Uploaded {
+                    skill_id,
+                    archive_sha,
+                    task_no,
+                } => {
+                    let record = SkillScanRecord {
+                        skill_id: skill_id.clone(),
+                        archive_sha256: archive_sha,
+                        scan_task_no: Some(task_no.clone()),
+                        // Keep blocked by default until a later polling cycle decides final status.
+                        scan_status: ScanStatus::Blocked,
+                        max_severity: None,
+                        is_safe: None,
+                        last_scanned_at: None,
+                        last_error: Some("scan queued, awaiting result polling".to_string()),
+                    };
+                    store.upsert(record);
+                    // Persist immediately once task_no is available.
+                    store.save()?;
+                    tracing::info!(
+                        "skill scan: upload accepted for '{}' task_no={} (persisted)",
+                        skill_id,
+                        task_no
+                    );
+                }
+                UploadOutcome::Failed {
+                    skill_id,
+                    archive_sha,
+                    error,
+                } => {
+                    let record = SkillScanRecord {
+                        skill_id: skill_id.clone(),
+                        archive_sha256: archive_sha,
+                        scan_task_no: None,
+                        scan_status: ScanStatus::Error,
+                        max_severity: None,
+                        is_safe: None,
+                        last_scanned_at: Some(Utc::now().to_rfc3339()),
+                        last_error: Some(error.clone()),
+                    };
+                    store.upsert(record);
+                    store.save()?;
+                    tracing::warn!("skill scan: upload failed for '{skill_id}': {error}");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn prepare_and_upload_skill(
+    skill_dir: &Path,
+    scan_cfg: &SkillsScanConfig,
+    existing: Option<SkillScanRecord>,
+) -> UploadOutcome {
     let skill_id = skill_id_from_dir(skill_dir);
-    let archive_bytes = build_skill_archive(skill_dir)?;
+    let archive_bytes = match build_skill_archive(skill_dir) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return UploadOutcome::Failed {
+                skill_id,
+                archive_sha: String::new(),
+                error: format!("build archive failed: {err:#}"),
+            };
+        }
+    };
     let archive_sha = sha256_hex(&archive_bytes);
 
-    if let Some(existing) = store.get(&skill_id) {
+    if let Some(existing) = existing.as_ref() {
         if existing.archive_sha256 == archive_sha {
             if matches!(existing.scan_status, ScanStatus::Allowed) {
-                tracing::debug!(
-                    "skill scan: no archive change for '{}', keeping status={:?}",
-                    skill_id,
-                    existing.scan_status
-                );
-                return Ok(true);
+                return UploadOutcome::Skipped { skill_id };
             }
-
-            let should_retry_same_sha = matches!(
-                existing.scan_status,
-                ScanStatus::Scanning | ScanStatus::PendingScan | ScanStatus::Error
-            ) || (matches!(existing.scan_status, ScanStatus::Blocked)
-                && existing
-                    .last_error
-                    .as_deref()
-                    .is_some_and(|e| e.contains("timed out") || e.contains("failed")));
-
-            if !should_retry_same_sha {
-                tracing::debug!(
-                    "skill scan: no archive change for '{}' and status is stable {:?}, skipping rescan",
-                    skill_id,
-                    existing.scan_status
-                );
-                return Ok(false);
+            if existing.scan_task_no.is_some() && should_poll_record(existing) {
+                return UploadOutcome::Skipped { skill_id };
             }
-
+            if !should_retry_upload(existing) {
+                return UploadOutcome::Skipped { skill_id };
+            }
             tracing::info!(
-                "skill scan: retrying '{}' with unchanged archive due to transient status={:?}, last_error={:?}",
+                "skill scan: retry upload for '{}' with unchanged archive due to status={:?}, last_error={:?}",
                 skill_id,
                 existing.scan_status,
                 existing.last_error
             );
-
-            if let Some(existing_task_no) = existing.scan_task_no.clone() {
-                tracing::info!(
-                    "skill scan: reusing existing task_no={} for '{}' (no re-upload)",
-                    existing_task_no,
-                    skill_id
-                );
-                let now = Utc::now().to_rfc3339();
-                let client = SkillScanClient::new(
-                    scan_cfg.api.upload_url.clone(),
-                    scan_cfg.api.result_url.clone(),
-                )?;
-                let mut record = existing.clone();
-                record.scan_status = ScanStatus::Scanning;
-                record.last_error = None;
-                record.last_scanned_at = None;
-                store.upsert(record.clone());
-                return wait_for_scan_completion(
-                    &client,
-                    &existing_task_no,
-                    &archive_sha,
-                    &skill_id,
-                    scan_cfg,
-                    &now,
-                    &mut record,
-                    store,
-                );
-            }
         }
         if existing.archive_sha256 != archive_sha {
             tracing::info!(
@@ -114,166 +183,163 @@ fn evaluate_skill(
                 archive_sha
             );
         }
-    } else {
-        tracing::info!(
-            "skill scan: new skill detected '{}', scheduling scan",
-            skill_id
-        );
     }
 
-    let now = Utc::now().to_rfc3339();
-    let mut record = SkillScanRecord {
-        skill_id: skill_id.clone(),
-        archive_sha256: archive_sha.clone(),
-        scan_task_no: None,
-        scan_status: ScanStatus::Scanning,
-        max_severity: None,
-        is_safe: None,
-        last_scanned_at: None,
-        last_error: None,
+    let client = match SkillScanClient::new(
+        scan_cfg.api.upload_url.clone(),
+        scan_cfg.api.result_url.clone(),
+    ) {
+        Ok(client) => client,
+        Err(err) => {
+            return UploadOutcome::Failed {
+                skill_id,
+                archive_sha,
+                error: format!("build client failed: {err:#}"),
+            };
+        }
     };
-    store.upsert(record.clone());
+    let filename = format!("{skill_id}.zip");
+    let upload = match client.upload_archive(archive_bytes, &filename) {
+        Ok(upload) => upload,
+        Err(err) => {
+            return UploadOutcome::Failed {
+                skill_id,
+                archive_sha,
+                error: format!("upload scan failed: {err:#}"),
+            };
+        }
+    };
+    if let Some(server_sha) = upload.file_sha256.as_deref() {
+        if !server_sha.eq_ignore_ascii_case(&archive_sha) {
+            return UploadOutcome::Failed {
+                skill_id,
+                archive_sha: archive_sha.clone(),
+                error: format!(
+                    "archive sha mismatch: local={}, remote={server_sha}",
+                    archive_sha
+                ),
+            };
+        }
+    }
+    UploadOutcome::Uploaded {
+        skill_id,
+        archive_sha,
+        task_no: upload.task_no,
+    }
+}
 
+fn should_retry_upload(existing: &SkillScanRecord) -> bool {
+    matches!(
+        existing.scan_status,
+        ScanStatus::Scanning | ScanStatus::PendingScan | ScanStatus::Error
+    ) || (matches!(existing.scan_status, ScanStatus::Blocked)
+        && existing.last_error.as_deref().is_some_and(|e| {
+            e.contains("timed out")
+                || e.contains("failed")
+                || e.contains("queued")
+                || e.contains("awaiting result")
+                || e.contains("still running")
+        }))
+}
+
+fn should_poll_record(existing: &SkillScanRecord) -> bool {
+    matches!(
+        existing.scan_status,
+        ScanStatus::Scanning | ScanStatus::PendingScan
+    ) || existing.last_error.as_deref().is_some_and(|e| {
+        e.contains("timed out")
+            || e.contains("queued")
+            || e.contains("awaiting result")
+            || e.contains("still running")
+    })
+}
+
+fn poll_skill_once(
+    skill_id: &str,
+    scan_cfg: &SkillsScanConfig,
+    store: &mut SkillScanStore,
+) -> Result<()> {
+    let Some(existing) = store.get(skill_id).cloned() else {
+        return Ok(());
+    };
+    if !should_poll_record(&existing) {
+        return Ok(());
+    }
+    let Some(task_no) = existing.scan_task_no.clone() else {
+        return Ok(());
+    };
     let client = SkillScanClient::new(
         scan_cfg.api.upload_url.clone(),
         scan_cfg.api.result_url.clone(),
     )?;
-    let filename = format!("{skill_id}.zip");
-    tracing::info!(
-        "skill scan: uploading archive for '{}' as {}",
-        skill_id,
-        filename
-    );
-    let upload = client.upload_archive(archive_bytes, &filename)?;
-    record.scan_task_no = Some(upload.task_no.clone());
-    tracing::info!(
-        "skill scan: upload accepted for '{}' task_no={}",
-        skill_id,
-        upload.task_no
-    );
-    if let Some(server_sha) = upload.file_sha256.as_deref() {
-        if !server_sha.eq_ignore_ascii_case(&archive_sha) {
+    let result = client
+        .query_result(&task_no)
+        .with_context(|| format!("query result failed for task {task_no}"))?;
+    let mut record = existing;
+    if let Some(server_sha) = result.file_sha256.as_deref() {
+        if !server_sha.eq_ignore_ascii_case(&record.archive_sha256) {
             record.scan_status = ScanStatus::Blocked;
             record.last_error = Some(format!(
-                "archive sha mismatch: local={}, remote={server_sha}",
-                archive_sha
+                "archive sha mismatch while polling: local={}, remote={server_sha}",
+                record.archive_sha256
             ));
-            record.last_scanned_at = Some(now.clone());
+            record.last_scanned_at = Some(Utc::now().to_rfc3339());
             store.upsert(record);
-            return Ok(false);
+            return Ok(());
         }
     }
-    store.upsert(record.clone());
+    let completed = result.status == 2 || result.status_text == "completed";
+    if !completed {
+        record.scan_status = ScanStatus::Blocked;
+        record.last_error = Some(format!("scan still running (task_no={task_no})"));
+        store.upsert(record);
+        return Ok(());
+    }
 
-    wait_for_scan_completion(
-        &client,
-        upload.task_no.as_str(),
-        &archive_sha,
-        &skill_id,
-        scan_cfg,
-        &now,
-        &mut record,
-        store,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn wait_for_scan_completion(
-    client: &SkillScanClient,
-    task_no: &str,
-    archive_sha: &str,
-    skill_id: &str,
-    scan_cfg: &SkillsScanConfig,
-    now: &str,
-    record: &mut SkillScanRecord,
-    store: &mut SkillScanStore,
-) -> Result<bool> {
-    record.scan_task_no = Some(task_no.to_string());
-    let deadline = Instant::now() + Duration::from_secs(scan_cfg.poll_timeout_secs.max(1));
-    let poll_sleep = Duration::from_secs(scan_cfg.poll_interval_secs.max(1));
-    loop {
-        if Instant::now() >= deadline {
-            record.scan_status = ScanStatus::Blocked;
-            record.last_error = Some(format!("scan polling timed out (task_no={task_no})"));
-            record.last_scanned_at = Some(now.to_string());
-            store.upsert(record.clone());
-            return Ok(false);
-        }
-
-        let result = client
-            .query_result(task_no)
-            .with_context(|| format!("query result failed for task {task_no}"))?;
-
-        if let Some(server_sha) = result.file_sha256.as_deref() {
-            if !server_sha.eq_ignore_ascii_case(archive_sha) {
-                record.scan_status = ScanStatus::Blocked;
-                record.last_error = Some(format!(
-                    "archive sha mismatch while polling: local={}, remote={server_sha}",
-                    archive_sha
-                ));
-                record.last_scanned_at = Some(now.to_string());
-                store.upsert(record.clone());
-                return Ok(false);
-            }
-        }
-
-        let completed = result.status == 2 || result.status_text == "completed";
-        if !completed {
-            thread::sleep(poll_sleep);
-            continue;
-        }
-
-        let raw_max_severity = result.max_severity.clone();
-        let parsed_severity = raw_max_severity
-            .as_deref()
-            .and_then(SkillScanSeverity::parse);
-        if raw_max_severity.is_some() && parsed_severity.is_none() {
-            tracing::warn!(
-                "skill scan: '{}' returned unsupported max_severity={:?}; falling back to is_safe-driven decision",
-                skill_id,
-                raw_max_severity
-            );
-        }
-
-        let severity = parsed_severity
-            .or_else(|| {
-                if result.is_safe.unwrap_or(false) {
-                    tracing::info!(
-                        "skill scan: '{}' uses SAFE fallback because is_safe=true and max_severity={:?}",
-                        skill_id,
-                        raw_max_severity
-                    );
-                    Some(SkillScanSeverity::Safe)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(SkillScanSeverity::Critical);
-
-        let allowed = is_allowed_by_severity(scan_cfg.max_allowed_severity, severity);
-        record.scan_status = if allowed {
-            ScanStatus::Allowed
-        } else {
-            ScanStatus::Blocked
-        };
-        record.max_severity = raw_max_severity
-            .clone()
-            .or_else(|| Some(format!("{severity:?}").to_ascii_uppercase()));
-        record.is_safe = result.is_safe;
-        record.last_scanned_at = Some(now.to_string());
-        record.last_error = None;
-        store.upsert(record.clone());
-        tracing::info!(
-            "skill scan: decision for '{}' => {} (task_no={}, raw_max_severity={:?}, effective_severity={:?}, is_safe={:?})",
+    let raw_max_severity = result.max_severity.clone();
+    let parsed_severity = raw_max_severity
+        .as_deref()
+        .and_then(SkillScanSeverity::parse);
+    if raw_max_severity.is_some() && parsed_severity.is_none() {
+        tracing::warn!(
+            "skill scan: '{}' returned unsupported max_severity={:?}; falling back to is_safe-driven decision",
             skill_id,
-            if allowed { "allowed" } else { "blocked" },
-            task_no,
-            raw_max_severity,
-            severity,
-            result.is_safe
+            raw_max_severity
         );
-        return Ok(allowed);
     }
+
+    let severity = parsed_severity
+        .or_else(|| {
+            if result.is_safe.unwrap_or(false) {
+                Some(SkillScanSeverity::Safe)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(SkillScanSeverity::Critical);
+    let allowed = is_allowed_by_severity(scan_cfg.max_allowed_severity, severity);
+    record.scan_status = if allowed {
+        ScanStatus::Allowed
+    } else {
+        ScanStatus::Blocked
+    };
+    record.max_severity = raw_max_severity
+        .clone()
+        .or_else(|| Some(format!("{severity:?}").to_ascii_uppercase()));
+    record.is_safe = result.is_safe;
+    record.last_scanned_at = Some(Utc::now().to_rfc3339());
+    record.last_error = None;
+    store.upsert(record);
+    tracing::info!(
+        "skill scan: decision for '{}' => {} (task_no={}, raw_max_severity={:?}, effective_severity={:?}, is_safe={:?})",
+        skill_id,
+        if allowed { "allowed" } else { "blocked" },
+        task_no,
+        raw_max_severity,
+        severity,
+        result.is_safe
+    );
+    Ok(())
 }
 
 fn list_workspace_skill_dirs(workspace_dir: &Path) -> Result<Vec<PathBuf>> {

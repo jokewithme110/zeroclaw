@@ -1,7 +1,7 @@
 use super::types::SkillScanRecord;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 const STATE_FILE_NAME: &str = "skill_scan_state.json";
@@ -45,6 +45,14 @@ impl SkillScanStore {
 
     pub fn upsert(&mut self, record: SkillScanRecord) {
         self.state.records.insert(record.skill_id.clone(), record);
+    }
+
+    pub fn prune_missing_skills(&mut self, active_skill_ids: &HashSet<String>) -> usize {
+        let before = self.state.records.len();
+        self.state
+            .records
+            .retain(|skill_id, _| active_skill_ids.contains(skill_id));
+        before.saturating_sub(self.state.records.len())
     }
 
     pub fn save(&self) -> Result<()> {
