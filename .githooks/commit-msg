@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+#
+# commit-msg hook — enforce AIOS commit message format.
+# Install:  git config core.hooksPath .githooks
+# Skip:     git commit --no-verify
+#
+# Required format:
+#   [AIOS]<type>(<scope>): <english subject>
+#
+#   - bullet in English
+#   - ...
+#
+#   Signed-off-by: <name> <email>
+
+set -euo pipefail
+
+msg_file="${1:-}"
+if [ -z "${msg_file}" ] || [ ! -f "${msg_file}" ]; then
+  echo "ERROR: commit-msg hook did not receive a valid commit message file." >&2
+  exit 1
+fi
+
+first_line="$(sed -n '1p' "${msg_file}")"
+second_line="$(sed -n '2p' "${msg_file}")"
+full_msg="$(sed '/^#/d' "${msg_file}")"
+
+# 1) Subject line:
+#    [AIOS]<type>(<scope>): <subject>
+#    - [AIOS] is mandatory
+#    - colon must be followed by one space
+#    - subject must be ASCII (English-only constraint)
+subject_re='^\[AIOS\](feat|fix|refactor|docs|test|chore|perf|ci|build|revert)\([a-z0-9][a-z0-9._/-]*\): [ -~]+$'
+if ! printf '%s\n' "${first_line}" | LC_ALL=C grep -Eq "${subject_re}"; then
+  cat >&2 <<'EOF'
+ERROR: Invalid commit title.
+Expected:
+  [AIOS]<type>(<scope>): <english subject>
+
+Rules:
+  - Must start with [AIOS]
+  - Must use one of: feat|fix|refactor|docs|test|chore|perf|ci|build|revert
+  - ':' must be followed by a single space
+  - Subject must be English/ASCII
+EOF
+  exit 1
+fi
+
+# 2) Title must be followed by a blank line.
+if [ -n "${second_line}" ]; then
+  echo "ERROR: The line after commit title must be blank." >&2
+  exit 1
+fi
+
+# 3) Required Signed-off-by trailer (value is not fixed).
+if ! printf '%s\n' "${full_msg}" | grep -Eq '^Signed-off-by:[[:space:]]+.+<[^<>[:space:]]+@[^<>[:space:]]+>$'; then
+  echo "ERROR: Missing or invalid Signed-off-by trailer." >&2
+  echo "Expected example: Signed-off-by: Your Name <your.email@example.com>" >&2
+  exit 1
+fi
+
+# 4) Rust formatting must pass before commit.
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -z "${repo_root}" ]; then
+  echo "ERROR: unable to resolve git repository root for fmt check." >&2
+  exit 1
+fi
+if ! (cd "${repo_root}" && cargo fmt --check); then
+  echo "ERROR: cargo fmt --check failed. Please format code before commit." >&2
+  exit 1
+fi
+
+exit 0
