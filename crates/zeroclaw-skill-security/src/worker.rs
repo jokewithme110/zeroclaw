@@ -28,12 +28,12 @@ where
     let mut interval = time::interval(Duration::from_secs(interval_secs));
     loop {
         interval.tick().await;
-        tracing::info!("skill scan periodic cycle begin");
+        tracing::debug!("skill scan periodic cycle begin");
         if let Err(err) = run_skill_scan_cycle(&config).await {
             tracing::warn!("skill scan periodic cycle failed: {err:#}");
         } else {
             mark_component_ok();
-            tracing::info!("skill scan periodic cycle complete");
+            tracing::debug!("skill scan periodic cycle complete");
         }
     }
 }
