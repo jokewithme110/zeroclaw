@@ -6090,6 +6090,218 @@ Use suffix `_N` for peer index (for example `_1`, `_2`, `_3`).
 For multiple peers, keep one shared `## A2A Gateway` section and append one `### Peer Detail: <PEER_ID_N>` block per peer.
 ";
 
+    let co_skill_creator_skill = r#"---
+name: co-skill-creator
+description: 编排型技能生成器。当用户明确表达想要创建技能时例如:「要创建技能」「创建编排技能」「基于已有技能编排」「组合技能做流程」使用本技能。
+version: 1.0.0
+author: XYDT Studio/Dep3
+composable: false
+---
+
+# 技能：编排型技能生成器（co-skill-creator）
+
+本技能**仅**负责生成**编排型技能**：多技能链路、输入输出契约、字段映射与异常策略，全部写入新技能的 `SKILL.md`。**MUST** 从步骤 1 起顺序执行。
+
+**MUST** 凡由本技能生成的新技能，其 frontmatter **必须**包含 **`composable: false`**（固定值），**MUST NOT** 写 `composable: true`、**MUST NOT** 省略该字段，以免被更上层编排自动选入。
+
+## 规范语言
+
+- **MUST**：强制性要求，禁止跳过。
+- **MUST NOT**：禁止行为。
+- **SHOULD**：强烈建议。
+
+---
+
+## 步骤 1：收集编排元数据与目标
+
+当用户明确表达“创建技能 / 新建技能 / 做一个技能”时，**MUST** 先获取可组合技能列表。
+
+### 发现候选技能
+
+按以下顺序获取候选技能：
+
+1. 扫描：
+   ```text
+   workspace/skills
+   ```
+2. 目录扫描时，**MUST** 先用 `glob_search` 获取所有 `SKILL.md` 和 `SKILL.toml` 路径，再用 `content_search` 统一检索 `composable: false`
+3. 命中 `composable: false` 的技能排除；未命中的技能默认可用
+4. 对结果去重后得到最终可编排技能列表
+
+发现候选技能时的约束：
+
+- **MUST NOT** 在步骤 1 逐个 `file_read` 技能文件
+- **MUST NOT** 因为未检索到 `composable` 字段，就回退为逐个读取文件确认
+- **MUST** 将“未命中 `composable: false`”直接解释为“可用候选”
+- 若没有可用候选，**MUST** 明确告知用户当前无法创建该编排技能；若一个都没有，再回复“当前不支持该能力”
+
+### 判断是否可编排
+
+拿到候选技能后，**MUST** 先判断这些能力是否足以支撑用户当前目标，再决定是否继续追问。
+
+- 若用户目标需要某个核心原子能力，而当前候选技能中完全不存在该能力，**MUST** 直接判定无法创建
+- 若当前目标与候选技能明显不匹配，**MUST** 直接告知用户当前无法创建该编排技能，并列出当前可编排技能
+- 若用户提出的目标本身就不属于当前候选技能的能力边界，**MUST** 直接判定不可行；**MUST NOT** 再追问“想实现什么功能”“具体想要什么能力”之类的澄清问题
+- 例如用户要“打麻将技能”，而当前候选技能仅覆盖提醒、日程、设备控制等外围能力，不包含麻将本体玩法能力时，**MUST** 直接告知不可行，**MUST NOT** 继续追问记录、提醒或其他附属功能
+- **MUST NOT** 在能力不足时提供替代路线、编号选项、独立技能路线或近似方案
+- **MUST NOT** 勉强拼接部分命中的技能，生成“近似可用”的编排方案
+- 只有当目标与候选技能存在明确可编排空间时，才可继续追问用户想组合哪些能力、想达到什么效果
+
+若用户需要创建的技能已判定不可行，**MUST** 使用以下稳定格式回复：
+
+```markdown
+当前无法创建该编排技能。
+
+当前可编排的技能有：
+- <技能A>
+- <技能B>
+- <技能C>
+```
+
+要求：
+- 只说明“无法创建”并列出当前可编排技能
+- **MUST NOT** 追加追问、替代方案、功能猜测或需求引导
+- 若当前没有任何可编排技能，直接回复：`当前不支持该能力`
+
+在用户确认“要组合的能力与目标”后，补齐生成 `SKILL.md` 所需的必要信息即可。能从上下文直接推断的就直接推断；只有缺失时再追问用户。
+
+---
+
+## 步骤 2：确认复用链路
+
+只有在用户目标已经被判定为“可编排”，且用户确认了要组合的候选技能后，才进入本步骤。
+
+对已入选技能：**MUST** 阅读对应 `SKILL.md`（必要时 `references/`），归纳可衔接的 I/O、前置条件、输出字段与失败信号，并确认是否能组成完整链路。
+
+- 与用户确认组合方案时，**MUST** 用自然语言描述链路、每步职责、预期结果与主要限制
+- **MUST NOT** 默认展示 `JSON`、字段映射表或大段内部结构化内容
+- 若在本步骤发现仍存在能力缺口，**MUST** 立即告知用户当前无法创建该编排技能，并列出当前可编排技能；**MUST NOT** 继续生成技能目录或 `SKILL.md`
+
+---
+
+## 步骤 3：初始化技能目录
+
+在已确认的 `<workspace_skills_dir>` 下创建：
+
+```
+<workspace_skills_dir>/
+└── <skill-name>/
+    ├── SKILL.md        ← 步骤 4 填写
+    └── references/     ← 可选：仅当有补充参考文档时创建
+        └── ...
+```
+
+约束：
+
+- 目录名、`SKILL.md` 内 frontmatter 的 `name`、步骤 1 中的 `<skill-name>` **MUST** 三者一致。
+- **MUST NOT** 在 `<skill-name>/` 根下放置除 `SKILL.md` 外的 Markdown；补充说明 **MUST** 放在 `references/`。
+- **MUST NOT** 创建空 `references/` 占位。
+
+初始化后 **MUST** 自检：至少存在 `<skill-name>/SKILL.md`。
+
+---
+
+## 步骤 4：写入 `SKILL.md`
+
+在步骤 3 目录内写入完整 `SKILL.md`。
+
+### Frontmatter
+
+**MUST** 包含以下字段：
+
+```yaml
+---
+name: <skill-name>
+description: <第三人称：编排能力 + 触发场景>
+version: 1.0.0
+generator: co-skill-creator
+composable: false
+---
+```
+
+- `name` **MUST** 与目录名一致
+- `description` **MUST** 用第三人称，写清“做什么 + 何时触发”
+- `composable` **MUST** 恒为 `false`；**MUST NOT** 改为 `true` 或省略
+- **MUST NOT** 使用无 `---` 包裹的松散 frontmatter
+
+### 正文
+
+**SHOULD** 以 `references/multi_skill_orchestration_template.md` 作为骨架填写，并确保至少包含：复用技能清单、字段映射、路由规则、执行流程、异常处理、输出约定。
+
+正文要求：
+
+- 中间技能输入按上一步输出 + 路由条件组装。
+- 路由步骤必须产出 `next_skill`、`next_input`（建议含 `reason`）。
+- 映射中的关键字段必须可在 I/O 契约定位，且 `on_missing` 明确。
+- `references/multi_skill_orchestration_template.md` 仅作占位模板；**MUST NOT** 将模板示例或占位文本原样写入目标技能 `SKILL.md`。
+- **SHOULD** 优先复用已有技能能力边界；**MUST NOT** 在编排层虚构不存在的原子能力或字段。
+
+---
+
+## 完成前自检
+
+- [ ] `name` 与目录名一致
+- [ ] frontmatter 含 **`composable: false`** 且未写 `true`、未省略
+- [ ] 未违反已有技能的 `composable` 过滤规则
+- [ ] 正文含复用说明、字段映射、路由规则与异常策略
+- [ ] 已定义输出驱动的下一步路由规则（条件、目标技能、输入组装）
+- [ ] 路由步骤能产出 `next_skill` 与 `next_input`，下游技能可直接消费
+"#;
+
+    let co_skill_creator_template = r#"---
+name: <skill-name>
+description: <适用场景>
+version: 1.0.0
+generator: co-skill-creator
+composable: false
+---
+
+## 目标
+
+- 目标描述：<在什么触发场景下，为实现什么业务目标，最终输出什么结果形态>
+
+## 复用能力说明
+
+- 复用 `<skill-a>`：<职责>
+- 复用 `<skill-b>`：<职责>
+
+## 技能链路（上下游）
+
+1. 上游 `<skill-a>`：输入 `<...>` → 输出 `<...>`
+2. 决策 Agent `<router-agent>`：读取上游输出，产出 `next_skill` + `next_input`
+3. 下游 `<skill-c>`：输入 `<...>` → 输出 `<...>`
+
+## 复用技能清单（I/O 契约）
+
+- `<skill-a>`（上游）：输入 `<...>`；输出 `<...>`；职责 `<...>`；前置条件 `<可选>`
+- `<skill-c>`（下游）：输入 `<...>`；输出 `<...>`；职责 `<...>`；前置条件 `<可选>`
+
+## 字段映射（上下游）
+
+- `<skill-a>.<output_field>` -> `<skill-b>.<input_field>`；转换 `<透传/格式转换/枚举映射>`；缺失处理 `<报错/默认值/跳过>`；备注 `<可选>`
+- `<skill-b>.<output_field>` -> `<skill-c>.<input_field>`；转换 `<...>`；缺失处理 `<...>`；备注 `<可选>`
+
+## 路由规则（按输出决定下一步）
+
+- 条件 `<condition-a>` 命中时：调用 `<next-skill-a>`，输入组装 `<from pipeline/intermediate/...>`
+- 条件 `<condition-b>` 命中时：调用 `<next-skill-b>`，输入组装 `<...>`
+- 未命中任何条件：`<默认分支：结束/兜底技能/追问用户>`
+## 执行流程
+
+1. …
+2. …
+3. …
+
+## 异常处理
+
+- …
+
+## 输出约定
+
+- 成功：…
+- 失败：…
+"#;
+
     let mut files: Vec<(&str, String)> = vec![
         ("IDENTITY.md", identity),
         ("AGENTS.md", agents),
@@ -6103,6 +6315,14 @@ For multiple peers, keep one shared `## A2A Gateway` section and append one `###
         (
             "skills/a2a-setup/references/tools-md-template.md",
             a2a_tools_md_template.to_string(),
+        ),
+        (
+            "skills/co-skill-creator/SKILL.md",
+            co_skill_creator_skill.to_string(),
+        ),
+        (
+            "skills/co-skill-creator/references/multi_skill_orchestration_template.md",
+            co_skill_creator_template.to_string(),
         ),
     ];
     if memory_backend != "none" {
@@ -7137,6 +7357,50 @@ mod tests {
         assert!(
             reference.contains("TOOLS.md Template for A2A Setup"),
             "reference template should include expected heading"
+        );
+    }
+
+    #[tokio::test]
+    async fn scaffold_creates_default_co_skill_creator_skill() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = ProjectContext::default();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite")
+            .await
+            .unwrap();
+
+        let skill_path = tmp
+            .path()
+            .join("skills")
+            .join("co-skill-creator")
+            .join("SKILL.md");
+        assert!(
+            skill_path.exists(),
+            "missing default skill file: {}",
+            skill_path.display()
+        );
+
+        let content = tokio::fs::read_to_string(skill_path).await.unwrap();
+        assert!(
+            content.contains("name: co-skill-creator"),
+            "default co-skill-creator should include expected frontmatter"
+        );
+
+        let reference_path = tmp
+            .path()
+            .join("skills")
+            .join("co-skill-creator")
+            .join("references")
+            .join("multi_skill_orchestration_template.md");
+        assert!(
+            reference_path.exists(),
+            "missing co-skill-creator reference template file: {}",
+            reference_path.display()
+        );
+
+        let reference = tokio::fs::read_to_string(reference_path).await.unwrap();
+        assert!(
+            reference.contains("## 目标"),
+            "co-skill-creator template should include expected section heading"
         );
     }
 
