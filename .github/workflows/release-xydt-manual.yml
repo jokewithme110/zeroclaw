@@ -134,7 +134,7 @@ jobs:
             target: armv7-unknown-linux-musleabihf
             artifact: zeroclaw
             ext: tar.gz
-            skip_prometheus: true
+
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
