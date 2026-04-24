@@ -11,7 +11,7 @@ zeroclaw-config.workspace = true
 anyhow = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 hex = "0.4"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring", "blocking", "multipart"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring", "blocking", "multipart", "hickory-dns"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 sha2 = "0.10"

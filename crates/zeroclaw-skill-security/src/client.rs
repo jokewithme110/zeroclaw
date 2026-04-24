@@ -197,7 +197,12 @@ fn normalize_proxy_url(raw: Option<&str>) -> Option<String> {
 fn network_hint(url: &str, err: &reqwest::Error) -> String {
     let mut hints = Vec::new();
     let err_text = error_chain_to_string(err).to_ascii_lowercase();
-    if err.is_connect() && err_text.contains("dns") {
+    if err.is_connect()
+        && (err_text.contains("dns")
+            || err_text.contains("failed to lookup address information")
+            || err_text.contains("name or service not known")
+            || err_text.contains("temporary failure in name resolution"))
+    {
         hints.push("DNS resolution failed");
     }
     if cfg!(target_os = "android")
