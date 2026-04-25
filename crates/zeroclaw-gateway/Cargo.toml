@@ -103,3 +103,4 @@ gateway-voice-duplex = []
 # and saves a bit of build time. Mirrors zeroclaw-config's `schema-export`.
 schema-export = ["zeroclaw-config/schema-export", "dep:schemars"]
 embedded-web = ["dep:include_dir"]
+node-control = []

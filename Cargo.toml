@@ -363,6 +363,7 @@ probe = ["dep:zeroclaw-hardware", "zeroclaw-hardware/probe"]
 rag-pdf = ["zeroclaw-tools/rag-pdf", "zeroclaw-runtime/rag-pdf"]
 webauthn = ["zeroclaw-runtime/webauthn", "zeroclaw-gateway?/webauthn"]
 embedded-web = ["zeroclaw-gateway/embedded-web"]
+node-control = ["zeroclaw-gateway/node-control"]
 
 # Backward-compatible aliases
 fantoccini = ["browser-native"]

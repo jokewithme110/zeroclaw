@@ -61,6 +61,7 @@ use axum::{
     response::{IntoResponse, Json},
     routing::{delete, get, post},
 };
+#[cfg(feature = "node-control")]
 use nodes_server::handle_ws_node;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
@@ -1759,9 +1760,11 @@ pub async fn run_gateway(
         get(api_plugins::plugin_routes::list_plugins),
     );
 
+    #[cfg(feature = "node-control")]
+    let inner = inner.route("/", get(handle_ws_node));
+
     let inner = inner
         // ── SSE event stream ──
-        .route("/", get(handle_ws_node))
         .route("/api/events", get(sse::handle_sse_events))
         .route("/api/events/history", get(sse::handle_events_history))
         // ── ACP client bridge ──

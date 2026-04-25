@@ -2,8 +2,7 @@ use std::process::Command;
 
 fn main() {
     // For `cargo install` users: attempt a best-effort npm build so the
-    // dashboard is available out of the box. If node/npm is missing or
-    // the build fails, we skip silently — the binary works fine without it.
+    // dashboard is available out of the box.
     build_web_dashboard();
     ensure_embedded_web_dist_when_enabled();
 }
@@ -65,8 +64,9 @@ fn ensure_embedded_web_dist_when_enabled() {
 
     println!("cargo:rerun-if-changed={}", web_dist.display());
 
-    assert!(
-        web_dist.join("index.html").exists(),
-        "feature `embedded-web` requires `web/dist/index.html`; run: cargo web build"
-    );
+    if !web_dist.join("index.html").exists() {
+        panic!(
+            "feature `embedded-web` requires `web/dist/index.html`. Build frontend first: cd web && npm ci && npm run build"
+        );
+    }
 }
