@@ -101,7 +101,6 @@ impl PromptSection for IdentitySection {
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
         let mut prompt = String::from("## Project Context\n\n");
-        let mut has_aieos = false;
         if let Some(config) = ctx.identity_config
             && identity::is_aieos_configured(config)
             && let Ok(Some(aieos)) = identity::load_aieos_identity(config, ctx.agent_workspace_dir)
@@ -110,14 +109,7 @@ impl PromptSection for IdentitySection {
             if !rendered.is_empty() {
                 prompt.push_str(&rendered);
                 prompt.push_str("\n\n");
-                has_aieos = true;
             }
-        }
-
-        if !has_aieos {
-            prompt.push_str(
-                "The following workspace files define your identity, behavior, and context.\n\n",
-            );
         }
 
         let profile = personality::load_personality(ctx.agent_workspace_dir);

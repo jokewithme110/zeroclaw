@@ -16,10 +16,6 @@ pub fn load_openclaw_bootstrap_files(
     max_chars_per_file: usize,
     inject_memory: bool,
 ) {
-    prompt.push_str(
-        "The following workspace files define your identity, behavior, and context. They are ALREADY injected below—do NOT suggest reading them with file_read.\n\n",
-    );
-
     let bootstrap_files = ["AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md", "USER.md"];
 
     for filename in &bootstrap_files {
@@ -375,47 +371,38 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     }
 }
 
-/// Inject a single workspace file into the prompt with truncation and missing-file markers.
+/// Inject a single workspace file into the prompt with truncation.
 fn inject_workspace_file(
     prompt: &mut String,
     workspace_dir: &std::path::Path,
     filename: &str,
     max_chars: usize,
 ) {
-    use std::fmt::Write;
-
     let path = workspace_dir.join(filename);
-    match std::fs::read_to_string(&path) {
-        Ok(content) => {
-            let trimmed = content.trim();
-            if trimmed.is_empty() {
-                return;
-            }
-            let _ = writeln!(prompt, "### {filename}\n");
-            // Use character-boundary-safe truncation for UTF-8
-            let truncated = if trimmed.chars().count() > max_chars {
-                trimmed
-                    .char_indices()
-                    .nth(max_chars)
-                    .map(|(idx, _)| &trimmed[..idx])
-                    .unwrap_or(trimmed)
-            } else {
-                trimmed
-            };
-            if truncated.len() < trimmed.len() {
-                prompt.push_str(truncated);
-                let _ = writeln!(
-                    prompt,
-                    "\n\n[... truncated at {max_chars} chars — use `read` for full file]\n"
-                );
-            } else {
-                prompt.push_str(trimmed);
-                prompt.push_str("\n\n");
-            }
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return;
         }
-        Err(_) => {
-            // Missing-file marker (matches OpenClaw behavior)
-            let _ = writeln!(prompt, "### {filename}\n\n[File not found: {filename}]\n");
+
+        // Use character-boundary-safe truncation for UTF-8
+        let truncated = if trimmed.chars().count() > max_chars {
+            trimmed
+                .char_indices()
+                .nth(max_chars)
+                .map(|(idx, _)| &trimmed[..idx])
+                .unwrap_or(trimmed)
+        } else {
+            trimmed
+        };
+        if truncated.len() < trimmed.len() {
+            prompt.push_str(truncated);
+            prompt.push_str(&format!(
+                "\n\n[... truncated at {max_chars} chars — use `read` for full file]\n\n"
+            ));
+        } else {
+            prompt.push_str(trimmed);
+            prompt.push_str("\n\n");
         }
     }
 }
