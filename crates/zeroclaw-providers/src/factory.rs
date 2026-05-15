@@ -276,6 +276,9 @@ pub fn dispatch_family_factory(
                     }
                 )+
                 _ => {
+                    if let Some(provider) = crate::try_model_provider_from_plugin_registry(family) {
+                        return Ok(provider);
+                    }
                     ::zeroclaw_log::record!(
                         ERROR,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)

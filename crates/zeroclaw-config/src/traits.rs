@@ -82,6 +82,10 @@ impl HasPropKind for Vec<String> {
     const PROP_KIND: PropKind = PropKind::StringArray;
 }
 
+impl HasPropKind for Vec<std::path::PathBuf> {
+    const PROP_KIND: PropKind = PropKind::StringArray;
+}
+
 // The per-category provider-ref newtypes (defined in `crate::providers`)
 // serialize as plain strings; the schema-tooling layer treats them as
 // strings too.

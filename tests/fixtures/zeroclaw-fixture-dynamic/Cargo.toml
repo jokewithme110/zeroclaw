@@ -1,0 +1,16 @@
+[package]
+name = "zeroclaw-fixture-dynamic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reference cdylib plugin for ZeroClaw — used by loader integration tests and as community-facing template."
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+zeroclaw-api.workspace = true
+anyhow = "1.0"
+async-trait = "0.1"
+serde_json = { version = "1.0", default-features = false, features = ["std"] }

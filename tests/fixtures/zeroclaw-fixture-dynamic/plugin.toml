@@ -1,0 +1,18 @@
+# Reference plugin manifest for ZeroClaw native dynamic plugins.
+# Distributed alongside the .so / .dylib / .dll produced by this crate.
+
+name = "zeroclaw-fixture-dynamic"
+version = "0.1.0"
+api_version = 100   # zeroclaw_api::version::API_VERSION_U32 (0.1.0)
+description = "Reference cdylib plugin used by zeroclaw-loader integration tests."
+
+# Path to the compiled cdylib, relative to this manifest file.
+# This points at the workspace debug build output so the fixture can be loaded
+# directly from the source tree (e.g. `zeroclaw daemon` after `cargo build`).
+# For release builds, change to "../../target/release/...".
+# macOS: replace .so with .dylib; Windows: zeroclaw_fixture_dynamic.dll.
+library = "../../target/debug/libzeroclaw_fixture_dynamic.so"
+
+[[components]]
+kind = "tool"
+names = ["fixture-echo-dynamic"]

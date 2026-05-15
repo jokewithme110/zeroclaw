@@ -1171,6 +1171,38 @@ fn is_legacy_kimi_code_alias(name: &str) -> bool {
     matches!(name, "kimi-code" | "kimi_coding" | "kimi_for_coding")
 }
 
+/// Last-resort model_provider lookup against the process-global plugin
+/// [`RegistrySet`](zeroclaw_api::plugin::RegistrySet). Returns `None` when no
+/// global registry is installed or no factory is registered under `name`;
+/// returns `None` on factory error too (caller falls through to its own
+/// "Unknown provider" path).
+fn try_model_provider_from_plugin_registry(name: &str) -> Option<Box<dyn ModelProvider>> {
+    use zeroclaw_api::plugin::PluginRegistry;
+    let registries = zeroclaw_api::plugin::runtime::registries()?;
+    if !registries.providers.contains(name) {
+        return None;
+    }
+    // Plugin ModelProvider factories take a JSON config; we have nothing
+    // per-call-specific to pass, so use Null. Plugin authors who need
+    // configuration should consume it at registration time.
+    match registries.providers.get(name, &serde_json::Value::Null) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "provider": name,
+                        "error": e.to_string(),
+                    })),
+                "plugin model_provider factory failed; falling through to built-in resolver error"
+            );
+            None
+        }
+    }
+}
+
 /// Factory: create model_provider with optional base URL and runtime options.
 #[allow(clippy::too_many_lines)]
 fn create_model_provider_inner(

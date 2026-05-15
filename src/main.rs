@@ -3307,6 +3307,35 @@ async fn main() -> Result<()> {
         }
     }
 
+    // ── Load native dynamic plugins (best-effort, never aborts startup) ─────
+    // Static plugins are linked at compile time; integrators add a single
+    // `<crate>::register(&registries)` call site below for each one they
+    // bundle. The loaded `Vec<LoadedPlugin>` is held in `_loaded_plugins`
+    // for the rest of `main` so the `.so` files remain mapped.
+    #[cfg(feature = "agent-runtime")]
+    let _loaded_plugins = {
+        use std::sync::Arc;
+        use zeroclaw_api::plugin::{RegistrySet, runtime as plugin_runtime};
+
+        let registries = Arc::new(RegistrySet::new());
+        // Dynamic plugins — scanned from native_paths at startup.
+        let loaded = if config.plugins.native_paths.is_empty() {
+            Vec::new()
+        } else {
+            zeroclaw_loader::load_directories(&config.plugins.native_paths, &registries)
+        };
+        // Install global, ignoring "already initialized" (test reruns within
+        // one process) — first writer wins.
+        if let Err(_existing) = plugin_runtime::init(Arc::clone(&registries)) {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip),
+                "global plugin registries already initialized; skipping re-init"
+            );
+        }
+        loaded
+    };
+
     #[cfg(not(feature = "agent-runtime"))]
     {
         // Kernel-only mode: minimal CLI agent without channels/tools/gateway

@@ -7599,6 +7599,16 @@ pub struct PluginsConfig {
     #[serde(default)]
     #[nested]
     pub security: PluginSecurityConfig,
+
+    /// Directories to scan for **native** dynamic plugin manifests (`*.toml`).
+    ///
+    /// Independent from [`plugins_dir`](Self::plugins_dir), which targets the
+    /// WASM plugin system. Each directory is scanned non-recursively at
+    /// startup; every `*.toml` that parses as a `PluginManifest` is loaded
+    /// via `zeroclaw_loader::DynPluginLoader::load`. Failed loads are logged
+    /// and skipped — they do not abort startup.
+    #[serde(default)]
+    pub native_paths: Vec<PathBuf>,
 }
 
 /// Plugin signature verification configuration (`[plugins.security]`).
@@ -7648,6 +7658,7 @@ impl Default for PluginsConfig {
             auto_discover: false,
             max_plugins: default_max_plugins(),
             security: PluginSecurityConfig::default(),
+            native_paths: Vec::new(),
         }
     }
 }

@@ -560,7 +560,20 @@ impl AgentBuilder {
             tools.retain(|t| !zeroclaw_tools::MEMORY_TOOL_NAMES.contains(&t.name()));
         }
 
-        let tool_specs = tools.iter().map(|tool| tool.spec()).collect();
+        let mut tool_specs: Vec<ToolSpec> = tools.iter().map(|tool| tool.spec()).collect();
+        // Add specs for plugin-registry tools so the LLM can discover and call them.
+        if let Some(registries) = zeroclaw_api::plugin::runtime::registries() {
+            use zeroclaw_api::plugin::PluginRegistry as _;
+            for name in registries.tools.list_registered() {
+                if let Ok(tool) = registries
+                    .tools
+                    .get(&name, &serde_json::Value::Null)
+                    .map(|t: Box<dyn crate::tools::Tool>| t)
+                {
+                    tool_specs.push(tool.spec());
+                }
+            }
+        }
         let workspace_dir = self
             .workspace_dir
             .clone()
@@ -1970,9 +1983,33 @@ impl Agent {
                             (err_text, false)
                         }
                     }
+                } else if let Some(result) = self
+                    .try_execute_via_plugin_registry(
+                        &tool_name,
+                        &tool_args,
+                        &tool_call_id,
+                        &args_json,
+                        turn_id,
+                        start,
+                    )
+                    .await
+                {
+                    result
                 } else {
                     (format!("Unknown tool: {}", tool_name), false)
                 }
+            } else if let Some(result) = self
+                .try_execute_via_plugin_registry(
+                    &tool_name,
+                    &tool_args,
+                    &tool_call_id,
+                    &args_json,
+                    turn_id,
+                    start,
+                )
+                .await
+            {
+                result
             } else {
                 (format!("Unknown tool: {}", tool_name), false)
             };
@@ -2055,6 +2092,81 @@ impl Agent {
             .map(|call| self.execute_tool_call(call, turn_id))
             .collect();
         futures_util::future::join_all(futs).await
+    }
+
+    /// Last-resort tool lookup: query the process-global plugin
+    /// [`RegistrySet`](zeroclaw_api::plugin::RegistrySet), and if a factory
+    /// exists for `tool_name`, instantiate it and execute with the given args.
+    /// Returns `None` when no global registry is installed or the name is not
+    /// registered; returns `Some((output, success))` after attempting execution.
+    async fn try_execute_via_plugin_registry(
+        &self,
+        tool_name: &str,
+        tool_args: &serde_json::Value,
+        tool_call_id: &Option<String>,
+        args_json: &str,
+        turn_id: &str,
+        start: std::time::Instant,
+    ) -> Option<(String, bool)> {
+        use zeroclaw_api::plugin::PluginRegistry;
+        let registries = zeroclaw_api::plugin::runtime::registries()?;
+        if !registries.tools.contains(tool_name) {
+            return None;
+        }
+        let tool = match registries.tools.get(tool_name, &serde_json::Value::Null) {
+            Ok(t) => t,
+            Err(e) => {
+                let err_text = format!("Error instantiating plugin tool {tool_name}: {e}");
+                self.observer.record_event(&ObserverEvent::ToolCall {
+                    tool: tool_name.to_string(),
+                    tool_call_id: tool_call_id.clone(),
+                    duration: start.elapsed(),
+                    success: false,
+                    arguments: Some(args_json.to_string()),
+                    result: Some(super::loop_::scrub_credentials(&err_text)),
+                    channel: None,
+                    agent_alias: self.observer_agent_alias(),
+                    turn_id: Some(turn_id.to_string()),
+                });
+                return Some((err_text, false));
+            }
+        };
+        match tool.execute(tool_args.clone()).await {
+            Ok(r) => {
+                let (outcome_text, ok) = if r.success {
+                    (r.output, true)
+                } else {
+                    (format!("Error: {}", r.error.unwrap_or(r.output)), false)
+                };
+                self.observer.record_event(&ObserverEvent::ToolCall {
+                    tool: tool_name.to_string(),
+                    tool_call_id: tool_call_id.clone(),
+                    duration: start.elapsed(),
+                    success: ok,
+                    arguments: Some(args_json.to_string()),
+                    result: Some(super::loop_::scrub_credentials(&outcome_text)),
+                    channel: None,
+                    agent_alias: self.observer_agent_alias(),
+                    turn_id: Some(turn_id.to_string()),
+                });
+                Some((outcome_text, ok))
+            }
+            Err(e) => {
+                let err_text = format!("Error executing {tool_name}: {e}");
+                self.observer.record_event(&ObserverEvent::ToolCall {
+                    tool: tool_name.to_string(),
+                    tool_call_id: tool_call_id.clone(),
+                    duration: start.elapsed(),
+                    success: false,
+                    arguments: Some(args_json.to_string()),
+                    result: Some(super::loop_::scrub_credentials(&err_text)),
+                    channel: None,
+                    agent_alias: self.observer_agent_alias(),
+                    turn_id: Some(turn_id.to_string()),
+                });
+                Some((err_text, false))
+            }
+        }
     }
 
     fn classify_model(&self, user_message: &str) -> String {
