@@ -3372,9 +3372,11 @@ pub async fn run(
         model_provider: provider_name,
         model: model_name,
         duration: start.elapsed(),
-        tokens_used: session_usage.map(|usage| zeroclaw_api::observability_traits::TurnTokenUsage {
-            input_tokens: usage.input_tokens,
-            output_tokens: usage.output_tokens,
+        tokens_used: session_usage.map(|usage| {
+            zeroclaw_api::observability_traits::TurnTokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+            }
         }),
         cost_usd: session_usage.map(|usage| usage.cost_usd),
         channel: None,

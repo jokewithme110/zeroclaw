@@ -384,6 +384,7 @@ ci-all = [
 ]
 
 [profile.dev]
+debug = true
 incremental = true
 opt-level = 0
 

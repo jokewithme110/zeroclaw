@@ -8591,6 +8591,17 @@ pub async fn start_channels(
             .map(|t| (t.name().to_string(), t.description().to_string()))
             .collect();
 
+        // Keep a reference to unfiltered_tool_arcs for dag_plan_execute initialization
+        let tool_arcs_for_dag = all_tools_result_ch.unfiltered_tool_arcs.clone();
+
+        // Initialize dag_plan_execute tool with all registered tools
+        let dag_tool = zeroclaw_tools::dag_plan_execute::DagPlanExecuteTool::new(Arc::new(
+            parking_lot::RwLock::new(tool_arcs_for_dag),
+        ));
+        built_tools.push(Box::new(zeroclaw_runtime::tools::ArcToolRef(Arc::new(
+            dag_tool,
+        ))));
+
         let tools_registry = Arc::new(built_tools);
 
         let mut tool_descs: Vec<(&str, &str)> = vec![
@@ -9382,6 +9393,9 @@ pub async fn deliver_announcement(
                 .get(alias)
                 .ok_or_else(not_configured)?;
             anyhow::bail!("wecom_ws channel is not connected");
+        }
+        "webchat" => {
+            println!("webchat channel not implemented");
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }

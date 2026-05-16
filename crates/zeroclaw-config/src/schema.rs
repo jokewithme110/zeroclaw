@@ -5446,7 +5446,6 @@ pub struct CostConfig {
     #[nested]
     pub rates: CostRatesConfig,
 
-
     /// Default timezone used for cost aggregation and CLI cost queries.
     #[serde(default = "default_cost_timezone")]
     pub default_timezone: String,

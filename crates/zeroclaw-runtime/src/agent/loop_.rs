@@ -4734,9 +4734,11 @@ pub async fn run(
             channel: None,
             agent_alias: None,
             turn_id: None,
-            tokens_used: session_usage.map(|usage| zeroclaw_api::observability_traits::TurnTokenUsage {
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
+            tokens_used: session_usage.map(|usage| {
+                zeroclaw_api::observability_traits::TurnTokenUsage {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                }
             }),
             cost_usd: session_usage.map(|usage| usage.cost_usd),
         });
@@ -12183,6 +12185,7 @@ Let me check the result."#;
             .iter()
             .map(|d| match d {
                 StreamDelta::Status(t) | StreamDelta::Text(t) => t.as_str(),
+                StreamDelta::Reasoning(t) => t.as_str(),
             })
             .collect();
 

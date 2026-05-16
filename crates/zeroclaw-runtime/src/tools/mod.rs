@@ -63,6 +63,7 @@ pub use zeroclaw_tools::cloud_patterns::CloudPatternsTool;
 pub use zeroclaw_tools::codex_cli::CodexCliTool;
 pub use zeroclaw_tools::composio::ComposioTool;
 pub use zeroclaw_tools::content_search::ContentSearchTool;
+pub use zeroclaw_tools::dag_plan_execute::DagPlanExecuteTool;
 pub use zeroclaw_tools::data_management::DataManagementTool;
 pub use zeroclaw_tools::discord_search::DiscordSearchTool;
 pub use zeroclaw_tools::escalate::EscalateToHumanTool;
@@ -199,6 +200,10 @@ impl Tool for ArcToolRef {
         self.0.parameters_schema()
     }
 
+    fn is_skill_derived_tool(&self) -> bool {
+        self.0.is_skill_derived_tool()
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.0.execute(args).await
     }
@@ -236,6 +241,10 @@ impl Tool for ArcDelegatingTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         self.inner.parameters_schema()
+    }
+
+    fn is_skill_derived_tool(&self) -> bool {
+        self.inner.is_skill_derived_tool()
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
