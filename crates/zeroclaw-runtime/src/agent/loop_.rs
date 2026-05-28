@@ -3109,90 +3109,14 @@ pub async fn run_tool_call_loop(
             })),
         "tool_loop_exhausted"
     );
-
-    // Graceful shutdown: ask the LLM for a final summary without tools
+    // if agent exceeded maximum tool ,don't summary for end , throwe error directly
     ::zeroclaw_log::record!(
         WARN,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-            .with_attrs(::serde_json::json!({"max_iterations": max_iterations})),
-        "Max iterations reached, requesting final summary"
+            .with_attrs(::serde_json::json!({"error": "Agent exceeded maximum tool iterations"})),
+        "Agent exceeded maximum tool iterations"
     );
-    history.push(ChatMessage::user(
-        "You have reached the maximum number of tool iterations. \
-         Please provide your best answer based on the work completed so far. \
-         Summarize what you accomplished and what remains to be done."
-            .to_string(),
-    ));
-
-    let summary_request = zeroclaw_providers::ChatRequest {
-        messages: history,
-        tools: None, // No tools — force a text response
-        thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-            .try_with(Clone::clone)
-            .ok()
-            .flatten(),
-    };
-    let summary_future = model_provider.chat(summary_request, model, temperature);
-    let summary_call = match pacing.step_timeout_secs {
-        Some(step_secs) if step_secs > 0 => {
-            let step_timeout = Duration::from_secs(step_secs);
-            if let Some(token) = cancellation_token.as_ref() {
-                tokio::select! {
-                    () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                    result = tokio::time::timeout(step_timeout, summary_future) => match result {
-                        Ok(inner) => inner,
-                        Err(_) => anyhow::bail!(
-                            "Final summary LLM call timed out after {step_secs}s (step_timeout_secs)"
-                        ),
-                    },
-                }
-            } else {
-                match tokio::time::timeout(step_timeout, summary_future).await {
-                    Ok(inner) => inner,
-                    Err(_) => anyhow::bail!(
-                        "Final summary LLM call timed out after {step_secs}s (step_timeout_secs)"
-                    ),
-                }
-            }
-        }
-        _ => {
-            if let Some(token) = cancellation_token.as_ref() {
-                tokio::select! {
-                    () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                    result = summary_future => result,
-                }
-            } else {
-                summary_future.await
-            }
-        }
-    };
-    match summary_call {
-        Ok(resp) => {
-            let text = resp.text.unwrap_or_default();
-            if text.is_empty() {
-                anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
-            }
-            accumulated_display_text.push_str(&text);
-            Ok(accumulated_display_text)
-        }
-        Err(e) => {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "model": model,
-                        "provider": provider_name,
-                        "max_iterations": max_iterations,
-                        "trace_id": turn_id,
-                        "error": format!("{e}"),
-                    })),
-                "final summary LLM call failed after iteration exhaustion; bailing"
-            );
-            anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
-        }
-    }
 }
 
 /// Build the tool instruction block for the system prompt so the LLM knows
