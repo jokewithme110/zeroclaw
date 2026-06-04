@@ -9509,6 +9509,37 @@ pub struct ObservabilityConfig {
     /// secret reads). Empty by default.
     #[serde(default)]
     pub log_tool_io_denylist: Vec<String>,
+
+    /// Langfuse public key. Required when `backend = "langfuse"`. Marked as a
+    /// secret so the value is ChaCha20-Poly1305-encrypted when serialized to
+    /// the on-disk config.
+    #[serde(default)]
+    pub langfuse_public_key: Option<String>,
+
+    /// Langfuse secret key. Required when `backend = "langfuse"`. Marked as a
+    /// secret so the value is ChaCha20-Poly1305-encrypted when serialized to
+    /// the on-disk config.
+    #[serde(default)]
+    pub langfuse_secret_key: Option<String>,
+
+    /// Langfuse base URL. Defaults to `"https://cloud.langfuse.com"`. Override
+    /// for US region (`https://us.cloud.langfuse.com`) or self-hosted
+    /// instances.
+    #[serde(default = "default_langfuse_base_url")]
+    pub langfuse_base_url: String,
+
+    /// Whether to include LLM input messages and output text in Langfuse
+    /// traces. Defaults to `false` — turn on to debug prompts in the Langfuse
+    /// UI. May capture sensitive content; only enable in trusted environments.
+    #[serde(default)]
+    pub langfuse_include_io: bool,
+
+    /// When true and Langfuse I/O capture is enabled, every LLM request stores
+    /// the full input message list instead of only the delta since the
+    /// previous request. Useful when replaying full conversations in Langfuse;
+    /// defaults to `false` to keep trace payloads compact.
+    #[serde(default)]
+    pub langfuse_full_prompt_per_request: bool,
 }
 
 impl Default for ObservabilityConfig {
@@ -9524,6 +9555,11 @@ impl Default for ObservabilityConfig {
             log_tool_io: default_log_tool_io(),
             log_tool_io_truncate_bytes: default_log_tool_io_truncate_bytes(),
             log_tool_io_denylist: Vec::new(),
+            langfuse_public_key: None,
+            langfuse_secret_key: None,
+            langfuse_base_url: default_langfuse_base_url(),
+            langfuse_include_io: false,
+            langfuse_full_prompt_per_request: false,
         }
     }
 }
@@ -9546,6 +9582,10 @@ fn default_log_tool_io() -> String {
 
 fn default_log_tool_io_truncate_bytes() -> usize {
     40960
+}
+
+fn default_langfuse_base_url() -> String {
+    "https://cloud.langfuse.com".to_string()
 }
 
 // ── Hooks ────────────────────────────────────────────────────────

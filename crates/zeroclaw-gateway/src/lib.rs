@@ -2580,6 +2580,8 @@ async fn handle_webhook(
             channel: None,
             agent_alias: None,
             turn_id: None,
+            input_json: None,
+            input_tools_json: None,
         },
     );
 
@@ -2617,6 +2619,8 @@ async fn handle_webhook(
                     channel: None,
                     agent_alias: None,
                     turn_id: None,
+                    output_text: None,
+                    output_tool_calls_json: None,
                 },
             );
             state.observer.record_metric(
@@ -2654,6 +2658,8 @@ async fn handle_webhook(
                     channel: None,
                     agent_alias: None,
                     turn_id: None,
+                    output_text: None,
+                    output_tool_calls_json: None,
                 },
             );
             state.observer.record_metric(

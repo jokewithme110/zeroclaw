@@ -151,6 +151,8 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
             channel: channel_opt,
             agent_alias: agent_alias_opt,
             turn_id: turn_id_opt,
+            input_json: None,
+            input_tools_json: None,
         }),
         "llm_response" => Some(ObserverEvent::LlmResponse {
             model_provider,
@@ -173,6 +175,8 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
             channel: channel_opt,
             agent_alias: agent_alias_opt,
             turn_id: turn_id_opt,
+            output_text: None,
+            output_tool_calls_json: None,
         }),
         "tool_call_start" => Some(ObserverEvent::ToolCallStart {
             tool,

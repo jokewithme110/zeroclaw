@@ -321,6 +321,9 @@ impl Observer for OtelObserver {
                 channel,
                 agent_alias,
                 turn_id,
+                input_tokens: _,
+                output_tokens: _,
+                ..
             } => {
                 let secs = duration.as_secs_f64();
                 let attrs = [
@@ -610,6 +613,8 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            input_json: None,
+            input_tools_json: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             model_provider: "openrouter".into(),
@@ -622,6 +627,8 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            output_text: None,
+            output_tool_calls_json: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "openrouter".into(),
@@ -772,6 +779,8 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            output_text: None,
+            output_tool_calls_json: None,
         });
     }
 
@@ -913,6 +922,8 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            output_text: None,
+            output_tool_calls_json: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),

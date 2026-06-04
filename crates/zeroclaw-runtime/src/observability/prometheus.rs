@@ -680,6 +680,8 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            output_text: None,
+            output_tool_calls_json: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             model_provider: "openrouter".into(),
@@ -692,6 +694,8 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            output_text: None,
+            output_tool_calls_json: None,
         });
 
         let output = obs.encode();
@@ -721,6 +725,8 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            output_text: None,
+            output_tool_calls_json: None,
         });
 
         let output = obs.encode();

@@ -486,6 +486,25 @@ struct ChannelRuntimeContext {
     runtime_defaults_override: Arc<Mutex<Option<Arc<ChannelRuntimeOverride>>>>,
 }
 
+fn channel_session_observer(ctx: &ChannelRuntimeContext) -> Arc<dyn Observer> {
+    // Langfuse stores the live root span inside the observer between
+    // `AgentStart` and `AgentEnd`. A long-running daemon must therefore use a
+    // fresh observer per inbound message so concurrent channel sessions do not
+    // overwrite each other's trace state.
+    if ctx
+        .prompt_config
+        .observability
+        .backend
+        .eq_ignore_ascii_case("langfuse")
+    {
+        Arc::from(observability::create_observer(
+            &ctx.prompt_config.observability,
+        ))
+    } else {
+        Arc::clone(&ctx.observer)
+    }
+}
+
 #[derive(Clone)]
 struct InFlightSenderTaskState {
     task_id: u64,
@@ -4276,6 +4295,15 @@ async fn process_channel_message_body(
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates());
 
+    let session_observer = channel_session_observer(ctx.as_ref());
+    session_observer.record_event(&ObserverEvent::AgentStart {
+        model_provider: route.model_provider.clone(),
+        model: route.model.clone(),
+        channel: Some(msg.channel.clone()),
+        agent_alias: Some(ctx.agent_alias.as_ref().clone()),
+        turn_id: Some(msg.id.clone()),
+    });
+
     ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"has_target_channel": target_channel.is_some(), "use_draft_streaming": use_draft_streaming})), "Streaming decision");
 
     // Partial mode: delta channel for draft updates (progress + text).
@@ -4438,7 +4466,7 @@ async fn process_channel_message_body(
     // Wrap observer to forward tool events as live thread messages
     let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let notify_observer: Arc<ChannelNotifyObserver> = Arc::new(ChannelNotifyObserver {
-        inner: Arc::clone(&ctx.observer),
+        inner: Arc::clone(&session_observer),
         tx: notify_tx,
         tools_used: AtomicBool::new(false),
     });
@@ -4628,13 +4656,15 @@ async fn process_channel_message_body(
                         route.model = new_model;
                         clear_model_switch_request();
 
-                        ctx.observer.record_event(&ObserverEvent::AgentStart {
-                            model_provider: route.model_provider.clone(),
-                            model: route.model.clone(),
-                            channel: None,
-                            agent_alias: None,
-                            turn_id: None,
-                        });
+                        if session_observer.name() != "langfuse" {
+                            session_observer.record_event(&ObserverEvent::AgentStart {
+                                model_provider: route.model_provider.clone(),
+                                model: route.model.clone(),
+                                channel: None,
+                                agent_alias: None,
+                                turn_id: None,
+                            });
+                        }
 
                         continue;
                     }
@@ -4688,6 +4718,17 @@ async fn process_channel_message_body(
     if let Some(handle) = notify_task {
         let _ = handle.await;
     }
+
+    session_observer.record_event(&ObserverEvent::AgentEnd {
+        model_provider: route.model_provider.clone(),
+        model: route.model.clone(),
+        duration: started_at.elapsed(),
+        tokens_used: None,
+        cost_usd: None,
+        channel: Some(msg.channel.clone()),
+        agent_alias: Some(ctx.agent_alias.as_ref().clone()),
+        turn_id: Some(msg.id.clone()),
+    });
 
     #[allow(clippy::cast_possible_truncation)]
     let llm_call_ms = llm_call_start.elapsed().as_millis() as u64;
@@ -9512,6 +9553,41 @@ temperature = 0.3
         Arc::new(NamedMockChannel { name })
     }
 
+    #[derive(Default)]
+    struct RecordingObserver {
+        events: std::sync::Mutex<Vec<ObserverEvent>>,
+    }
+
+    impl RecordingObserver {
+        fn snapshot(&self) -> Vec<ObserverEvent> {
+            self.events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+    }
+
+    impl Observer for RecordingObserver {
+        fn record_event(&self, event: &ObserverEvent) {
+            self.events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(event.clone());
+        }
+
+        fn record_metric(&self, _metric: &ObserverMetric) {}
+
+        fn name(&self) -> &str {
+            "recording"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    static OBSERVABILITY_HOOK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     struct MentionMockChannel {
         name: &'static str,
         mention: &'static str,
@@ -12314,6 +12390,137 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(reply.contains("BTC is currently around"));
         assert!(!reply.contains("\"tool_calls\""));
         assert!(!reply.contains("mock_price"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_emits_agent_lifecycle_events_for_langfuse_backend() {
+        let _guard = OBSERVABILITY_HOOK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        zeroclaw_runtime::observability::clear_broadcast_hook();
+
+        let hook = Arc::new(RecordingObserver::default());
+        let hook_observer: Arc<dyn Observer> = hook.clone();
+        let _broadcast_guard =
+            zeroclaw_runtime::observability::set_scoped_broadcast_hook(hook_observer);
+
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let mut prompt_config = zeroclaw_config::schema::Config::default();
+        prompt_config.observability.backend = "langfuse".to_string();
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: Arc::new(ToolCallingModelProvider),
+            default_model_provider: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(prompt_config),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+            },
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-langfuse".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-42".to_string(),
+                content: "What is the BTC price now?".to_string(),
+                channel: "test-channel".to_string(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let events = hook.snapshot();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ObserverEvent::AgentStart { .. })),
+            "channel path must emit AgentStart for langfuse-backed sessions"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ObserverEvent::LlmRequest { .. })),
+            "channel path must emit LlmRequest for langfuse-backed sessions"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ObserverEvent::LlmResponse { .. })),
+            "channel path must emit LlmResponse for langfuse-backed sessions"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ObserverEvent::AgentEnd { .. })),
+            "channel path must emit AgentEnd for langfuse-backed sessions"
+        );
     }
 
     #[tokio::test]
@@ -15284,6 +15491,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 args: HashMap::new(),
                 target: None,
                 locked_args: std::collections::HashMap::new(),
+                method: None,
+                headers: HashMap::new(),
+                body: None,
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
             location: None,

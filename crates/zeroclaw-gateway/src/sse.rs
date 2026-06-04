@@ -169,6 +169,8 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 channel,
                 agent_alias,
                 turn_id,
+                input_json: _,
+                input_tools_json: _,
             } => {
                 let mut json = serde_json::json!({
                     "type": "llm_request",

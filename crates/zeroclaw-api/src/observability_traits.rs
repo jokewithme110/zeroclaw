@@ -34,6 +34,16 @@ pub enum ObserverEvent {
         channel: Option<String>,
         agent_alias: Option<String>,
         turn_id: Option<String>,
+        /// JSON-serialized input messages `[{role, content}, ...]`.
+        /// Populated by the agent loop for observers that support I/O capture
+        /// (e.g. Langfuse). Observers that don't need prompt content should ignore
+        /// this field. First call carries the full conversation context; later
+        /// calls within the same loop carry only the delta since the previous
+        /// request, unless `langfuse_full_prompt_per_request` is enabled.
+        input_json: Option<String>,
+        /// JSON-serialized tool definitions `[{name, description, parameters}, ...]`.
+        /// Only set on the first LLM call of a session when tools are available.
+        input_tools_json: Option<String>,
     },
     /// Result of a single LLM model_provider call.
     LlmResponse {
@@ -47,6 +57,14 @@ pub enum ObserverEvent {
         channel: Option<String>,
         agent_alias: Option<String>,
         turn_id: Option<String>,
+        /// Response text from the LLM. Populated by the agent loop for observers
+        /// that support I/O capture (e.g. Langfuse). The observer decides whether
+        /// to forward it based on its own `include_io` setting.
+        output_text: Option<String>,
+        /// JSON-serialized tool calls `[{id, name, arguments}, ...]` the LLM
+        /// returned. Populated by the agent loop for observers that need to
+        /// capture structured tool-call output.
+        output_tool_calls_json: Option<String>,
     },
     /// The agent session has finished.
     ///

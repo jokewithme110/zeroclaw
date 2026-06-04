@@ -2227,6 +2227,8 @@ impl Agent {
                 channel: None,
                 agent_alias: self.observer_agent_alias(),
                 turn_id: Some(turn_id.clone()),
+                input_json: None,
+                input_tools_json: None,
             });
 
             let response = match self
@@ -2272,6 +2274,8 @@ impl Agent {
                         channel: None,
                         agent_alias: self.observer_agent_alias(),
                         turn_id: Some(turn_id.clone()),
+                        output_text: None,
+                        output_tool_calls_json: None,
                     });
                     resp
                 }
@@ -2288,6 +2292,8 @@ impl Agent {
                         channel: None,
                         agent_alias: self.observer_agent_alias(),
                         turn_id: Some(turn_id.clone()),
+                        output_text: None,
+                        output_tool_calls_json: None,
                     });
                     return Err(err);
                 }
@@ -2560,6 +2566,8 @@ impl Agent {
                 channel: None,
                 agent_alias: self.observer_agent_alias(),
                 turn_id: Some(turn_id.clone()),
+                input_json: None,
+                input_tools_json: None,
             });
 
             let stream_opts = zeroclaw_providers::traits::StreamOptions::new(
@@ -2705,6 +2713,40 @@ impl Agent {
                         zeroclaw_providers::traits::StreamEvent::Final => break,
                     },
                     Err(error) => {
+                        if got_stream || !committed_response.is_empty() {
+                            if !streamed_text.is_empty() {
+                                let partial = Self::marked_partial_response(
+                                    &streamed_text,
+                                    "[stream interrupted]",
+                                );
+                                self.append_streamed_assistant_message_to_history(
+                                    partial,
+                                    &mut new_msgs,
+                                    &mut committed_response,
+                                );
+                            }
+                            let safe_error =
+                                zeroclaw_providers::sanitize_api_error(&error.to_string());
+                            self.observer.record_event(&ObserverEvent::LlmResponse {
+                                model_provider: self.model_provider_name.clone(),
+                                model: effective_model.clone(),
+                                duration: llm_started_at.elapsed(),
+                                success: false,
+                                error_message: Some(safe_error),
+                                agent_alias: self.observer_agent_alias(),
+                                channel: None,
+                                turn_id: Some(turn_id.clone()),
+                                input_tokens: None,
+                                output_tokens: None,
+                                output_text: None,
+                                output_tool_calls_json: None,
+                            });
+                            return Err(StreamedTurnError {
+                                error: anyhow::Error::msg(error.to_string()),
+                                committed_response,
+                                new_messages: new_msgs,
+                            });
+                        }
                         stream_error = Some(error.to_string());
                         break;
                     }
@@ -2735,6 +2777,8 @@ impl Agent {
                     channel: None,
                     agent_alias: self.observer_agent_alias(),
                     turn_id: Some(turn_id.clone()),
+                    output_text: None,
+                    output_tool_calls_json: None,
                 });
                 return Err(StreamedTurnError {
                     error: crate::agent::loop_::ToolLoopCancelled.into(),
@@ -2767,6 +2811,8 @@ impl Agent {
                     channel: None,
                     agent_alias: self.observer_agent_alias(),
                     turn_id: Some(turn_id.clone()),
+                    output_text: None,
+                    output_tool_calls_json: None,
                 });
                 return Err(StreamedTurnError {
                     error: anyhow::Error::msg(stream_error.unwrap_or_default()),
@@ -2827,16 +2873,8 @@ impl Agent {
                     tokio::select! {
                         biased;
                         () = token.cancelled() => {
-                            let partial = if streamed_text.is_empty() {
-                                "[interrupted by user]".to_string()
-                            } else {
-                                Self::marked_partial_response(
-                                    &streamed_text,
-                                    "[interrupted by user]",
-                                )
-                            };
                             self.append_streamed_assistant_message_to_history(
-                                partial,
+                                "[interrupted by user]".to_string(),
                                 &mut new_msgs,
                                 &mut committed_response,
                             );
@@ -2845,14 +2883,16 @@ impl Agent {
                                 model: effective_model.clone(),
                                 duration: llm_started_at.elapsed(),
                                 success: false,
+                                agent_alias: self.observer_agent_alias(),
+                                channel: None,
+                                turn_id: Some(turn_id.clone()),
                                 error_message: Some("request cancelled by user".into()),
                                 input_tokens: None,
                                 output_tokens: None,
-                                channel: None,
-                                agent_alias: self.observer_agent_alias(),
-                                turn_id: Some(turn_id.clone()),
+                                output_text: None,
+                                output_tool_calls_json: None,
                             });
-                                return Err(StreamedTurnError {
+                            return Err(StreamedTurnError {
                                 error: crate::agent::loop_::ToolLoopCancelled.into(),
                                 committed_response,
                                 new_messages: new_msgs,
@@ -2878,6 +2918,8 @@ impl Agent {
                             channel: None,
                             agent_alias: self.observer_agent_alias(),
                             turn_id: Some(turn_id.clone()),
+                            output_text: None,
+                            output_tool_calls_json: None,
                         });
                         if got_stream && !streamed_text.is_empty() {
                             let partial = Self::marked_partial_response(
@@ -2923,6 +2965,8 @@ impl Agent {
                 channel: None,
                 agent_alias: self.observer_agent_alias(),
                 turn_id: Some(turn_id.clone()),
+                output_text: None,
+                output_tool_calls_json: None,
             });
 
             // Forward per-call token usage so the WS gateway (and any other

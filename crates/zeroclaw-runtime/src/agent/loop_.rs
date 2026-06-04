@@ -1600,6 +1600,13 @@ pub async fn run_tool_call_loop(
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
     let mut malformed_tool_protocol_retries: usize = 0;
+    // Number of messages that were already serialized into the previous
+    // `LlmRequest::input_json` for this loop. Lets the next LLM call emit
+    // only the delta (compact default) or the full history (Langfuse
+    // full-prompt mode). Reset only when the LLM is *actually* called —
+    // failures don't count, otherwise the next attempt would lose the
+    // accumulated context.
+    let mut last_llm_input_messages: usize = 0;
 
     for iteration in 0..max_iterations {
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
@@ -1866,7 +1873,20 @@ pub async fn run_tool_call_loop(
             channel: None,
             agent_alias: None,
             turn_id: None,
+            input_json: build_llm_request_input_json(
+                &prepared_messages.messages,
+                last_llm_input_messages,
+                crate::observability::langfuse_full_prompt_per_request_enabled(),
+            ),
+            input_tools_json: if last_llm_input_messages == 0 && !tool_specs.is_empty() {
+                serde_json::to_string(&tool_specs).ok()
+            } else {
+                None
+            },
         });
+        // Record the message count we just serialized so the next iteration's
+        // delta-encoded LlmRequest only carries the new tail.
+        last_llm_input_messages = history.len();
         {
             let _provider_guard =
                 ::zeroclaw_log::attribution_span!(active_model_provider).entered();
@@ -2097,6 +2117,8 @@ pub async fn run_tool_call_loop(
                     channel: None,
                     agent_alias: None,
                     turn_id: None,
+                    output_text: resp.text.clone(),
+                    output_tool_calls_json: serde_json::to_string(&resp.tool_calls).ok(),
                 });
 
                 // Record cost via task-local tracker (no-op when not scoped)
@@ -2248,6 +2270,8 @@ pub async fn run_tool_call_loop(
                     channel: None,
                     agent_alias: None,
                     turn_id: None,
+                    output_text: None,
+                    output_tool_calls_json: None,
                 });
                 ::zeroclaw_log::record!(
                     WARN,
@@ -3175,6 +3199,30 @@ pub async fn run_tool_call_loop(
 /// how to invoke tools.
 pub fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
     build_tool_instructions_for_tools(tools_registry.iter().map(|tool| tool.as_ref()))
+}
+
+/// Build the JSON payload carried on [`ObserverEvent::LlmRequest::input_json`].
+///
+/// The compact default behaviour is to emit only the messages appended since
+/// the previous LLM call in this loop. Langfuse's full-prompt mode (or the
+/// first call of a session) needs the full conversation history instead so
+/// every generation in the trace is self-contained.
+pub fn build_llm_request_input_json(
+    full_messages: &[ChatMessage],
+    last_llm_input_messages: usize,
+    force_full_prompt_per_request: bool,
+) -> Option<String> {
+    if force_full_prompt_per_request || last_llm_input_messages == 0 {
+        // First call — or Langfuse full-prompt capture mode — includes the
+        // entire provider-facing message list.
+        serde_json::to_string(full_messages).ok()
+    } else if last_llm_input_messages < full_messages.len() {
+        // Default mode keeps follow-up traces compact by only recording the
+        // messages added since the previous LLM request in this loop.
+        serde_json::to_string(&full_messages[last_llm_input_messages..]).ok()
+    } else {
+        None
+    }
 }
 
 /// Build tool instructions for the subset of registered tools that are
@@ -5380,8 +5428,8 @@ pub async fn process_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_text_tool_prompt_policy, emergency_history_trim, estimate_history_tokens,
-        fast_trim_tool_results, load_interactive_session_history,
+        apply_text_tool_prompt_policy, build_llm_request_input_json, emergency_history_trim,
+        estimate_history_tokens, fast_trim_tool_results, load_interactive_session_history,
         maybe_inject_channel_delivery_defaults, save_interactive_session_history,
         truncate_tool_result,
     };
@@ -5436,6 +5484,47 @@ mod tests {
             args.get("delivery").is_none(),
             "webhook delivery needs sender/thread context and must not reuse reply_target as to"
         );
+    }
+    // ── build_llm_request_input_json tests ────────────────────────
+
+    #[test]
+    fn llm_request_input_json_first_call_uses_full_history() {
+        let messages = vec![ChatMessage::system("sys"), ChatMessage::user("hello")];
+        let json = build_llm_request_input_json(&messages, 0, false).expect("json should exist");
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0]["role"], "system");
+        assert_eq!(parsed[1]["content"], "hello");
+    }
+
+    #[test]
+    fn llm_request_input_json_follow_up_uses_delta_by_default() {
+        let messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("tool call"),
+            ChatMessage::tool("result"),
+        ];
+        let json = build_llm_request_input_json(&messages, 2, false).expect("json should exist");
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0]["role"], "assistant");
+        assert_eq!(parsed[1]["role"], "tool");
+    }
+
+    #[test]
+    fn llm_request_input_json_follow_up_can_force_full_history() {
+        let messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("tool call"),
+            ChatMessage::tool("result"),
+        ];
+        let json = build_llm_request_input_json(&messages, 2, true).expect("json should exist");
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(parsed.len(), 4);
+        assert_eq!(parsed[0]["role"], "system");
+        assert_eq!(parsed[3]["role"], "tool");
     }
 
     // ── truncate_tool_result tests ────────────────────────────────
