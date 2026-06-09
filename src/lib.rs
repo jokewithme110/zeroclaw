@@ -314,6 +314,35 @@ Examples:
         #[arg(long)]
         recipient: String,
     },
+    /// Manage channel contacts (recipients from received messages)
+    Contacts {
+        #[command(subcommand)]
+        contacts_command: ContactsCommands,
+    },
+}
+
+/// Channel contacts subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ContactsCommands {
+    /// List all channel contacts
+    #[command(long_about = "\
+List all channel contacts from received messages.
+
+Shows the channel type, recipient identifier, and last seen timestamp \
+for each contact that has sent a message to the agent.
+
+Examples:
+  zeroclaw channel contacts list              # list all contacts
+  zeroclaw channel contacts list --channel qq # filter by channel type
+  zeroclaw channel contacts list --json       # output as JSON")]
+    List {
+        /// Filter by channel type (e.g. qq, feishu, dingtalk)
+        #[arg(long)]
+        channel: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Skills management subcommands

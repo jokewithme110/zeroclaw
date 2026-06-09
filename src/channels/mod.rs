@@ -10,8 +10,9 @@ pub mod session_sqlite {
     pub use zeroclaw_infra::session_sqlite::*;
 }
 
+use crate::ContactsCommands;
 use crate::config::Config;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use zeroclaw_runtime::i18n::get_required_cli_string;
 #[cfg(feature = "channel-notion")]
 use zeroclaw_runtime::i18n::get_required_cli_string_with_args;
@@ -72,5 +73,61 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
             channel_id,
             recipient,
         } => send_channel_message(config, &channel_id, &recipient, &message).await,
+        crate::ChannelCommands::Contacts { contacts_command } => {
+            handle_contacts_command(contacts_command, config)
+        }
+    }
+}
+
+fn handle_contacts_command(command: ContactsCommands, config: &Config) -> Result<()> {
+    match command {
+        ContactsCommands::List { channel, json } => {
+            use zeroclaw_runtime::channel::contacts::ChannelContactsStore;
+
+            let store = match ChannelContactsStore::new(&config.data_dir) {
+                Ok(s) => s,
+                Err(e) => {
+                    anyhow::bail!("Failed to open channel contacts store: {e}");
+                }
+            };
+
+            let contacts = match store.list_contacts(channel.as_deref()) {
+                Ok(c) => c,
+                Err(e) => {
+                    anyhow::bail!("Failed to list contacts: {e}");
+                }
+            };
+
+            if contacts.is_empty() {
+                if json {
+                    println!("[]");
+                } else {
+                    println!("No contacts found.");
+                }
+                return Ok(());
+            }
+
+            if json {
+                // Output as JSON
+                let json_output = serde_json::to_string_pretty(&contacts)
+                    .context("Failed to serialize contacts to JSON")?;
+                println!("{}", json_output);
+            } else {
+                // Output as table (default, sorted by last_seen desc)
+                println!("{:<10} {:<35} Last Seen", "Channel", "Recipient");
+                println!("{:-<10} {:-<35} {:-<20}", "", "", "");
+
+                for contact in contacts {
+                    println!(
+                        "{:<10} {:<35} {}",
+                        contact.channel,
+                        contact.recipient,
+                        contact.last_seen.format("%Y-%m-%d %H:%M")
+                    );
+                }
+            }
+
+            Ok(())
+        }
     }
 }

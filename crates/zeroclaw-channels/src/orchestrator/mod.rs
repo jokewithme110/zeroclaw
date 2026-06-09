@@ -8955,6 +8955,16 @@ pub async fn start_channels(
                         zeroclaw_runtime::hooks::builtin::CommandLoggerHook::new(),
                     ));
                 }
+                // Contact recorder is always enabled when hooks are enabled
+                if let Ok(contacts_store) =
+                    zeroclaw_runtime::channel::contacts::ChannelContactsStore::new(&config.data_dir)
+                {
+                    runner.register(Box::new(
+                        zeroclaw_runtime::hooks::builtin::ContactRecorderHook::new(Arc::new(
+                            contacts_store,
+                        )),
+                    ));
+                }
                 if config.hooks.builtin.webhook_audit.enabled {
                     runner.register(Box::new(
                         zeroclaw_runtime::hooks::builtin::WebhookAuditHook::new(
