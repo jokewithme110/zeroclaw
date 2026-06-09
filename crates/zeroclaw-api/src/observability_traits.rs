@@ -53,10 +53,12 @@ pub enum ObserverEvent {
         success: bool,
         error_message: Option<String>,
         input_tokens: Option<u64>,
+        cached_input_tokens: Option<u64>,
         output_tokens: Option<u64>,
         channel: Option<String>,
         agent_alias: Option<String>,
         turn_id: Option<String>,
+        cost_usd: Option<f64>,
         /// Response text from the LLM. Populated by the agent loop for observers
         /// that support I/O capture (e.g. Langfuse). The observer decides whether
         /// to forward it based on its own `include_io` setting.

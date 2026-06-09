@@ -2161,7 +2161,7 @@ impl Agent {
             turn_id: Some(turn_id.clone()),
         });
 
-        let mut guard = TurnGuard {
+        let _guard = TurnGuard {
             observer: Arc::clone(&self.observer),
             model_provider: self.model_provider_name.clone(),
             model: effective_model.clone(),
@@ -2249,20 +2249,11 @@ impl Agent {
                 .await
             {
                 Ok(resp) => {
-                    let (resp_input_tokens, resp_output_tokens) = resp
+                    let (resp_input_tokens, resp_cached_input_tokens, resp_output_tokens) = resp
                         .usage
                         .as_ref()
-                        .map(|u| (u.input_tokens, u.output_tokens))
-                        .unwrap_or((None, None));
-                    if let Some(input) = resp_input_tokens {
-                        guard.total_input_tokens = guard.total_input_tokens.saturating_add(input);
-                        guard.saw_usage = true;
-                    }
-                    if let Some(output) = resp_output_tokens {
-                        guard.total_output_tokens =
-                            guard.total_output_tokens.saturating_add(output);
-                        guard.saw_usage = true;
-                    }
+                        .map(|u| (u.input_tokens, u.cached_input_tokens, u.output_tokens))
+                        .unwrap_or((None, None, None));
                     self.observer.record_event(&ObserverEvent::LlmResponse {
                         model_provider: self.model_provider_name.clone(),
                         model: effective_model.clone(),
@@ -2270,10 +2261,12 @@ impl Agent {
                         success: true,
                         error_message: None,
                         input_tokens: resp_input_tokens,
+                        cached_input_tokens: resp_cached_input_tokens,
                         output_tokens: resp_output_tokens,
                         channel: None,
                         agent_alias: self.observer_agent_alias(),
                         turn_id: Some(turn_id.clone()),
+                        cost_usd: None,
                         output_text: None,
                         output_tool_calls_json: None,
                     });
@@ -2288,10 +2281,12 @@ impl Agent {
                         success: false,
                         error_message: Some(safe_error),
                         input_tokens: None,
+                        cached_input_tokens: None,
                         output_tokens: None,
                         channel: None,
                         agent_alias: self.observer_agent_alias(),
                         turn_id: Some(turn_id.clone()),
+                        cost_usd: None,
                         output_text: None,
                         output_tool_calls_json: None,
                     });
@@ -2455,7 +2450,7 @@ impl Agent {
             turn_id: Some(turn_id.clone()),
         });
 
-        let mut guard = TurnGuard {
+        let _guard = TurnGuard {
             observer: Arc::clone(&self.observer),
             model_provider: self.model_provider_name.clone(),
             model: effective_model.clone(),
@@ -2737,7 +2732,9 @@ impl Agent {
                                 channel: None,
                                 turn_id: Some(turn_id.clone()),
                                 input_tokens: None,
+                                cached_input_tokens: None,
                                 output_tokens: None,
+                                cost_usd: None,
                                 output_text: None,
                                 output_tool_calls_json: None,
                             });
@@ -2773,10 +2770,12 @@ impl Agent {
                     success: false,
                     error_message: Some("request cancelled by user".into()),
                     input_tokens: None,
+                    cached_input_tokens: None,
                     output_tokens: None,
                     channel: None,
                     agent_alias: self.observer_agent_alias(),
                     turn_id: Some(turn_id.clone()),
+                    cost_usd: None,
                     output_text: None,
                     output_tool_calls_json: None,
                 });
@@ -2807,6 +2806,8 @@ impl Agent {
                     success: false,
                     error_message: Some(safe_error),
                     input_tokens: None,
+                    cached_input_tokens: None,
+                    cost_usd: None,
                     output_tokens: None,
                     channel: None,
                     agent_alias: self.observer_agent_alias(),
@@ -2888,7 +2889,9 @@ impl Agent {
                                 turn_id: Some(turn_id.clone()),
                                 error_message: Some("request cancelled by user".into()),
                                 input_tokens: None,
+                                cached_input_tokens: None,
                                 output_tokens: None,
+                                cost_usd: None,
                                 output_text: None,
                                 output_tool_calls_json: None,
                             });
@@ -2914,10 +2917,12 @@ impl Agent {
                             success: false,
                             error_message: Some(safe_error),
                             input_tokens: None,
+                            cached_input_tokens: None,
                             output_tokens: None,
                             channel: None,
                             agent_alias: self.observer_agent_alias(),
                             turn_id: Some(turn_id.clone()),
+                            cost_usd: None,
                             output_text: None,
                             output_tool_calls_json: None,
                         });
@@ -2941,19 +2946,11 @@ impl Agent {
                 }
             };
 
-            let (resp_input_tokens, resp_output_tokens) = response
+            let (resp_input_tokens, resp_cached_input_tokens, resp_output_tokens) = response
                 .usage
                 .as_ref()
-                .map(|u| (u.input_tokens, u.output_tokens))
-                .unwrap_or((None, None));
-            if let Some(input) = resp_input_tokens {
-                guard.total_input_tokens = guard.total_input_tokens.saturating_add(input);
-                guard.saw_usage = true;
-            }
-            if let Some(output) = resp_output_tokens {
-                guard.total_output_tokens = guard.total_output_tokens.saturating_add(output);
-                guard.saw_usage = true;
-            }
+                .map(|u| (u.input_tokens, u.cached_input_tokens, u.output_tokens))
+                .unwrap_or((None, None, None));
             self.observer.record_event(&ObserverEvent::LlmResponse {
                 model_provider: self.model_provider_name.clone(),
                 model: effective_model.clone(),
@@ -2961,10 +2958,12 @@ impl Agent {
                 success: true,
                 error_message: None,
                 input_tokens: resp_input_tokens,
+                cached_input_tokens: resp_cached_input_tokens,
                 output_tokens: resp_output_tokens,
                 channel: None,
                 agent_alias: self.observer_agent_alias(),
                 turn_id: Some(turn_id.clone()),
+                cost_usd: None,
                 output_text: None,
                 output_tool_calls_json: None,
             });
@@ -3350,8 +3349,8 @@ pub async fn run(
 
     let _run_guard = TurnGuard {
         observer: Arc::clone(&agent.observer),
-        model_provider: provider_name,
-        model: model_name,
+        model_provider: provider_name.clone(),
+        model: model_name.clone(),
         turn_id: None,
         turn_started_at: start,
         agent_alias: None,
@@ -3367,6 +3366,21 @@ pub async fn run(
     } else {
         agent.run_interactive().await?;
     }
+
+    let session_usage = crate::agent::cost::snapshot_scoped_turn_usage();
+    agent.observer.record_event(&ObserverEvent::AgentEnd {
+        model_provider: provider_name,
+        model: model_name,
+        duration: start.elapsed(),
+        tokens_used: session_usage.map(|usage| zeroclaw_api::observability_traits::TurnTokenUsage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+        }),
+        cost_usd: session_usage.map(|usage| usage.cost_usd),
+        channel: None,
+        agent_alias: None,
+        turn_id: None,
+    });
 
     Ok(())
 }

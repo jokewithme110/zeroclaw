@@ -146,6 +146,7 @@ export interface ModelStats {
   input_tokens: number;
   output_tokens: number;
   cached_input_tokens: number;
+  billable_input_tokens: number;
   request_count: number;
 }
 

@@ -2268,15 +2268,10 @@ async fn run_gateway_chat_with_tools(
         // `<type>.<alias>` to match how the channels orchestrator builds
         // its `ModelProviderPricing`.
         let cost_tracking_context = state.cost_tracker.as_ref().map(|tracker| {
-            let pricing: zeroclaw_runtime::agent::cost::ModelProviderPricing = config
-                .providers
-                .models
-                .iter_entries()
-                .filter(|(_, _, base)| !base.pricing.is_empty())
-                .map(|(type_k, alias_k, base)| {
-                    (format!("{type_k}.{alias_k}"), base.pricing.clone())
-                })
-                .collect();
+            let pricing = zeroclaw_runtime::agent::cost::build_model_provider_pricing(
+                &config,
+                zeroclaw_runtime::agent::cost::PricingMapKeyMode::Alias,
+            );
             zeroclaw_runtime::agent::cost::ToolLoopCostTrackingContext::new(
                 tracker.clone(),
                 std::sync::Arc::new(pricing),
@@ -2618,10 +2613,12 @@ async fn handle_webhook(
                     success: true,
                     error_message: None,
                     input_tokens,
+                    cached_input_tokens: None,
                     output_tokens,
                     channel: None,
                     agent_alias: None,
                     turn_id: None,
+                    cost_usd: None,
                     output_text: None,
                     output_tool_calls_json: None,
                 },
@@ -2657,10 +2654,12 @@ async fn handle_webhook(
                     success: false,
                     error_message: Some(sanitized.clone()),
                     input_tokens: None,
+                    cached_input_tokens: None,
                     output_tokens: None,
                     channel: None,
                     agent_alias: None,
                     turn_id: None,
+                    cost_usd: None,
                     output_text: None,
                     output_tool_calls_json: None,
                 },

@@ -135,21 +135,21 @@ Trace: "ZeroClaw Agent Session"        ← AgentStart → AgentEnd
 - `langfuse.trace.name` — `"ZeroClaw Agent Session"`
 - `provider` / `model` — 使用的 LLM provider 和模型
 - `duration_s` — 会话总耗时
-- `tokens_used` — 总 token 消耗
-- `langfuse.observation.cost_details` — 成本（USD）
+- `langfuse.observation.input` / `langfuse.observation.output` — 整轮 Agent 的输入与输出摘要（启用 `langfuse_include_io` 时）
 
 **Generation（LLM 调用）**：
 - `langfuse.observation.type` — `"generation"`
 - `langfuse.observation.model.name` — 模型名称
-- `langfuse.observation.usage_details` — token 使用详情（JSON: `promptTokens`, `completionTokens`, `totalTokens`）
+- `langfuse.observation.usage_details` — token 使用详情（JSON: `prompt_tokens`, `prompt_tokens_details.cached_tokens`, `completion_tokens`, `total_tokens`）
+- `langfuse.observation.cost_details` — 单次调用成本（USD）
 - `langfuse.observation.metadata.provider` — Provider 名称
 - `langfuse.observation.metadata.success` — 调用是否成功
 - `langfuse.observation.status_message` — 错误信息（失败时）
 - `duration_s` — LLM 调用耗时
 - `startTime` / `endTime` — 精确的调用时间窗口
 
-**Span（工具执行）**：
-- `langfuse.observation.type` — `"span"`
+**Tool（工具执行）**：
+- `langfuse.observation.type` — `"tool"`
 - `langfuse.observation.input` — 工具调用参数
 - `langfuse.observation.metadata.tool` — 工具名称
 - `langfuse.observation.metadata.success` — 执行是否成功

@@ -128,6 +128,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 # URL handling / encoding for web search and proxies
 url = "2.5"
 urlencoding = "2.1"
+unicode-width = "0.2"
 
 # HTML to plain text conversion (web_fetch tool)
 nanohtml2text = "0.2"

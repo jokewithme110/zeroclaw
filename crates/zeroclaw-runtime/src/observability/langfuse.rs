@@ -121,6 +121,31 @@ impl LangfuseObserver {
         // spans are local by default.
         Context::new().with_remote_span_context(root.span_context().clone())
     }
+
+    fn usage_details_json(
+        input_tokens: Option<u64>,
+        cached_input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+    ) -> serde_json::Value {
+        let prompt_tokens = input_tokens.unwrap_or(0);
+        let completion_tokens = output_tokens.unwrap_or(0);
+        let total_tokens = prompt_tokens + completion_tokens;
+
+        serde_json::json!({
+            "prompt_tokens": prompt_tokens,
+            "prompt_tokens_details": {
+                "cached_tokens": cached_input_tokens.unwrap_or(0),
+            },
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        })
+    }
+
+    fn cost_details_json(cost_usd: Option<f64>) -> serde_json::Value {
+        serde_json::json!({
+            "total": cost_usd.unwrap_or(0.0),
+        })
+    }
 }
 
 impl Observer for LangfuseObserver {
@@ -135,6 +160,7 @@ impl Observer for LangfuseObserver {
                     opentelemetry::trace::SpanBuilder::from_name("agent.invocation")
                         .with_kind(SpanKind::Server)
                         .with_attributes(vec![
+                            KeyValue::new("langfuse.observation.type", "agent"),
                             KeyValue::new("langfuse.trace.name", "ZeroClaw Agent Session"),
                             KeyValue::new("provider", model_provider.clone()),
                             KeyValue::new("model", model.clone()),
@@ -161,7 +187,9 @@ impl Observer for LangfuseObserver {
                 success,
                 error_message,
                 input_tokens,
+                cached_input_tokens,
                 output_tokens,
+                cost_usd,
                 output_text,
                 output_tool_calls_json,
             } => {
@@ -176,11 +204,8 @@ impl Observer for LangfuseObserver {
                     .unwrap_or(SystemTime::now());
 
                 // Serialize usage_details as JSON string (Langfuse attribute convention).
-                let usage_details = serde_json::json!({
-                    "promptTokens": input_tokens.unwrap_or(0),
-                    "completionTokens": output_tokens.unwrap_or(0),
-                    "totalTokens": input_tokens.unwrap_or(0) + output_tokens.unwrap_or(0),
-                });
+                let usage_details =
+                    Self::usage_details_json(*input_tokens, *cached_input_tokens, *output_tokens);
 
                 let mut attrs = vec![
                     KeyValue::new("langfuse.observation.type", "generation"),
@@ -198,6 +223,11 @@ impl Observer for LangfuseObserver {
                     KeyValue::new("model", model.clone()),
                     KeyValue::new("duration_s", secs),
                 ];
+                let cost_json = Self::cost_details_json(*cost_usd);
+                attrs.push(KeyValue::new(
+                    "langfuse.observation.cost_details",
+                    cost_json.to_string(),
+                ));
                 if let Some(msg) = error_message {
                     attrs.push(KeyValue::new(
                         "langfuse.observation.status_message",
@@ -333,10 +363,9 @@ impl Observer for LangfuseObserver {
                     root.set_attribute(KeyValue::new("tokens_used", *t as i64));
                 }
                 if let Some(c) = cost_usd {
-                    let cost_json = serde_json::json!({"total": c});
                     root.set_attribute(KeyValue::new(
                         "langfuse.observation.cost_details",
-                        cost_json.to_string(),
+                        Self::cost_details_json(Some(*c)).to_string(),
                     ));
                 }
                 root.end();
@@ -429,6 +458,15 @@ mod tests {
     }
 
     #[test]
+    fn usage_details_include_cached_prompt_tokens() {
+        let usage_details = LangfuseObserver::usage_details_json(Some(500), Some(120), Some(200));
+        assert_eq!(usage_details["prompt_tokens"], 500);
+        assert_eq!(usage_details["prompt_tokens_details"]["cached_tokens"], 120);
+        assert_eq!(usage_details["completion_tokens"], 200);
+        assert_eq!(usage_details["total_tokens"], 700);
+    }
+
+    #[test]
     fn records_full_session_without_panic() {
         let obs = test_observer();
         obs.record_event(&ObserverEvent::AgentStart {
@@ -449,7 +487,9 @@ mod tests {
             success: true,
             error_message: None,
             input_tokens: Some(500),
+            cached_input_tokens: Some(120),
             output_tokens: Some(200),
+            cost_usd: Some(0.0123),
             output_text: None,
             output_tool_calls_json: None,
         });
@@ -486,7 +526,9 @@ mod tests {
             success: false,
             error_message: Some("timeout".into()),
             input_tokens: None,
+            cached_input_tokens: None,
             output_tokens: None,
+            cost_usd: None,
             output_text: None,
             output_tool_calls_json: None,
         });
@@ -533,7 +575,9 @@ mod tests {
             success: true,
             error_message: None,
             input_tokens: Some(0),
+            cached_input_tokens: Some(0),
             output_tokens: Some(0),
+            cost_usd: Some(0.0),
             output_text: None,
             output_tool_calls_json: None,
         });
@@ -589,7 +633,9 @@ mod tests {
                 success: true,
                 error_message: None,
                 input_tokens: Some(1000),
+                cached_input_tokens: Some(250),
                 output_tokens: Some(500),
+                cost_usd: Some(0.015),
                 output_text: None,
                 output_tool_calls_json: None,
             });

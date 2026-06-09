@@ -331,7 +331,9 @@ impl Observer for PrometheusObserver {
                 model,
                 success,
                 input_tokens,
+                cached_input_tokens: _,
                 output_tokens,
+                cost_usd: _,
                 ..
             } => {
                 let success_str = if *success { "true" } else { "false" };
@@ -676,10 +678,12 @@ mod tests {
             success: true,
             error_message: None,
             input_tokens: Some(100),
+            cached_input_tokens: Some(25),
             output_tokens: Some(50),
             channel: None,
             agent_alias: None,
             turn_id: None,
+            cost_usd: Some(0.001),
             output_text: None,
             output_tool_calls_json: None,
         });
@@ -690,10 +694,12 @@ mod tests {
             success: true,
             error_message: None,
             input_tokens: Some(200),
+            cached_input_tokens: Some(40),
             output_tokens: Some(80),
             channel: None,
             agent_alias: None,
             turn_id: None,
+            cost_usd: Some(0.002),
             output_text: None,
             output_tool_calls_json: None,
         });
@@ -721,10 +727,12 @@ mod tests {
             success: false,
             error_message: Some("timeout".into()),
             input_tokens: None,
+            cached_input_tokens: None,
             output_tokens: None,
             channel: None,
             agent_alias: None,
             turn_id: None,
+            cost_usd: None,
             output_text: None,
             output_tool_calls_json: None,
         });

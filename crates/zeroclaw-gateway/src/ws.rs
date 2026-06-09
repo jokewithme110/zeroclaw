@@ -944,6 +944,7 @@ async fn process_chat_message(
     // The agent emits TurnEvent::Usage once per LLM call when the provider
     // surfaces usage; we sum to produce a single done-frame total.
     let mut total_input_tokens: Option<u64> = None;
+    let mut total_cached_input_tokens: Option<u64> = None;
     let mut total_output_tokens: Option<u64> = None;
 
     // Routes the three concurrent streams that the running turn cares about:
@@ -1075,7 +1076,7 @@ async fn process_chat_message(
                     let ws_msg = match event {
                         TurnEvent::Usage {
                             input_tokens,
-                            cached_input_tokens: _,
+                            cached_input_tokens,
                             output_tokens,
                             cost_usd: _,
                         } => {
@@ -1086,6 +1087,10 @@ async fn process_chat_message(
                             // cache reads.
                             if let Some(it) = input_tokens {
                                 total_input_tokens = Some(total_input_tokens.unwrap_or(0) + it);
+                            }
+                            if let Some(cit) = cached_input_tokens {
+                                total_cached_input_tokens =
+                                    Some(total_cached_input_tokens.unwrap_or(0) + cit);
                             }
                             if let Some(ot) = output_tokens {
                                 total_output_tokens = Some(total_output_tokens.unwrap_or(0) + ot);
@@ -1297,7 +1302,7 @@ async fn process_chat_message(
                 &model_label,
                 total_input_tokens,
                 total_output_tokens,
-                None,
+                total_cached_input_tokens,
             );
 
             let done = serde_json::json!({
@@ -1440,13 +1445,10 @@ fn record_turn_cost(
     // paths derive identical costs because both bottom out in the same
     // `<type>.<alias>` key shape.
     let config = state.config.read();
-    let pricing_map = config
-        .providers
-        .models
-        .iter_entries()
-        .filter(|(_, _, base)| !base.pricing.is_empty())
-        .map(|(type_k, alias_k, base)| (format!("{type_k}.{alias_k}"), base.pricing.clone()))
-        .collect::<std::collections::HashMap<String, std::collections::HashMap<String, f64>>>();
+    let pricing_map = zeroclaw_runtime::agent::cost::build_model_provider_pricing(
+        &config,
+        zeroclaw_runtime::agent::cost::PricingMapKeyMode::Alias,
+    );
     drop(config);
     let model_pricing = pricing_map.get(provider_name);
     let try_lookup = |key: &str| -> (f64, f64, f64) {

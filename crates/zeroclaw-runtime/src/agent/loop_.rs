@@ -144,7 +144,7 @@ use zeroclaw_providers::{
 // Cost tracking moved to `super::cost`.
 pub use super::cost::{
     TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, TurnUsage,
-    check_tool_loop_budget, record_tool_loop_cost_usage,
+    check_tool_loop_budget, record_tool_loop_cost_usage, snapshot_scoped_turn_usage,
 };
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
@@ -2100,11 +2100,16 @@ pub async fn run_tool_call_loop(
             response_streamed_live,
         ) = match chat_result {
             Ok(resp) => {
-                let (resp_input_tokens, resp_output_tokens) = resp
+                let (resp_input_tokens, resp_cached_input_tokens, resp_output_tokens) = resp
                     .usage
                     .as_ref()
-                    .map(|u| (u.input_tokens, u.output_tokens))
-                    .unwrap_or((None, None));
+                    .map(|u| (u.input_tokens, u.cached_input_tokens, u.output_tokens))
+                    .unwrap_or((None, None, None));
+                let resp_cost_usd = resp
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| record_tool_loop_cost_usage(provider_name, model, usage))
+                    .map(|(_, cost_usd)| cost_usd);
 
                 observer.record_event(&ObserverEvent::LlmResponse {
                     model_provider: provider_name.to_string(),
@@ -2113,21 +2118,21 @@ pub async fn run_tool_call_loop(
                     success: true,
                     error_message: None,
                     input_tokens: resp_input_tokens,
+                    cached_input_tokens: resp_cached_input_tokens,
                     output_tokens: resp_output_tokens,
                     channel: None,
                     agent_alias: None,
                     turn_id: None,
+                    cost_usd: resp_cost_usd,
                     output_text: resp.text.clone(),
                     output_tool_calls_json: serde_json::to_string(&resp.tool_calls).ok(),
                 });
 
-                // Record cost via task-local tracker (no-op when not scoped)
-                let _ = resp
-                    .usage
-                    .as_ref()
-                    .and_then(|usage| record_tool_loop_cost_usage(provider_name, model, usage));
-
-                let response_text = strip_think_tags(resp.text_or_empty());
+                let response_text = if tool_specs.is_empty() {
+                    strip_think_tags(resp.text_or_empty())
+                } else {
+                    resp.text_or_empty().to_string()
+                };
                 // First try native structured tool calls (OpenAI-format).
                 // Fall back to text-based parsing (XML tags, markdown blocks,
                 // GLM format) only if the model_provider returned no native calls —
@@ -2266,10 +2271,12 @@ pub async fn run_tool_call_loop(
                     success: false,
                     error_message: Some(safe_error.clone()),
                     input_tokens: None,
+                    cached_input_tokens: None,
                     output_tokens: None,
                     channel: None,
                     agent_alias: None,
                     turn_id: None,
+                    cost_usd: None,
                     output_text: None,
                     output_tool_calls_json: None,
                 });
@@ -3117,6 +3124,7 @@ pub async fn run_tool_call_loop(
             .with_attrs(::serde_json::json!({"error": "Agent exceeded maximum tool iterations"})),
         "Agent exceeded maximum tool iterations"
     );
+    anyhow::bail!("Agent exceeded maximum tool iterations")
 }
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -3940,15 +3948,10 @@ pub async fn run(
         let cost_tracking_context: Option<ToolLoopCostTrackingContext> =
             crate::cost::CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)
                 .map(|tracker| {
-                    let pricing: crate::agent::cost::ModelProviderPricing = config
-                        .providers
-                        .models
-                        .iter_entries()
-                        .map(|(type_k, alias_k, profile)| {
-                            (format!("{type_k}.{alias_k}"), profile.pricing.clone())
-                        })
-                        .filter(|(_, p)| !p.is_empty())
-                        .collect();
+                    let pricing = crate::agent::cost::build_model_provider_pricing(
+                        &config,
+                        crate::agent::cost::PricingMapKeyMode::Alias,
+                    );
                     ToolLoopCostTrackingContext::new(tracker, Arc::new(pricing))
                         .with_agent_alias(agent_alias)
                 });
@@ -4723,15 +4726,19 @@ pub async fn run(
         }
 
         let duration = start.elapsed();
+        let session_usage = snapshot_scoped_turn_usage();
         observer.record_event(&ObserverEvent::AgentEnd {
             model_provider: provider_name.to_string(),
             model: model_name.to_string(),
             duration,
-            tokens_used: None,
-            cost_usd: None,
             channel: None,
             agent_alias: None,
             turn_id: None,
+            tokens_used: session_usage.map(|usage| zeroclaw_api::observability_traits::TurnTokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+            }),
+            cost_usd: session_usage.map(|usage| usage.cost_usd),
         });
 
         Ok(final_output)
@@ -12278,6 +12285,14 @@ Let me check the result."#;
             enabled: true,
             ..zeroclaw_config::schema::CostConfig::default()
         };
+        cost_config.prices = HashMap::from([(
+            "mock-model".to_string(),
+            ModelPricing {
+                input: 3.0,
+                output: 15.0,
+                cached_input: None,
+            },
+        )]);
         let tracker = Arc::new(CostTracker::new(cost_config.clone(), workspace.path()).unwrap());
         let mut model_pricing: HashMap<String, f64> = HashMap::new();
         model_pricing.insert("mock-model.input".to_string(), 3.0);

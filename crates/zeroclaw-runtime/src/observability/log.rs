@@ -131,14 +131,31 @@ impl Observer for LogObserver {
                 success,
                 error_message,
                 input_tokens,
+                cached_input_tokens,
                 output_tokens,
                 channel: _,
                 agent_alias: _,
                 turn_id: _,
+                cost_usd,
                 ..
             } => {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
-                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": model_provider, "model": model, "duration_ms": ms, "success": success, "error": error_message, "input_tokens": input_tokens, "output_tokens": output_tokens})), "llm.response");
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "model_provider": model_provider,
+                            "model": model,
+                            "duration_ms": ms,
+                            "success": success,
+                            "error": error_message,
+                            "input_tokens": input_tokens,
+                            "cached_input_tokens": cached_input_tokens,
+                            "output_tokens": output_tokens,
+                            "cost_usd": cost_usd
+                        })),
+                    "llm.response"
+                );
             }
             ObserverEvent::DeploymentStarted { deploy_id } => {
                 ::zeroclaw_log::record!(
@@ -287,10 +304,12 @@ mod tests {
             success: true,
             error_message: None,
             input_tokens: Some(100),
+            cached_input_tokens: Some(20),
             output_tokens: Some(50),
             channel: None,
             agent_alias: None,
             turn_id: None,
+            cost_usd: Some(0.001),
             output_text: None,
             output_tool_calls_json: None,
         });
@@ -301,10 +320,12 @@ mod tests {
             success: false,
             error_message: Some("rate limited".into()),
             input_tokens: None,
+            cached_input_tokens: None,
             output_tokens: None,
             channel: None,
             agent_alias: None,
             turn_id: None,
+            cost_usd: None,
             output_text: None,
             output_tool_calls_json: None,
         });

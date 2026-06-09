@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Token usage information from a single API call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7,6 +8,9 @@ pub struct TokenUsage {
     pub model: String,
     /// Input/prompt tokens
     pub input_tokens: u64,
+    /// Billable input tokens after subtracting cache hits
+    #[serde(default)]
+    pub billable_input_tokens: u64,
     /// Output/completion tokens
     pub output_tokens: u64,
     /// Cached input tokens (Anthropic `cache_read_input_tokens`, OpenAI
@@ -51,12 +55,34 @@ impl TokenUsage {
         output_price_per_million: f64,
         cached_input_price_per_million: f64,
     ) -> Self {
+        Self::new_with_cache(
+            model,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            input_price_per_million,
+            cached_input_price_per_million,
+            output_price_per_million,
+        )
+    }
+
+    /// Create a new token usage record with cache-aware input pricing.
+    pub fn new_with_cache(
+        model: impl Into<String>,
+        input_tokens: u64,
+        cached_input_tokens: u64,
+        output_tokens: u64,
+        input_price_per_million: f64,
+        cached_input_price_per_million: f64,
+        output_price_per_million: f64,
+    ) -> Self {
         let model = model.into();
         let input_price_per_million = Self::sanitize_price(input_price_per_million);
         let output_price_per_million = Self::sanitize_price(output_price_per_million);
         let cached_input_price_per_million = Self::sanitize_price(cached_input_price_per_million);
         let cached_input_tokens = cached_input_tokens.min(input_tokens);
         let billable_uncached_input = input_tokens.saturating_sub(cached_input_tokens);
+        let billable_input_tokens = input_tokens.saturating_sub(cached_input_tokens);
         let total_tokens = input_tokens.saturating_add(output_tokens);
 
         // Calculate cost: (tokens / 1M) * price_per_million for each band.
@@ -76,6 +102,7 @@ impl TokenUsage {
         Self {
             model,
             input_tokens,
+            billable_input_tokens,
             output_tokens,
             cached_input_tokens,
             total_tokens,
@@ -94,6 +121,14 @@ impl TokenUsage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UsagePeriod {
     Session,
+    Day,
+    Month,
+}
+
+/// Time period for token aggregation queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenPeriod {
     Day,
     Month,
 }
@@ -211,19 +246,136 @@ pub struct ModelStats {
     pub model: String,
     /// Total cost for this model.
     pub cost_usd: f64,
-    /// Total tokens for this model (input + output).
-    pub total_tokens: u64,
-    /// Input tokens (uncached + cached).
+    /// Total input tokens for this model
     #[serde(default)]
     pub input_tokens: u64,
-    /// Output tokens.
-    #[serde(default)]
-    pub output_tokens: u64,
-    /// Cached input tokens served from the prompt cache.
+    /// Total cached input tokens for this model
     #[serde(default)]
     pub cached_input_tokens: u64,
+    /// Total billable input tokens for this model
+    #[serde(default)]
+    pub billable_input_tokens: u64,
+    /// Total output tokens for this model
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// Total tokens for this model
+    pub total_tokens: u64,
     /// Number of LLM responses for this model.
     pub request_count: usize,
+}
+
+/// Aggregated token statistics for a model or total row.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TokenStats {
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub billable_input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd: f64,
+    pub request_count: usize,
+}
+
+impl TokenStats {
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+
+    pub fn record_usage(&mut self, usage: &TokenUsage) {
+        self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(usage.cached_input_tokens);
+        self.billable_input_tokens = self
+            .billable_input_tokens
+            .saturating_add(usage.billable_input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
+        self.cost_usd += usage.cost_usd;
+        self.request_count += 1;
+    }
+}
+
+/// Compact aggregate stats stored in `cost_aggregates.json`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AggregateStats {
+    #[serde(rename = "in", default)]
+    pub input_tokens: u64,
+    #[serde(rename = "cin", default)]
+    pub cached_input_tokens: u64,
+    #[serde(rename = "bin", default)]
+    pub billable_input_tokens: u64,
+    #[serde(rename = "out", default)]
+    pub output_tokens: u64,
+    #[serde(rename = "cost", default)]
+    pub cost_usd: f64,
+    #[serde(rename = "req", default)]
+    pub request_count: usize,
+}
+
+impl AggregateStats {
+    pub fn record_usage(&mut self, usage: &TokenUsage) {
+        self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(usage.cached_input_tokens);
+        self.billable_input_tokens = self
+            .billable_input_tokens
+            .saturating_add(usage.billable_input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
+        self.cost_usd += usage.cost_usd;
+        self.request_count += 1;
+    }
+}
+
+impl From<AggregateStats> for TokenStats {
+    fn from(value: AggregateStats) -> Self {
+        Self {
+            input_tokens: value.input_tokens,
+            cached_input_tokens: value.cached_input_tokens,
+            billable_input_tokens: value.billable_input_tokens,
+            output_tokens: value.output_tokens,
+            cost_usd: value.cost_usd,
+            request_count: value.request_count,
+        }
+    }
+}
+
+impl From<&AggregateStats> for TokenStats {
+    fn from(value: &AggregateStats) -> Self {
+        Self {
+            input_tokens: value.input_tokens,
+            cached_input_tokens: value.cached_input_tokens,
+            billable_input_tokens: value.billable_input_tokens,
+            output_tokens: value.output_tokens,
+            cost_usd: value.cost_usd,
+            request_count: value.request_count,
+        }
+    }
+}
+
+/// Aggregate file persisted alongside cost details.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CostAggregates {
+    #[serde(default)]
+    pub tz: String,
+    #[serde(default)]
+    pub daily: HashMap<String, HashMap<String, AggregateStats>>,
+    #[serde(default)]
+    pub monthly: HashMap<String, HashMap<String, AggregateStats>>,
+}
+
+/// Aggregated token usage for a specific period.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TokenSummary {
+    pub period: TokenPeriod,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date: Option<chrono::NaiveDate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub month: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub tz: String,
+    pub models: HashMap<String, TokenStats>,
+    pub totals: TokenStats,
 }
 
 impl Default for CostSummary {
@@ -251,6 +403,8 @@ mod tests {
         // Expected: (1000/1M)*3 + (500/1M)*15 = 0.003 + 0.0075 = 0.0105
         assert!((usage.cost_usd - 0.0105).abs() < 0.0001);
         assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.cached_input_tokens, 0);
+        assert_eq!(usage.billable_input_tokens, 1000);
         assert_eq!(usage.output_tokens, 500);
         assert_eq!(usage.total_tokens, 1500);
         assert_eq!(usage.cached_input_tokens, 0);
@@ -274,6 +428,18 @@ mod tests {
         let with_cache = TokenUsage::new("test/model", 1000, 500, 200, 3.0, 15.0, 0.0);
         let without_cache = TokenUsage::new("test/model", 1000, 500, 0, 3.0, 15.0, 0.0);
         assert!((with_cache.cost_usd - without_cache.cost_usd).abs() < 1e-9);
+    }
+
+    #[test]
+    fn token_usage_cache_aware_calculation() {
+        let usage = TokenUsage::new_with_cache("test/model", 1_000, 800, 500, 3.0, 0.3, 15.0);
+
+        // Expected: uncached=(200/1M)*3 + cached=(800/1M)*0.3 + output=(500/1M)*15
+        let expected = 0.0006 + 0.00024 + 0.0075;
+        assert!((usage.cost_usd - expected).abs() < 0.0001);
+        assert_eq!(usage.cached_input_tokens, 800);
+        assert_eq!(usage.billable_input_tokens, 200);
+        assert_eq!(usage.total_tokens, 1500);
     }
 
     #[test]

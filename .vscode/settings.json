@@ -14,6 +14,7 @@
   "editor.formatOnPaste": true,
   "files.autoSave": "afterDelay",
   "files.autoSaveDelay": 1000,
+  "rust-analyzer.checkOnSave.command": "check",
   "rust-analyzer.check.command": "clippy",
   "rust-analyzer.check.extraArgs": ["--", "-D", "warnings"],
   "window.title": "${activeRepositoryBranchName}",

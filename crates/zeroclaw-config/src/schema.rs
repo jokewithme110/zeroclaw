@@ -5436,6 +5436,20 @@ pub struct CostConfig {
     #[serde(default = "default_track_per_agent")]
     pub track_per_agent: bool,
 
+    /// Per-model pricing (USD per 1M tokens)
+    #[serde(default = "get_default_pricing")]
+    pub prices: std::collections::HashMap<String, ModelPricing>,
+
+    /// Operator-managed rate sheet retained for compatibility with the
+    /// existing runtime cost-resolution flow.
+    #[serde(default)]
+    #[nested]
+    pub rates: CostRatesConfig,
+
+
+    /// Default timezone used for cost aggregation and CLI cost queries.
+    #[serde(default = "default_cost_timezone")]
+    pub default_timezone: String,
     /// Operator-managed rate sheet at `[cost.rates.*]`. Sections mirror
     /// the `[providers.*]` dotted-path exactly with the trailing `alias`
     /// segment replaced by the resource the rate applies to (model id,
@@ -5459,7 +5473,26 @@ pub struct CostConfig {
     #[tab(Costs)]
     #[serde(default)]
     #[nested]
-    pub rates: CostRatesConfig,
+    pub storage: CostStorageConfig,
+}
+
+/// Cost storage retention and size controls.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "cost.storage"]
+pub struct CostStorageConfig {
+    /// Maximum combined size in bytes of `costs.jsonl` and `cost_aggregates.json`.
+    #[serde(default = "default_cost_storage_max_total_bytes")]
+    pub max_total_bytes: u64,
+    /// Number of latest detail records to retain in `costs.jsonl`.
+    #[serde(default = "default_cost_storage_max_detail_records")]
+    pub max_detail_records: usize,
+    /// Number of recent daily aggregate buckets to retain.
+    #[serde(default = "default_cost_storage_retain_daily_days")]
+    pub retain_daily_days: usize,
+    /// Number of recent monthly aggregate buckets to retain.
+    #[serde(default = "default_cost_storage_retain_monthly_months")]
+    pub retain_monthly_months: usize,
 }
 
 /// Configuration for cost enforcement behavior when budget limits are reached.
@@ -5482,6 +5515,26 @@ fn default_cost_enforcement_mode() -> String {
     "warn".to_string()
 }
 
+fn default_cost_timezone() -> String {
+    "Asia/Shanghai".to_string()
+}
+
+fn default_cost_storage_max_total_bytes() -> u64 {
+    1_048_576
+}
+
+fn default_cost_storage_max_detail_records() -> usize {
+    10
+}
+
+fn default_cost_storage_retain_daily_days() -> usize {
+    90
+}
+
+fn default_cost_storage_retain_monthly_months() -> usize {
+    24
+}
+
 fn default_reserve_percent() -> u8 {
     10
 }
@@ -5494,6 +5547,35 @@ impl Default for CostEnforcementConfig {
             reserve_percent: default_reserve_percent(),
         }
     }
+}
+
+impl Default for CostStorageConfig {
+    fn default() -> Self {
+        Self {
+            max_total_bytes: default_cost_storage_max_total_bytes(),
+            max_detail_records: default_cost_storage_max_detail_records(),
+            retain_daily_days: default_cost_storage_retain_daily_days(),
+            retain_monthly_months: default_cost_storage_retain_monthly_months(),
+        }
+    }
+}
+
+/// Per-model pricing entry (USD per 1M tokens).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct ModelPricing {
+    /// Input price per 1M tokens
+    #[serde(default)]
+    pub input: f64,
+
+    /// Output price per 1M tokens
+    #[serde(default)]
+    pub output: f64,
+
+    /// Cached input price per 1M tokens (optional, defaults to None).
+    /// When `None` the cached subset bills at the standard input rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input: Option<f64>,
 }
 
 fn default_daily_limit() -> f64 {
@@ -5651,11 +5733,151 @@ impl Default for CostConfig {
             monthly_limit_usd: default_monthly_limit(),
             warn_at_percent: default_warn_percent(),
             allow_override: false,
-            enforcement: CostEnforcementConfig::default(),
             track_per_agent: default_track_per_agent(),
+            prices: get_default_pricing(),
             rates: CostRatesConfig::default(),
+            enforcement: CostEnforcementConfig::default(),
+            default_timezone: default_cost_timezone(),
+            storage: CostStorageConfig::default(),
         }
     }
+}
+
+/// Default pricing for popular models (USD per 1M tokens)
+fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
+    let mut prices = std::collections::HashMap::new();
+
+    // Anthropic models
+    prices.insert(
+        "anthropic/claude-sonnet-4-20250514".into(),
+        ModelPricing {
+            input: 3.0,
+            output: 15.0,
+            cached_input: None,
+        },
+    );
+    prices.insert(
+        "anthropic/claude-opus-4-20250514".into(),
+        ModelPricing {
+            input: 15.0,
+            output: 75.0,
+            cached_input: None,
+        },
+    );
+    prices.insert(
+        "anthropic/claude-3.5-sonnet".into(),
+        ModelPricing {
+            input: 3.0,
+            output: 15.0,
+            cached_input: None,
+        },
+    );
+    prices.insert(
+        "anthropic/claude-3-haiku".into(),
+        ModelPricing {
+            input: 0.25,
+            output: 1.25,
+            cached_input: None,
+        },
+    );
+
+    // OpenAI models
+    prices.insert(
+        "openai/gpt-4o".into(),
+        ModelPricing {
+            input: 5.0,
+            output: 15.0,
+            cached_input: None,
+        },
+    );
+    prices.insert(
+        "openai/gpt-4o-mini".into(),
+        ModelPricing {
+            input: 0.15,
+            output: 0.60,
+            cached_input: None,
+        },
+    );
+    prices.insert(
+        "openai/o1-preview".into(),
+        ModelPricing {
+            input: 15.0,
+            output: 60.0,
+            cached_input: None,
+        },
+    );
+
+    // Google models
+    prices.insert(
+        "google/gemini-2.0-flash".into(),
+        ModelPricing {
+            input: 0.10,
+            output: 0.40,
+            cached_input: None,
+        },
+    );
+    prices.insert(
+        "google/gemini-1.5-pro".into(),
+        ModelPricing {
+            input: 1.25,
+            output: 5.0,
+            cached_input: None,
+        },
+    );
+
+    // High-frequency China models (minimal default catalog)
+    prices.insert(
+        "deepseek/deepseek-v4-flash".into(),
+        ModelPricing {
+            input: 0.14,
+            output: 0.28,
+            cached_input: Some(0.0028),
+        },
+    );
+    prices.insert(
+        "deepseek/deepseek-v4-pro".into(),
+        ModelPricing {
+            input: 0.435,
+            output: 0.87,
+            cached_input: Some(0.003625),
+        },
+    );
+    prices.insert(
+        "qwen/qwen3.5-plus".into(),
+        ModelPricing {
+            input: 0.115,
+            output: 0.688,
+            cached_input: Some(0.058),
+        },
+    );
+    prices.insert(
+        "glm/glm-4.7".into(),
+        ModelPricing {
+            input: 0.29,
+            output: 1.17,
+            cached_input: Some(0.06),
+        },
+    );
+    for key in ["minimax", "minimax-cn", "minimaxi"] {
+        prices.insert(
+            format!("{key}/MiniMax-M2.5"),
+            ModelPricing {
+                input: 0.30,
+                output: 1.20,
+                cached_input: Some(0.03),
+            },
+        );
+        prices.insert(
+            format!("{key}/MiniMax-M2.7"),
+            ModelPricing {
+                input: 0.30,
+                output: 1.20,
+                cached_input: Some(0.06),
+            },
+        );
+    }
+
+    prices
 }
 
 // ── Peripherals (hardware: STM32, RPi GPIO, etc.) ────────────────────────
@@ -19427,8 +19649,9 @@ auto_save = true
             cron: HashMap::new(),
             acp: AcpConfig::default(),
             channels: ChannelsConfig {
-                webchat: None,
-                bot_service: None,
+                webchat: HashMap::new(),
+                bot_service: HashMap::new(),
+                precheck_reply_intent: false,
                 cli: true,
                 telegram: HashMap::from([(
                     "default".to_string(),
@@ -20929,6 +21152,9 @@ allowed_users = ["@u:matrix.org"]
     #[test]
     async fn channels_with_imessage_and_matrix() {
         let c = ChannelsConfig {
+            webchat: HashMap::new(),
+            bot_service: HashMap::new(),
+            precheck_reply_intent: false,
             cli: true,
             telegram: HashMap::new(),
             discord: HashMap::new(),
@@ -21396,6 +21622,9 @@ allowed_numbers = ["+1", "+2"]
     #[test]
     async fn channels_with_whatsapp() {
         let c = ChannelsConfig {
+            webchat: HashMap::new(),
+            bot_service: HashMap::new(),
+            precheck_reply_intent: false,
             cli: true,
             telegram: HashMap::new(),
             discord: HashMap::new(),
@@ -27948,5 +28177,73 @@ allowed_users = []
             .insert("primary".to_string(), entry);
 
         assert!(config.collect_warnings().is_empty());
+    }
+
+    #[test]
+    async fn default_pricing_includes_minimal_high_frequency_china_models() {
+        let prices = get_default_pricing();
+
+        let deepseek_flash = prices
+            .get("deepseek/deepseek-v4-flash")
+            .expect("deepseek v4 flash default price");
+        assert_eq!(deepseek_flash.input, 0.14);
+        assert_eq!(deepseek_flash.output, 0.28);
+        assert_eq!(deepseek_flash.cached_input, Some(0.0028));
+
+        let deepseek_pro = prices
+            .get("deepseek/deepseek-v4-pro")
+            .expect("deepseek v4 pro default price");
+        assert_eq!(deepseek_pro.input, 0.435);
+        assert_eq!(deepseek_pro.output, 0.87);
+        assert_eq!(deepseek_pro.cached_input, Some(0.003625));
+
+        let qwen = prices
+            .get("qwen/qwen3.5-plus")
+            .expect("qwen3.5-plus default price");
+        assert_eq!(qwen.input, 0.115);
+        assert_eq!(qwen.output, 0.688);
+        assert_eq!(qwen.cached_input, Some(0.058));
+
+        let glm = prices.get("glm/glm-4.7").expect("glm-4.7 default price");
+        assert_eq!(glm.input, 0.29);
+        assert_eq!(glm.output, 1.17);
+        assert_eq!(glm.cached_input, Some(0.06));
+
+        let minimax = prices
+            .get("minimax/MiniMax-M2.5")
+            .expect("MiniMax M2.5 default price");
+        assert_eq!(minimax.input, 0.30);
+        assert_eq!(minimax.output, 1.20);
+        assert_eq!(minimax.cached_input, Some(0.03));
+
+        let minimaxi = prices
+            .get("minimaxi/MiniMax-M2.7")
+            .expect("MiniMax alias default price");
+        assert_eq!(minimaxi.input, 0.30);
+        assert_eq!(minimaxi.output, 1.20);
+        assert_eq!(minimaxi.cached_input, Some(0.06));
+    }
+
+    #[test]
+    async fn cost_config_missing_prices_uses_default_pricing_catalog() {
+        let config: CostConfig = toml::from_str(
+            r#"
+enabled = true
+daily_limit_usd = 10.0
+monthly_limit_usd = 100.0
+warn_at_percent = 80
+allow_override = false
+"#,
+        )
+        .expect("cost config without prices should deserialize");
+
+        assert!(
+            config.prices.contains_key("deepseek/deepseek-v4-flash"),
+            "missing [cost.prices] must still seed the default pricing catalog"
+        );
+        assert!(
+            config.prices.contains_key("openai/gpt-4o"),
+            "legacy default entries must remain present"
+        );
     }
 }

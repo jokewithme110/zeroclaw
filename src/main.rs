@@ -36,11 +36,13 @@
 )]
 
 use anyhow::{Context, Result, bail};
+use chrono::{Datelike, NaiveDate};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use dialoguer::{Password, Select};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use unicode_width::UnicodeWidthStr;
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 
 /// Resolve a `cli-*` Fluent key for CLI output. Routes through the runtime
@@ -162,6 +164,27 @@ where
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
     config::schema::validate_temperature(t)
+}
+
+fn parse_cli_date(s: &str) -> std::result::Result<NaiveDate, String> {
+    NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .map_err(|_| format!("invalid date '{s}', expected YYYY-MM-DD"))
+}
+
+fn parse_cli_month(s: &str) -> std::result::Result<(i32, u32), String> {
+    let (year, month) = s
+        .split_once('-')
+        .ok_or_else(|| format!("invalid month '{s}', expected YYYY-MM"))?;
+    let year: i32 = year
+        .parse()
+        .map_err(|_| format!("invalid month '{s}', expected YYYY-MM"))?;
+    let month: u32 = month
+        .parse()
+        .map_err(|_| format!("invalid month '{s}', expected YYYY-MM"))?;
+    if !(1..=12).contains(&month) {
+        return Err(format!("invalid month '{s}', expected YYYY-MM"));
+    }
+    Ok((year, month))
 }
 
 fn print_no_command_help(cmd: clap::Command) -> Result<()> {
@@ -606,6 +629,12 @@ Examples:
         format: Option<String>,
     },
 
+    /// Show token and cost usage summaries
+    Cost {
+        #[command(subcommand)]
+        cost_command: CostCommands,
+    },
+
     /// Engage, inspect, and resume emergency-stop states.
     ///
     /// Examples:
@@ -1009,6 +1038,53 @@ enum LocalesCommands {
 // `Subcommand` derive (gated on the `clap` feature there). No mirror
 // enum, no parallel variant list — the canonical `Section` enum IS
 // the clap surface.
+
+#[derive(Subcommand, Debug)]
+enum CostCommands {
+    /// Show daily token usage
+    Daily {
+        /// Date in the configured cost timezone (YYYY-MM-DD). Defaults to today.
+        #[arg(long, value_name = "YYYY-MM-DD")]
+        date: Option<String>,
+        /// Filter by model identifier.
+        #[arg(long)]
+        model: Option<String>,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show monthly token usage
+    Monthly {
+        /// Month in the configured cost timezone (YYYY-MM). Defaults to the current month.
+        #[arg(long, value_name = "YYYY-MM")]
+        month: Option<String>,
+        /// Filter by model identifier.
+        #[arg(long)]
+        model: Option<String>,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Section selector for `zeroclaw onboard <section>`.
+#[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
+enum OnboardSection {
+    /// Workspace isolation settings.
+    Workspace,
+    /// Provider selection, credentials, and live model picker.
+    Providers,
+    /// Messaging channels (Telegram, Discord, Slack, Matrix, …).
+    Channels,
+    /// Memory backend (sqlite, lucid, markdown, none) + auto-save.
+    Memory,
+    /// Physical hardware transport (native GPIO, serial, probe).
+    Hardware,
+    /// Public tunnel provider (cloudflare, ngrok, tailscale, …).
+    Tunnel,
+    /// Edit the markdown files that shape your agent (SOUL, IDENTITY, USER, …).
+    Personality,
+}
 
 /// Stub enum that mirrors the old `props` subcommands so clap can still parse
 /// `zeroclaw props <anything>` and print a deprecation message.
@@ -2889,6 +2965,191 @@ async fn fetch_locales(locale: &str, catalog: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "agent-runtime")]
+fn apply_early_config_dir_override_from_args() {
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == std::ffi::OsStr::new("--") {
+            break;
+        }
+
+        if arg == std::ffi::OsStr::new("--config-dir") {
+            if let Some(value) = args.next()
+                && !value.is_empty()
+            {
+                // SAFETY: called at process start before any threads are spawned.
+                unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", value) };
+            }
+            break;
+        }
+
+        if let Some(arg) = arg.to_str()
+            && let Some(value) = arg.strip_prefix("--config-dir=")
+        {
+            if !value.trim().is_empty() {
+                // SAFETY: called at process start before any threads are spawned.
+                unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", value) };
+            }
+            break;
+        }
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+fn cli_string(key: &str, fallback: &str) -> String {
+    crate::i18n::get_cli_string(key).unwrap_or_else(|| fallback.to_string())
+}
+
+#[cfg(feature = "agent-runtime")]
+fn cli_string_with_args(key: &str, args: &[(&str, &str)], fallback: &str) -> String {
+    crate::i18n::get_cli_string_with_args(key, args).unwrap_or_else(|| fallback.to_string())
+}
+
+#[cfg(feature = "agent-runtime")]
+fn format_token_count(value: u64) -> String {
+    if value >= 1_000_000 {
+        let scaled = value as f64 / 1_000_000.0;
+        format_compact_number(scaled, "M")
+    } else if value >= 1_000 {
+        let scaled = value as f64 / 1_000.0;
+        format_compact_number(scaled, "K")
+    } else {
+        value.to_string()
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+fn format_compact_number(value: f64, suffix: &str) -> String {
+    let rounded = (value * 10.0).round() / 10.0;
+    if (rounded.fract()).abs() < f64::EPSILON {
+        format!("{rounded:.0}{suffix}")
+    } else {
+        format!("{rounded:.1}{suffix}")
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+fn pad_display_right(value: &str, width: usize) -> String {
+    let display_width = UnicodeWidthStr::width(value);
+    let padding = width.saturating_sub(display_width);
+    format!("{value}{}", " ".repeat(padding))
+}
+
+#[cfg(feature = "agent-runtime")]
+fn pad_display_left(value: &str, width: usize) -> String {
+    let display_width = UnicodeWidthStr::width(value);
+    let padding = width.saturating_sub(display_width);
+    format!("{}{value}", " ".repeat(padding))
+}
+
+#[cfg(feature = "agent-runtime")]
+fn print_token_summary_table(summary: &cost::TokenSummary) {
+    let title = match summary.period {
+        cost::TokenPeriod::Day => {
+            let date = summary
+                .date
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            cli_string_with_args(
+                "cli-cost-daily-title",
+                &[("date", &date), ("tz", &summary.tz)],
+                &format!("Daily Token Usage ({}) - {date}", summary.tz),
+            )
+        }
+        cost::TokenPeriod::Month => {
+            let month = summary
+                .month
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            cli_string_with_args(
+                "cli-cost-monthly-title",
+                &[("month", &month), ("tz", &summary.tz)],
+                &format!("Monthly Token Usage ({}) - {month}", summary.tz),
+            )
+        }
+    };
+    println!("{title}");
+
+    let model_header = cli_string("cli-cost-col-model", "Model");
+    let input_header = cli_string("cli-cost-col-input", "Input");
+    let cached_header = cli_string("cli-cost-col-cached", "Cached");
+    let output_header = cli_string("cli-cost-col-output", "Output");
+    let cost_header = cli_string("cli-cost-col-cost", "Cost");
+    let mut models: Vec<_> = summary.models.iter().collect();
+    models.sort_by_key(|(model_name, _)| *model_name);
+
+    let total_label = cli_string("cli-cost-total-label", "Total");
+    let model_width = models
+        .iter()
+        .map(|(model_name, _)| UnicodeWidthStr::width(model_name.as_str()))
+        .chain([
+            UnicodeWidthStr::width(model_header.as_str()),
+            UnicodeWidthStr::width(total_label.as_str()),
+        ])
+        .max()
+        .unwrap_or(0)
+        .max(24)
+        + 2;
+    let number_width = 10usize;
+    let cost_width = 10usize;
+    let separator = "-".repeat(model_width + (number_width * 3) + cost_width + 4);
+
+    println!(
+        "{} {} {} {} {}",
+        pad_display_right(&model_header, model_width),
+        pad_display_left(&input_header, number_width),
+        pad_display_left(&cached_header, number_width),
+        pad_display_left(&output_header, number_width),
+        pad_display_left(&cost_header, cost_width)
+    );
+    println!("{separator}");
+
+    for (model_name, stats) in models {
+        let input_value = format_token_count(stats.input_tokens);
+        let cached_value = format_token_count(stats.cached_input_tokens);
+        let output_value = format_token_count(stats.output_tokens);
+        let cost_value = format!("${:.4}", stats.cost_usd);
+        println!(
+            "{} {} {} {} {}",
+            pad_display_right(model_name, model_width),
+            pad_display_left(&input_value, number_width),
+            pad_display_left(&cached_value, number_width),
+            pad_display_left(&output_value, number_width),
+            pad_display_left(&cost_value, cost_width)
+        );
+    }
+
+    if summary.models.is_empty() {
+        println!(
+            "{}",
+            cli_string(
+                "cli-cost-empty",
+                "No usage records found for the selected period."
+            )
+        );
+    }
+
+    println!("{separator}");
+    let total_input = format_token_count(summary.totals.input_tokens);
+    let total_cached = format_token_count(summary.totals.cached_input_tokens);
+    let total_output = format_token_count(summary.totals.output_tokens);
+    let total_cost = format!("${:.4}", summary.totals.cost_usd);
+    println!(
+        "{} {} {} {} {}",
+        pad_display_right(&total_label, model_width),
+        pad_display_left(&total_input, number_width),
+        pad_display_left(&total_cached, number_width),
+        pad_display_left(&total_output, number_width),
+        pad_display_left(&total_cost, cost_width)
+    );
+}
+
+#[cfg(feature = "agent-runtime")]
+fn print_token_summary_json(summary: &cost::TokenSummary) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(summary)?);
+    Ok(())
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
@@ -4138,6 +4399,68 @@ async fn main() -> Result<()> {
                     "Boards"
                 )
             );
+
+            Ok(())
+        }
+
+        Commands::Cost { cost_command } => {
+            let tracker = cost::CostTracker::new(config.cost.clone(), &config.data_dir)?;
+
+            match cost_command {
+                CostCommands::Daily { date, model, json } => {
+                    let date = match date {
+                        Some(date) => parse_cli_date(&date).map_err(anyhow::Error::msg)?,
+                        None => {
+                            let tz_name = config.cost.default_timezone.trim();
+                            let tz: chrono_tz::Tz = if tz_name.is_empty() {
+                                "Asia/Shanghai".parse()
+                            } else {
+                                tz_name.parse()
+                            }
+                            .map_err(|_| {
+                                anyhow::Error::msg(format!(
+                                    "Invalid cost default timezone: {}",
+                                    config.cost.default_timezone
+                                ))
+                            })?;
+                            chrono::Utc::now().with_timezone(&tz).date_naive()
+                        }
+                    };
+                    let summary = tracker.get_token_summary_day(date, model.as_deref())?;
+                    if json {
+                        print_token_summary_json(&summary)?;
+                    } else {
+                        print_token_summary_table(&summary);
+                    }
+                }
+                CostCommands::Monthly { month, model, json } => {
+                    let (year, month) = match month {
+                        Some(month) => parse_cli_month(&month).map_err(anyhow::Error::msg)?,
+                        None => {
+                            let tz_name = config.cost.default_timezone.trim();
+                            let tz: chrono_tz::Tz = if tz_name.is_empty() {
+                                "Asia/Shanghai".parse()
+                            } else {
+                                tz_name.parse()
+                            }
+                            .map_err(|_| {
+                                anyhow::Error::msg(format!(
+                                    "Invalid cost default timezone: {}",
+                                    config.cost.default_timezone
+                                ))
+                            })?;
+                            let now = chrono::Utc::now().with_timezone(&tz);
+                            (now.year(), now.month())
+                        }
+                    };
+                    let summary = tracker.get_token_summary_month(year, month, model.as_deref())?;
+                    if json {
+                        print_token_summary_json(&summary)?;
+                    } else {
+                        print_token_summary_table(&summary);
+                    }
+                }
+            }
 
             Ok(())
         }

@@ -104,10 +104,12 @@ mod tests {
             success: true,
             error_message: None,
             input_tokens: Some(50),
+            cached_input_tokens: Some(10),
             output_tokens: Some(25),
             channel: None,
             agent_alias: None,
             turn_id: None,
+            cost_usd: Some(0.0005),
             output_text: None,
             output_tool_calls_json: None,
         });

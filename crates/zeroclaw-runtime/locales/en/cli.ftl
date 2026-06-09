@@ -10,6 +10,7 @@ cli-daemon-about = Start the long-running autonomous daemon
 cli-service-about = Manage OS service lifecycle (launchd/systemd user service)
 cli-doctor-about = Run diagnostics for daemon/scheduler/channel freshness
 cli-status-about = Show system status (full details)
+cli-cost-about = Show token and cost usage summaries
 cli-estop-about = Engage, inspect, and resume emergency-stop states
 cli-cron-about = Configure and manage scheduled tasks
 cli-models-about = Manage provider model catalogs
@@ -130,6 +131,18 @@ cli-memory-get-about = Get a specific memory entry by key
 cli-memory-stats-about = Show memory backend statistics and health
 cli-memory-clear-about = Clear memories by category, by key, or clear all
 cli-memory-clear-unsupported-backend = memory clear is unsupported for append-only backend '{$backend}'; switch to a deletable backend (sqlite, lucid, or postgres)
+
+cli-cost-daily-about = Show daily token usage
+cli-cost-monthly-about = Show monthly token usage
+cli-cost-daily-title = Daily Token Usage ({$tz}) - {$date}
+cli-cost-monthly-title = Monthly Token Usage ({$tz}) - {$month}
+cli-cost-col-model = Model
+cli-cost-col-input = Input
+cli-cost-col-cached = Cached
+cli-cost-col-output = Output
+cli-cost-col-cost = Cost
+cli-cost-total-label = Total
+cli-cost-empty = No usage records found for the selected period.
 
 cli-estop-status-about = Print current estop status
 cli-estop-resume-about = Resume from an engaged estop level
