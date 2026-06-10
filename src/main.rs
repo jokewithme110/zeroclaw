@@ -263,6 +263,8 @@ mod daemon;
 mod doctor;
 mod dt_nodes;
 mod dt_nodes_registry;
+#[cfg(feature = "agent-runtime")]
+mod early_config_dir;
 #[cfg(feature = "gateway")]
 mod gateway;
 #[cfg(feature = "agent-runtime")]
@@ -2966,36 +2968,6 @@ async fn fetch_locales(locale: &str, catalog: Option<&str>) -> Result<()> {
 }
 
 #[cfg(feature = "agent-runtime")]
-fn apply_early_config_dir_override_from_args() {
-    let mut args = std::env::args_os().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == std::ffi::OsStr::new("--") {
-            break;
-        }
-
-        if arg == std::ffi::OsStr::new("--config-dir") {
-            if let Some(value) = args.next()
-                && !value.is_empty()
-            {
-                // SAFETY: called at process start before any threads are spawned.
-                unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", value) };
-            }
-            break;
-        }
-
-        if let Some(arg) = arg.to_str()
-            && let Some(value) = arg.strip_prefix("--config-dir=")
-        {
-            if !value.trim().is_empty() {
-                // SAFETY: called at process start before any threads are spawned.
-                unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", value) };
-            }
-            break;
-        }
-    }
-}
-
-#[cfg(feature = "agent-runtime")]
 fn cli_string(key: &str, fallback: &str) -> String {
     crate::i18n::get_cli_string(key).unwrap_or_else(|| fallback.to_string())
 }
@@ -3149,7 +3121,6 @@ fn print_token_summary_json(summary: &cost::TokenSummary) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(summary)?);
     Ok(())
 }
-
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
@@ -3167,6 +3138,9 @@ async fn main() -> Result<()> {
             )
         );
     }
+
+    #[cfg(feature = "agent-runtime")]
+    early_config_dir::apply_early_config_dir_override_from_args();
 
     #[cfg(feature = "agent-runtime")]
     crate::i18n::init(&crate::i18n::detect_locale());

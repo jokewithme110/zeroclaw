@@ -10,6 +10,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+pub use super::provider_error::{
+    ProviderErrorKind, classify_provider_error, classify_provider_error_message, is_auth_error,
+    is_model_not_found, is_network_error, is_non_retryable_rate_limit, is_rate_limited,
+    is_server_error,
+};
+
 // ── ModelProvider Fallback Notification ──────────────────────────────────────
 // When ReliableModelProvider uses a fallback (different model_provider or model than
 // requested), it records the details here so channel code can notify the user.
@@ -139,34 +145,6 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
             || msg_lower.contains("invalid"))
 }
 
-/// Check if an error indicates an authentication/authorization failure.
-/// Used by channels to evict cached model_providers whose OAuth tokens may have
-/// expired so the next request triggers a fresh credential resolution.
-pub fn is_auth_error(err: &anyhow::Error) -> bool {
-    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>()
-        && let Some(status) = reqwest_err.status()
-    {
-        let code = status.as_u16();
-        return code == 401 || code == 403;
-    }
-
-    let msg_lower = err.to_string().to_lowercase();
-    let hints = [
-        "401 unauthorized",
-        "403 forbidden",
-        "invalid api key",
-        "incorrect api key",
-        "authentication failed",
-        "auth failed",
-        "unauthorized",
-        "invalid token",
-        "token expired",
-        "access_token",
-    ];
-
-    hints.iter().any(|hint| msg_lower.contains(hint))
-}
-
 /// Check if an error is a tool schema validation failure (e.g. Groq returning
 /// "tool call validation failed: attempted to call tool '...' which was not in request").
 /// These errors should NOT be classified as non-retryable because the model_provider's
@@ -199,64 +177,6 @@ pub fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
     ];
 
     hints.iter().any(|hint| lower.contains(hint))
-}
-
-/// Check if an error is a rate-limit (429) error.
-fn is_rate_limited(err: &anyhow::Error) -> bool {
-    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>()
-        && let Some(status) = reqwest_err.status()
-    {
-        return status.as_u16() == 429;
-    }
-    let msg = err.to_string();
-    msg.contains("429")
-        && (msg.contains("Too Many") || msg.contains("rate") || msg.contains("limit"))
-}
-
-/// Check if a 429 is a business/quota-plan error that retries cannot fix.
-///
-/// Examples:
-/// - plan does not include requested model
-/// - insufficient balance / package not active
-/// - known model_provider business codes (e.g. Z.AI: 1311, 1113)
-fn is_non_retryable_rate_limit(err: &anyhow::Error) -> bool {
-    if !is_rate_limited(err) {
-        return false;
-    }
-
-    let msg = err.to_string();
-    let lower = msg.to_lowercase();
-
-    let business_hints = [
-        "plan does not include",
-        "doesn't include",
-        "not include",
-        "insufficient balance",
-        "insufficient_balance",
-        "insufficient quota",
-        "insufficient_quota",
-        "quota exhausted",
-        "out of credits",
-        "no available package",
-        "package not active",
-        "purchase package",
-        "model not available for your plan",
-    ];
-
-    if business_hints.iter().any(|hint| lower.contains(hint)) {
-        return true;
-    }
-
-    // Known model_provider business codes observed for 429 where retry is futile.
-    for token in lower.split(|c: char| !c.is_ascii_digit()) {
-        if let Ok(code) = token.parse::<u16>()
-            && matches!(code, 1113 | 1311)
-        {
-            return true;
-        }
-    }
-
-    false
 }
 
 /// Try to extract a Retry-After value (in milliseconds) from an error message.
@@ -2133,6 +2053,9 @@ mod tests {
         assert!(!is_rate_limited(&anyhow::Error::msg("401 Unauthorized")));
         assert!(!is_rate_limited(&anyhow::Error::msg(
             "500 Internal Server Error"
+        )));
+        assert!(!is_rate_limited(&anyhow::Error::msg(
+            "provider error code=429 request_id=req-123"
         )));
     }
 

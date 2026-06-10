@@ -3,7 +3,6 @@
 //! English descriptions are embedded via `include_str!` at compile time.
 //! Non-English locales are loaded from disk and override English per-key.
 
-use fluent::{FluentArgs, FluentBundle, FluentResource};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -11,6 +10,7 @@ static DESCRIPTIONS: OnceLock<HashMap<String, String>> = OnceLock::new();
 static CLI_STRINGS: OnceLock<HashMap<String, String>> = OnceLock::new();
 static CLI_FTL_SOURCES: OnceLock<CliFtlSources> = OnceLock::new();
 static LOCALE: OnceLock<String> = OnceLock::new();
+static ERROR_STRINGS: OnceLock<HashMap<String, String>> = OnceLock::new();
 
 /// The canonical locale registry, embedded from repo-root `locales.toml` at
 /// compile time. Parsed once into a `'static` list so callers (e.g. the RPC
@@ -62,8 +62,25 @@ struct CliFtlSources {
 
 /// Initialize with a specific locale. No-op after first call.
 pub fn init(locale: &str) {
-    let locale = LOCALE.get_or_init(|| normalize_locale(locale));
+    let requested_locale = normalize_locale(locale);
+    if let Some(active_locale) = LOCALE.get()
+        && active_locale != &requested_locale
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "error_key": "i18n.locale_reinit_ignored",
+                    "active_locale": active_locale,
+                    "requested_locale": requested_locale,
+                })),
+            "i18n locale already initialized; ignoring later locale"
+        );
+    }
+    let locale = LOCALE.get_or_init(|| requested_locale);
     DESCRIPTIONS.get_or_init(|| load_descriptions(locale));
+    ERROR_STRINGS.get_or_init(|| load_error_strings(locale));
     CLI_STRINGS.get_or_init(|| load_cli_strings(locale));
     CLI_FTL_SOURCES.get_or_init(|| load_cli_ftl_sources(locale));
 }
@@ -94,6 +111,17 @@ pub fn get_required_cli_string(key: &str) -> String {
 /// Get a required CLI string by key and format it with Fluent external arguments.
 pub fn get_required_cli_string_with_args(key: &str, args: &[(&str, &str)]) -> String {
     get_cli_string_with_args(key, args).unwrap_or_else(|| missing_cli_string(key))
+}
+
+/// Get an error string by key (e.g. "err-provider-auth-failed").
+pub fn get_error_string(key: &str) -> Option<String> {
+    let map = ERROR_STRINGS.get_or_init(|| load_error_strings(active_locale()));
+    map.get(key).cloned()
+}
+
+/// Get a required error string by key, reporting missing Fluent strings centrally.
+pub fn get_required_error_string(key: &str) -> String {
+    get_error_string(key).unwrap_or_else(|| crate::i18n_errors::missing_error_string(key))
 }
 
 fn active_locale() -> &'static str {
@@ -130,23 +158,25 @@ fn missing_cli_string(key: &str) -> String {
 }
 
 fn load_descriptions(locale: &str) -> HashMap<String, String> {
-    let mut map = format_ftl_messages(include_str!("../locales/en/tools.ftl"), "en");
+    let mut map =
+        crate::i18n_loader::format_ftl_messages(include_str!("../locales/en/tools.ftl"), "en");
     if locale != "en"
         && let Some(locale_ftl) = load_ftl_from_disk(locale, "tools.ftl")
     {
-        map.extend(format_ftl_messages(&locale_ftl, locale));
+        map.extend(crate::i18n_loader::format_ftl_messages(&locale_ftl, locale));
     }
     map
 }
 
 fn load_cli_strings(locale: &str) -> HashMap<String, String> {
-    let mut map = format_ftl_messages(include_str!("../locales/en/cli.ftl"), "en");
+    let mut map =
+        crate::i18n_loader::format_ftl_messages(include_str!("../locales/en/cli.ftl"), "en");
     if locale != "en" {
         if let Some(locale_ftl) = builtin_cli_ftl_source(locale) {
-            map.extend(format_ftl_messages(locale_ftl, locale));
+            map.extend(crate::i18n_loader::format_ftl_messages(locale_ftl, locale));
         }
         if let Some(locale_ftl) = load_ftl_from_disk(locale, "cli.ftl") {
-            map.extend(format_ftl_messages(&locale_ftl, locale));
+            map.extend(crate::i18n_loader::format_ftl_messages(&locale_ftl, locale));
         }
     }
     map
@@ -171,87 +201,44 @@ fn builtin_cli_ftl_source(locale: &str) -> Option<&'static str> {
     }
 }
 
+fn load_error_strings(locale: &str) -> HashMap<String, String> {
+    crate::i18n_errors::load_error_strings(
+        locale,
+        load_ftl_from_disk,
+        crate::i18n_loader::format_ftl_messages,
+    )
+}
+
 fn format_cli_string_with_args(
     sources: &CliFtlSources,
     key: &str,
     args: &[(&str, &str)],
 ) -> Option<String> {
     if let Some(locale_ftl) = sources.disk.as_deref()
-        && let Some(value) = format_ftl_message(locale_ftl, &sources.locale, key, args)
+        && let Some(value) =
+            crate::i18n_loader::format_ftl_message(locale_ftl, &sources.locale, key, args)
     {
         return Some(value);
     }
     if let Some(locale_ftl) = sources.builtin
-        && let Some(value) = format_ftl_message(locale_ftl, &sources.locale, key, args)
+        && let Some(value) =
+            crate::i18n_loader::format_ftl_message(locale_ftl, &sources.locale, key, args)
     {
         return Some(value);
     }
-    format_ftl_message(include_str!("../locales/en/cli.ftl"), "en", key, args)
-}
-
-fn format_ftl_messages(ftl_source: &str, locale: &str) -> HashMap<String, String> {
-    let resource =
-        FluentResource::try_new(ftl_source.to_string()).unwrap_or_else(|(resource, _)| resource);
-    let language_identifier = locale.parse().unwrap_or_else(|_| "en".parse().unwrap());
-    let mut bundle = FluentBundle::new(vec![language_identifier]);
-    bundle.set_use_isolating(false);
-    let _ = bundle.add_resource(resource);
-
-    let mut map = HashMap::new();
-    for line in ftl_source.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('-') {
-            continue;
-        }
-        if let Some(identifier) = trimmed.split(" =").next()
-            && let Some(message) = bundle.get_message(identifier)
-            && let Some(pattern) = message.value()
-        {
-            let mut errors = vec![];
-            let value = bundle.format_pattern(pattern, None, &mut errors);
-            if errors.is_empty() {
-                map.insert(identifier.to_string(), value.into_owned());
-            }
-        }
-    }
-    map
-}
-
-fn format_ftl_message(
-    ftl_source: &str,
-    locale: &str,
-    key: &str,
-    args: &[(&str, &str)],
-) -> Option<String> {
-    let resource =
-        FluentResource::try_new(ftl_source.to_string()).unwrap_or_else(|(resource, _)| resource);
-    let language_identifier = locale.parse().unwrap_or_else(|_| "en".parse().unwrap());
-    let mut bundle = FluentBundle::new(vec![language_identifier]);
-    bundle.set_use_isolating(false);
-    let _ = bundle.add_resource(resource);
-
-    let message = bundle.get_message(key)?;
-    let pattern = message.value()?;
-    let mut fluent_args = FluentArgs::new();
-    for (name, value) in args {
-        fluent_args.set(*name, *value);
-    }
-    let mut errors = vec![];
-    let value = bundle.format_pattern(pattern, Some(&fluent_args), &mut errors);
-    if errors.is_empty() {
-        Some(value.into_owned())
-    } else {
-        None
-    }
+    crate::i18n_loader::format_ftl_message(include_str!("../locales/en/cli.ftl"), "en", key, args)
 }
 
 fn load_ftl_from_disk(locale: &str, filename: &str) -> Option<String> {
-    load_ftl_with_reader(locale, filename, |p| std::fs::read_to_string(p).ok())
+    crate::i18n_loader::load_ftl_from_disk(locale, filename, || {
+        crate::i18n_bootstrap::locale_override_roots(read_config_table)
+    })
 }
 
 /// Path-resolution + read wiring for locale FTL, with an injectable reader so
 /// tests can verify which path is consulted without touching the real
 /// filesystem. Production passes `std::fs::read_to_string`.
+#[allow(dead_code)]
 fn load_ftl_with_reader(
     locale: &str,
     filename: &str,
@@ -275,34 +262,15 @@ fn load_ftl_with_reader(
     None
 }
 
-/// Detect locale: config.toml → "en".
+/// Detect locale: config.toml → locale env vars → "en".
 pub fn detect_locale() -> String {
-    locale_from_config().unwrap_or_else(|| "en".to_string())
+    locale_from_config()
+        .or_else(crate::i18n_bootstrap::locale_from_env)
+        .unwrap_or_else(|| "en".to_string())
 }
 
 fn read_config_table() -> Option<toml::Table> {
-    // An explicit config dir is authoritative: when set, locale detection and
-    // FTL loading resolve only against it and never fall back to the home
-    // config. This keeps the lookup hermetic — tests (and sandboxed runs) point
-    // it at a known dir without the host's real ~/.zeroclaw/config.toml leaking
-    // in. Without this, locale detection reads the developer's own config and
-    // is non-deterministic across machines.
-    if let Ok(custom) = std::env::var("ZEROCLAW_CONFIG_DIR") {
-        let trimmed = custom.trim();
-        if !trimmed.is_empty() {
-            let path = std::path::PathBuf::from(trimmed).join("config.toml");
-            return std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|c| c.parse().ok());
-        }
-    }
-
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(base) = directories::BaseDirs::new() {
-        candidates.push(base.home_dir().join(".zeroclaw/config.toml"));
-        candidates.push(base.config_dir().join("zeroclaw/config.toml"));
-    }
-    for path in &candidates {
+    for path in crate::i18n_bootstrap::config_table_candidates() {
         if let Ok(contents) = std::fs::read_to_string(path) {
             return contents.parse().ok();
         }
@@ -637,5 +605,82 @@ mod tests {
         let p = paths[0].to_string_lossy();
         assert!(p.contains("xx"), "path must carry the locale: {p}");
         assert!(p.ends_with("cli.ftl"), "path must target the file: {p}");
+    }
+
+    #[test]
+    fn error_strings_loaded_in_english() {
+        let map = format_ftl_messages(include_str!("../locales/en/errors.ftl"), "en");
+        assert_eq!(
+            map.get("err-provider-auth-failed").map(String::as_str),
+            Some("⚠️ API key is invalid or expired. Please check your model configuration.")
+        );
+    }
+
+    #[test]
+    fn error_strings_loaded_in_chinese() {
+        let map = format_ftl_messages(include_str!("../locales/zh-CN/errors.ftl"), "zh-CN");
+        let value = map
+            .get("err-provider-network-error")
+            .expect("zh-CN error key should exist");
+        assert!(value.contains("网络连接失败"));
+    }
+
+    #[test]
+    fn detect_locale_uses_locale_env_fallbacks() {
+        let previous = std::env::var("ZEROCLAW_LOCALE").ok();
+        // SAFETY: test mutates process env in a controlled scope.
+        unsafe { std::env::set_var("ZEROCLAW_LOCALE", "zh_CN.UTF-8") };
+        assert_eq!(detect_locale(), "zh-CN");
+        match previous {
+            Some(value) => {
+                // SAFETY: restoring process env after test.
+                unsafe { std::env::set_var("ZEROCLAW_LOCALE", value) };
+            }
+            None => {
+                // SAFETY: restoring process env after test.
+                unsafe { std::env::remove_var("ZEROCLAW_LOCALE") };
+            }
+        }
+    }
+
+    #[test]
+    fn detect_locale_prefers_config_dir_profile_before_env_locale() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_dir = temp.path().join("profile-a");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        std::fs::write(config_dir.join("config.toml"), "locale = \"zh-CN\"\n")
+            .expect("config write");
+
+        let previous_config_dir = std::env::var("ZEROCLAW_CONFIG_DIR").ok();
+        let previous_locale = std::env::var("ZEROCLAW_LOCALE").ok();
+
+        // SAFETY: test mutates process env in a controlled scope.
+        unsafe {
+            std::env::set_var("ZEROCLAW_CONFIG_DIR", &config_dir);
+            std::env::set_var("ZEROCLAW_LOCALE", "en_US.UTF-8");
+        }
+
+        assert_eq!(detect_locale(), "zh-CN");
+
+        match previous_config_dir {
+            Some(value) => {
+                // SAFETY: restoring process env after test.
+                unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", value) };
+            }
+            None => {
+                // SAFETY: restoring process env after test.
+                unsafe { std::env::remove_var("ZEROCLAW_CONFIG_DIR") };
+            }
+        }
+        match previous_locale {
+            Some(value) => {
+                // SAFETY: restoring process env after test.
+                unsafe { std::env::set_var("ZEROCLAW_LOCALE", value) };
+            }
+            None => {
+                // SAFETY: restoring process env after test.
+                unsafe { std::env::remove_var("ZEROCLAW_LOCALE") };
+            }
+        }
     }
 }
