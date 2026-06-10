@@ -862,6 +862,30 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Use Markdown text; the channel sends progressive draft updates when enabled\n\
              - Do not use local attachment markers; outbound image payloads are not supported yet.\n",
         ),
+        "dingtalk" => Some(
+            "When responding on DingTalk:\n\
+             - Use Markdown formatting\n\
+             - Be concise and direct\n\
+             - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], \
+               [VIDEO:<path-or-url>], [AUDIO:<path-or-url>]\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n",
+        ),
+        "lark" => Some(
+            "When responding on Lark:\n\
+             - Use Markdown formatting\n\
+             - Be concise and direct\n\
+             - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], \
+               [VIDEO:<path-or-url>], [AUDIO:<path-or-url>]\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n",
+        ),
+        "feishu" => Some(
+            "When responding on Feishu:\n\
+             - Use Markdown formatting\n\
+             - Be concise and direct\n\
+             - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], \
+               [VIDEO:<path-or-url>], [AUDIO:<path-or-url>]\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n",
+        ),
         _ => None,
     }
 }
@@ -5957,12 +5981,47 @@ fn build_channel_by_id(
                     LarkChannel::from_config(lk, alias, peer_resolver)
                         .with_approval_timeout_secs(lk.approval_timeout_secs)
                         .with_per_user_session(lk.per_user_session)
-                        .with_streaming(lk.stream_mode, lk.draft_update_interval_ms),
+                        .with_streaming(lk.stream_mode, lk.draft_update_interval_ms)
+                        .with_workspace_dir(config.channel_workspace_dir("lark.default")),
                 ))
             }
             #[cfg(not(feature = "channel-lark"))]
             {
                 anyhow::bail!("Lark channel requires the `channel-lark` feature");
+            }
+        }
+        "feishu" => {
+            #[cfg(feature = "channel-lark")]
+            {
+                let (alias, lk) = config
+                    .channels
+                    .lark
+                    .get_key_value("default")
+                    .filter(|(_, cfg)| cfg.use_feishu)
+                    .or_else(|| {
+                        config
+                            .channels
+                            .lark
+                            .get_key_value("feishu")
+                            .filter(|(_, cfg)| cfg.use_feishu)
+                    })
+                    .context("Feishu channel is not configured")?;
+                let alias = alias.clone();
+                let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                    let cfg_arc = config_arc.clone();
+                    let alias = alias.clone();
+                    Arc::new(move || cfg_arc.read().channel_external_peers("lark", &alias))
+                };
+                let channel_ref = format!("feishu.{alias}");
+                Ok(Arc::new(
+                    LarkChannel::from_config(lk, alias, peer_resolver)
+                        .with_transcription(config.transcription.clone())
+                        .with_workspace_dir(config.channel_workspace_dir(&channel_ref)),
+                ))
+            }
+            #[cfg(not(feature = "channel-lark"))]
+            {
+                anyhow::bail!("Feishu channel requires the `channel-lark` feature");
             }
         }
         #[cfg(feature = "channel-dingtalk")]
@@ -5985,7 +6044,8 @@ fn build_channel_by_id(
                     alias,
                     peer_resolver,
                 )
-                .with_proxy_url(dt.proxy_url.clone()),
+                .with_proxy_url(dt.proxy_url.clone())
+                .with_workspace_dir(config.channel_workspace_dir("dingtalk.default")),
             ))
         }
         #[cfg(not(feature = "channel-dingtalk"))]
@@ -7516,7 +7576,9 @@ fn collect_configured_channels(
                     alias.clone(),
                     peer_resolver,
                 )
-                .with_proxy_url(dt.proxy_url.clone()),
+                .with_proxy_url(dt.proxy_url.clone())
+                .with_workspace_dir(config.channel_workspace_dir(&format!("dingtalk.{alias}")))
+                .with_cleanup_config_resolver(cleanup_config_resolver),
             ),
         });
     }
@@ -8160,6 +8222,18 @@ fn build_owner_by_channel_key(
             if let Some((bare, _)) = ch_str.split_once('.') {
                 owner_by_channel_key
                     .entry(bare.to_string())
+                    .or_insert_with(|| alias_str.clone());
+            }
+            if let Some(("lark", channel_alias)) = ch_str.split_once('.')
+                && config
+                    .channels
+                    .lark
+                    .get(channel_alias)
+                    .is_some_and(|cfg| cfg.use_feishu)
+            {
+                owner_by_channel_key.insert(format!("feishu.{channel_alias}"), alias_str.clone());
+                owner_by_channel_key
+                    .entry("feishu".to_string())
                     .or_insert_with(|| alias_str.clone());
             }
         }
@@ -9258,6 +9332,26 @@ pub async fn deliver_announcement(
         "slack" => {
             anyhow::bail!("Slack channel requires the `channel-slack` feature");
         }
+        #[cfg(feature = "channel-dingtalk")]
+        "dingtalk" => {
+            let dt = config
+                .channels
+                .dingtalk
+                .get(alias)
+                .ok_or_else(not_configured)?;
+            let peers = config.channel_external_peers("dingtalk", alias);
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+                Arc::new(move || peers.clone());
+            let ch = DingTalkChannel::new(
+                dt.client_id.clone(),
+                dt.client_secret.clone(),
+                alias,
+                peer_resolver,
+            )
+            .with_proxy_url(dt.proxy_url.clone())
+            .with_workspace_dir(config.channel_workspace_dir(channel));
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+        }
         #[cfg(feature = "channel-signal")]
         "signal" => {
             let sg = config
@@ -10049,6 +10143,42 @@ temperature = 0.3
             Some("alpha")
         );
         assert_eq!(owners.get("mattermost").map(String::as_str), Some("alpha"));
+    }
+
+    #[test]
+    fn build_owner_by_channel_key_derives_feishu_runtime_alias_from_lark_binding() {
+        let mut config = Config::default();
+        config.channels.lark.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::LarkConfig {
+                enabled: true,
+                use_feishu: true,
+                ..Default::default()
+            },
+        );
+        config.agents.clear();
+        config.agents.insert(
+            "router".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["lark.default".into()],
+                ..Default::default()
+            },
+        );
+
+        let enabled_agents = vec!["router".to_string()];
+        let owners = build_owner_by_channel_key(&config, &enabled_agents, &[]);
+
+        assert_eq!(
+            owners.get("lark.default").map(String::as_str),
+            Some("router")
+        );
+        assert_eq!(
+            owners.get("feishu.default").map(String::as_str),
+            Some("router"),
+            "Feishu runtime identity must resolve back to the lark.* channel binding"
+        );
+        assert_eq!(owners.get("feishu").map(String::as_str), Some("router"));
     }
 
     #[test]

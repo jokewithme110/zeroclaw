@@ -2,8 +2,10 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
+use serde::Deserialize;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -55,6 +57,50 @@ const LARK_ACK_REACTIONS_JA: &[&str] = &[
 ];
 
 const MAX_LARK_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
+const LARK_HTTP_TIMEOUT_SECS: u64 = 30;
+const LARK_HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
+const LARK_SEND_MAX_ATTEMPTS: u32 = 4;
+const LARK_SEND_RETRY_DELAY: Duration = Duration::from_millis(500);
+const LARK_STREAM_CONNECT_MAX_ATTEMPTS: u32 = 3;
+const LARK_STREAM_CONNECT_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+macro_rules! lark_info {
+    ($message:expr) => {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            $message
+        )
+    };
+    ($attrs:expr, $message:expr) => {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs($attrs),
+            $message
+        )
+    };
+}
+
+macro_rules! lark_warn {
+    ($message:expr) => {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            $message
+        )
+    };
+    ($attrs:expr, $message:expr) => {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs($attrs),
+            $message
+        )
+    };
+}
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,6 +312,14 @@ const LARK_IMAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
 /// Maximum file size we will download and present as text (512 KiB).
 const LARK_FILE_MAX_BYTES: usize = 512 * 1024;
 
+/// Upload cache TTL (1 hour).
+const LARK_UPLOAD_CACHE_TTL: u64 = 3600;
+
+/// Cached upload entry to avoid re-uploading the same image.
+struct UploadCacheEntry {
+    image_key: String,
+    expires_at: u64,
+}
 /// Image MIME types we support for inline base64 encoding.
 const LARK_SUPPORTED_IMAGE_MIMES: &[&str] = &[
     "image/png",
@@ -617,6 +671,10 @@ fn ensure_lark_send_success(
     Ok(())
 }
 
+fn should_retry_lark_send_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
 /// State carried between sending an approval card and the user's click.
 ///
 /// Used to (a) wake the awaiting future via `sender` and (b) re-render
@@ -710,6 +768,10 @@ pub struct LarkChannel {
     /// number of in-flight drafts; entries are removed by `finalize_draft`
     /// and `cancel_draft`.
     last_draft_edit: Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
+    /// Workspace directory for saving downloaded images.
+    workspace_dir: Option<PathBuf>,
+    /// Upload cache: avoids re-uploading the same image within TTL.
+    upload_cache: Arc<RwLock<HashMap<String, UploadCacheEntry>>>,
     #[cfg(test)]
     api_base_override: Option<String>,
 }
@@ -775,6 +837,8 @@ impl LarkChannel {
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: 1000,
             last_draft_edit: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            workspace_dir: None,
+            upload_cache: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(test)]
             api_base_override: None,
         }
@@ -908,9 +972,11 @@ impl LarkChannel {
     }
 
     fn http_client(&self) -> reqwest::Client {
-        zeroclaw_config::schema::build_channel_proxy_client(
+        zeroclaw_config::schema::build_channel_proxy_client_with_timeouts(
             self.platform.proxy_service_key(),
             self.proxy_url.as_deref(),
+            LARK_HTTP_TIMEOUT_SECS,
+            LARK_HTTP_CONNECT_TIMEOUT_SECS,
         )
     }
 
@@ -1045,35 +1111,96 @@ impl LarkChannel {
         Ok((ep.url, ep.client_config.unwrap_or_default()))
     }
 
+    async fn open_ws_stream_with_retry(
+        &self,
+    ) -> anyhow::Result<(
+        zeroclaw_config::schema::ProxiedWsStream,
+        i32,
+        WsClientConfig,
+    )> {
+        let mut last_error = None;
+
+        for attempt in 1..=LARK_STREAM_CONNECT_MAX_ATTEMPTS {
+            let connection: anyhow::Result<(
+                zeroclaw_config::schema::ProxiedWsStream,
+                i32,
+                WsClientConfig,
+            )> = async {
+                let (wss_url, client_config) = self.get_ws_endpoint().await?;
+                let service_id = wss_url
+                    .split('?')
+                    .nth(1)
+                    .and_then(|qs| {
+                        qs.split('&')
+                            .find(|kv| kv.starts_with("service_id="))
+                            .and_then(|kv| kv.split('=').nth(1))
+                            .and_then(|v| v.parse::<i32>().ok())
+                    })
+                    .unwrap_or(0);
+
+                lark_info!(
+                    ::serde_json::json!({
+                        "channel": self.channel_name(),
+                    }),
+                    "Lark: connecting to stream WebSocket"
+                );
+
+                let (ws_stream, _) = zeroclaw_config::schema::ws_connect_with_proxy(
+                    &wss_url,
+                    "channel.lark",
+                    self.proxy_url.as_deref(),
+                )
+                .await?;
+
+                Ok((ws_stream, service_id, client_config))
+            }
+            .await;
+
+            match connection {
+                Ok(connection) => {
+                    if attempt > 1 {
+                        lark_info!(
+                            ::serde_json::json!({
+                                "channel": self.channel_name(),
+                                "attempt": attempt,
+                                "max_attempts": LARK_STREAM_CONNECT_MAX_ATTEMPTS,
+                            }),
+                            "Lark: stream connection recovered after retry"
+                        );
+                    }
+                    return Ok(connection);
+                }
+                Err(error) => {
+                    if attempt >= LARK_STREAM_CONNECT_MAX_ATTEMPTS {
+                        return Err(error);
+                    }
+
+                    lark_warn!(
+                        ::serde_json::json!({
+                            "channel": self.channel_name(),
+                            "attempt": attempt,
+                            "max_attempts": LARK_STREAM_CONNECT_MAX_ATTEMPTS,
+                            "retry_delay_ms": LARK_STREAM_CONNECT_RETRY_DELAY.as_millis() as u64,
+                            "error": error.to_string(),
+                        }),
+                        "Lark: stream connection failed, retrying"
+                    );
+                    last_error = Some(error);
+                    tokio::time::sleep(LARK_STREAM_CONNECT_RETRY_DELAY).await;
+                }
+            }
+        }
+
+        Err(last_error
+            .unwrap_or_else(|| anyhow::Error::msg("Lark: stream connection retry exhausted")))
+    }
+
     /// WS long-connection event loop.  Returns Ok(()) when the connection closes
     /// (the caller reconnects).
     #[allow(clippy::too_many_lines)]
     async fn listen_ws(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         self.ensure_bot_open_id().await;
-        let (wss_url, client_config) = self.get_ws_endpoint().await?;
-        let service_id = wss_url
-            .split('?')
-            .nth(1)
-            .and_then(|qs| {
-                qs.split('&')
-                    .find(|kv| kv.starts_with("service_id="))
-                    .and_then(|kv| kv.split('=').nth(1))
-                    .and_then(|v| v.parse::<i32>().ok())
-            })
-            .unwrap_or(0);
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"wss_url": wss_url})),
-            "connecting to"
-        );
-
-        let (ws_stream, _) = zeroclaw_config::schema::ws_connect_with_proxy(
-            &wss_url,
-            "channel.lark",
-            self.proxy_url.as_deref(),
-        )
-        .await?;
+        let (ws_stream, service_id, client_config) = self.open_ws_stream_with_retry().await?;
         let (mut write, mut read) = ws_stream.split();
         ::zeroclaw_log::record!(
             INFO,
@@ -1151,11 +1278,28 @@ impl LarkChannel {
                             match ws_msg {
                                 WsMsg::Binary(b) => b,
                                 WsMsg::Ping(d) => { let _ = write.send(WsMsg::Pong(d)).await; continue; }
-                                WsMsg::Close(_) => { ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "WS closed — reconnecting"); break; }
+                                WsMsg::Close(frame) => {
+                                    lark_warn!(
+                                        ::serde_json::json!({
+                                            "channel": self.channel_name(),
+                                            "close_frame": format!("{frame:?}"),
+                                        }),
+                                        "Lark: WS closed by remote, reconnecting"
+                                    );
+                                    break;
+                                }
                                 _ => continue,
                             }
                         }
-                        None => { ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "WS closed — reconnecting"); break; }
+                        None => {
+                            lark_warn!(
+                                ::serde_json::json!({
+                                    "channel": self.channel_name(),
+                                }),
+                                "Lark: WS stream ended, reconnecting"
+                            );
+                            break;
+                        }
                         Some(Err(e)) => { ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "WS read error"); break; }
                     };
 
@@ -1293,7 +1437,10 @@ impl LarkChannel {
                                 Some(k) => k.to_string(),
                                 None => { ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "WS: image message missing image_key"); continue; }
                             };
-                            match self.download_image_as_marker(&lark_msg.message_id, &image_key).await {
+                            match self
+                                .download_image_as_marker(&lark_msg.message_id, &image_key)
+                                .await
+                            {
                                 Some(marker) => (marker, Vec::new()),
                                 None => {
                                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"image_key": image_key})), "WS: failed to download image");
@@ -1413,14 +1560,15 @@ impl LarkChannel {
                         reply_target: lark_msg.chat_id.clone(),
                         content: text,
                         channel: self.channel_name().to_string(),
-            channel_alias: Some(self.alias.clone()),
+                        channel_alias: Some(self.alias.clone()),
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
                         thread_ts: None,
-                        interruption_scope_id: None,
-                    attachments: vec![],
+                        interruption_scope_id: (!sender_open_id.is_empty())
+                            .then(|| sender_open_id.to_string()),
+                        attachments: vec![],
                         subject: None,
                     };
 
@@ -1506,140 +1654,6 @@ impl LarkChannel {
     async fn invalidate_token(&self) {
         let mut cached = self.tenant_token.write().await;
         *cached = None;
-    }
-
-    /// Download an image from the Lark API and return an `[IMAGE:data:...]` marker string.
-    async fn download_image_as_marker(&self, message_id: &str, image_key: &str) -> Option<String> {
-        let url = self.image_resource_url(message_id, image_key);
-        let mut retried_token = false;
-
-        loop {
-            let token = match self.get_tenant_access_token().await {
-                Ok(t) => t,
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "failed to get token for image download"
-                    );
-                    return None;
-                }
-            };
-
-            let resp = match self
-                .http_client()
-                .get(&url)
-                .header("Authorization", format!("Bearer {token}"))
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(
-                                ::serde_json::json!({"error": format!("{}", e), "image_key": image_key})
-                            ),
-                        "image download request failed for"
-                    );
-                    return None;
-                }
-            };
-
-            if resp.status() == reqwest::StatusCode::UNAUTHORIZED && !retried_token {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"image_key": image_key})),
-                    "image download 401, refreshing token and retrying once"
-                );
-                drop(resp);
-                self.invalidate_token().await;
-                retried_token = true;
-                continue;
-            }
-
-            if !resp.status().is_success() {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                    &format!(
-                        "image download failed for {image_key}: status={}",
-                        resp.status()
-                    )
-                );
-                return None;
-            }
-
-            if let Some(cl) = resp.content_length()
-                && cl > LARK_IMAGE_MAX_BYTES as u64
-            {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"image_key": image_key, "cl": cl})),
-                    "image too large for : bytes exceeds limit"
-                );
-                return None;
-            }
-
-            let content_type = resp
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string);
-
-            let bytes = match resp.bytes().await {
-                Ok(b) => b,
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(
-                                ::serde_json::json!({"error": format!("{}", e), "image_key": image_key})
-                            ),
-                        "image body read failed for"
-                    );
-                    return None;
-                }
-            };
-
-            if bytes.is_empty() || bytes.len() > LARK_IMAGE_MAX_BYTES {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                    &format!(
-                        "image body empty or too large for {image_key}: {} bytes",
-                        bytes.len()
-                    )
-                );
-                return None;
-            }
-
-            let mime = lark_detect_image_mime(content_type.as_deref(), &bytes)?;
-            if !LARK_SUPPORTED_IMAGE_MIMES.contains(&mime.as_str()) {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"image_key": image_key, "mime": mime})),
-                    "unsupported image MIME for"
-                );
-                return None;
-            }
-
-            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            return Some(format!("[IMAGE:data:{mime};base64,{encoded}]"));
-        }
     }
 
     /// Download a file from the Lark API and return a text content marker.
@@ -2094,7 +2108,7 @@ impl LarkChannel {
             channel_alias: Some(self.alias.clone()),
             timestamp,
             thread_ts: None,
-            interruption_scope_id: None,
+            interruption_scope_id: (!open_id.is_empty()).then(|| open_id.to_string()),
             attachments: vec![],
             subject: None,
         }]
@@ -2119,6 +2133,107 @@ impl LarkChannel {
         let parsed = serde_json::from_str::<serde_json::Value>(&raw)
             .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
         Ok((status, parsed))
+    }
+
+    async fn send_api_message_with_retry(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+        context: &'static str,
+    ) -> anyhow::Result<()> {
+        let mut last_error = None;
+
+        for attempt in 1..=LARK_SEND_MAX_ATTEMPTS {
+            let attempt_result: Result<(), (anyhow::Error, bool)> = async {
+                let token = self.get_tenant_access_token().await.map_err(|error| {
+                    (
+                        anyhow::Error::msg(format!(
+                            "Lark: failed to get tenant token for {context}: {error}"
+                        )),
+                        true,
+                    )
+                })?;
+
+                let (status, response) =
+                    self.send_text_once(url, &token, body).await.map_err(|error| {
+                        (
+                            anyhow::Error::msg(format!(
+                                "Lark: send {context} request failed: {error}"
+                            )),
+                            true,
+                        )
+                    })?;
+
+                if should_refresh_lark_tenant_token(status, &response) {
+                    self.invalidate_token().await;
+                    let refreshed_token = self.get_tenant_access_token().await.map_err(|error| {
+                        (
+                            anyhow::Error::msg(format!(
+                                "Lark: failed to refresh tenant token for {context}: {error}"
+                            )),
+                            true,
+                        )
+                    })?;
+
+                    let (retry_status, retry_response) = self
+                        .send_text_once(url, &refreshed_token, body)
+                        .await
+                        .map_err(|error| {
+                            (
+                                anyhow::Error::msg(format!(
+                                    "Lark: send {context} request failed after token refresh: {error}"
+                                )),
+                                true,
+                            )
+                        })?;
+
+                    if should_refresh_lark_tenant_token(retry_status, &retry_response) {
+                        return Err((
+                            anyhow::Error::msg(format!(
+                                "Lark send failed after token refresh: status={retry_status}, body={retry_response}"
+                            )),
+                            false,
+                        ));
+                    }
+
+                    return ensure_lark_send_success(
+                        retry_status,
+                        &retry_response,
+                        "after token refresh",
+                    )
+                    .map_err(|error| (error, should_retry_lark_send_status(retry_status)));
+                }
+
+                ensure_lark_send_success(status, &response, "without token refresh")
+                    .map_err(|error| (error, should_retry_lark_send_status(status)))
+            }
+            .await;
+
+            match attempt_result {
+                Ok(()) => return Ok(()),
+                Err((error, retryable)) => {
+                    if !retryable || attempt >= LARK_SEND_MAX_ATTEMPTS {
+                        return Err(error);
+                    }
+
+                    lark_warn!(
+                        ::serde_json::json!({
+                            "attempt": attempt,
+                            "max_attempts": LARK_SEND_MAX_ATTEMPTS,
+                            "send_context": context,
+                            "error": error.to_string(),
+                        }),
+                        "Lark: send failed, retrying"
+                    );
+                    last_error = Some(error);
+                    tokio::time::sleep(LARK_SEND_RETRY_DELAY).await;
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            anyhow::Error::msg(format!("Lark: send retry exhausted for {context}"))
+        }))
     }
 
     /// Parse an event callback payload and extract messages.
@@ -2360,7 +2475,7 @@ impl LarkChannel {
             channel_alias: Some(self.alias.clone()),
             timestamp,
             thread_ts: None,
-            interruption_scope_id: None,
+            interruption_scope_id: (!open_id.is_empty()).then(|| open_id.to_string()),
             attachments: vec![],
             subject: None,
         });
@@ -2385,32 +2500,29 @@ impl Channel for LarkChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let token = self.get_tenant_access_token().await?;
-        let url = self.send_message_url();
+        // Parse [IMAGE:...] markers from content
+        let (text_content, image_paths) = Self::parse_image_markers(&message.content);
 
-        let chunks = split_markdown_chunks(&message.content, LARK_CARD_MARKDOWN_MAX_BYTES);
-        for chunk in &chunks {
-            let body = build_interactive_card_body(&message.recipient, chunk);
-
-            let (status, response) = self.send_text_once(&url, &token, &body).await?;
-
-            if should_refresh_lark_tenant_token(status, &response) {
-                // Token expired/invalid, invalidate and retry once.
-                self.invalidate_token().await;
-                let new_token = self.get_tenant_access_token().await?;
-                let (retry_status, retry_response) =
-                    self.send_text_once(&url, &new_token, &body).await?;
-
-                if should_refresh_lark_tenant_token(retry_status, &retry_response) {
-                    anyhow::bail!(
-                        "send failed after token refresh: status={retry_status}, body={retry_response}"
-                    );
-                }
-
-                ensure_lark_send_success(retry_status, &retry_response, "after token refresh")?;
-            } else {
-                ensure_lark_send_success(status, &response, "without token refresh")?;
+        // Send images first
+        for image_path in &image_paths {
+            if let Err(e) = self
+                .send_image_attachment(&message.recipient, image_path)
+                .await
+            {
+                lark_warn!(
+                    ::serde_json::json!({
+                        "image_path": image_path,
+                        "error": e.to_string(),
+                    }),
+                    "Lark: failed to send image"
+                );
             }
+        }
+
+        // Send text content (if any remains after extracting images)
+        if !text_content.trim().is_empty() {
+            self.send_text_message(&message.recipient, &text_content)
+                .await?;
         }
 
         Ok(())
@@ -2697,12 +2809,9 @@ impl Channel for LarkChannel {
             .unwrap_or_else(|| {
                 ::zeroclaw_log::record!(
                     WARN,
-                    ::zeroclaw_log::Event::new(
-                        module_path!(),
-                        ::zeroclaw_log::Action::Note
-                    )
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"approval_id": approval_id})),
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"approval_id": approval_id})),
                     "Lark: approval card sent but no data.message_id in response — post-click card update will be skipped"
                 );
                 String::new()
@@ -2998,6 +3107,437 @@ impl LarkChannel {
                 "Lark: draft PATCH soft-failed"
             );
         }
+        Ok(())
+    }
+}
+
+impl LarkChannel {
+    /// Parse [IMAGE:...] markers from content and return (text, image_paths).
+    fn parse_image_markers(content: &str) -> (String, Vec<String>) {
+        let mut text = String::new();
+        let mut image_paths = Vec::new();
+        let mut last_end = 0;
+
+        let re = regex::Regex::new(r"\[IMAGE:([^\]]+)\]").unwrap();
+
+        for cap in re.captures_iter(content) {
+            let full_match = cap.get(0).unwrap();
+            let path = cap.get(1).unwrap().as_str();
+
+            text.push_str(&content[last_end..full_match.start()]);
+
+            if path.starts_with('/') {
+                image_paths.push(path.to_string());
+            }
+
+            last_end = full_match.end();
+        }
+
+        text.push_str(&content[last_end..]);
+        (text, image_paths)
+    }
+
+    fn existing_local_image_path(image_path: &str) -> Option<&Path> {
+        let path = Path::new(image_path);
+        if !path.exists() {
+            lark_warn!(
+                ::serde_json::json!({
+                    "image_path": image_path,
+                }),
+                "Lark: image file not found"
+            );
+            return None;
+        }
+
+        Some(path)
+    }
+
+    async fn persist_downloaded_image(&self, bytes: &[u8], mime: &str) -> Option<String> {
+        let workspace = self.workspace_dir.as_ref()?;
+        let dir = workspace.join("lark_files");
+
+        if tokio::fs::create_dir_all(&dir).await.is_err() {
+            return None;
+        }
+
+        let ext = mime.split('/').next_back().unwrap_or("jpg");
+        let unique = &Uuid::new_v4().to_string()[..8];
+        let filename = format!("image_{unique}.{ext}");
+        let path = dir.join(&filename);
+
+        if tokio::fs::write(&path, bytes).await.is_err() {
+            return None;
+        }
+
+        lark_info!(
+            ::serde_json::json!({
+                "path": path.display().to_string(),
+            }),
+            "Lark: image saved"
+        );
+        Some(format!("[IMAGE:{}]", path.display()))
+    }
+
+    /// Upload a local image to Feishu/Lark and return the image_key (with retry).
+    async fn upload_image(&self, file_path: &Path) -> anyhow::Result<String> {
+        const MAX_RETRIES: u32 = 2;
+        const RETRY_DELAY: Duration = Duration::from_millis(500);
+
+        let file_path_str = file_path.display().to_string();
+        let file_name = file_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        let cache = self.upload_cache.read().await;
+        if let Some(entry) = cache.get(&file_path_str) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            if now < entry.expires_at {
+                return Ok(entry.image_key.clone());
+            }
+        }
+        drop(cache);
+
+        let file_bytes = tokio::fs::read(file_path).await?;
+        if file_bytes.is_empty() {
+            anyhow::bail!("Lark: image file is empty: {}", file_path.display());
+        }
+        if file_bytes.len() > LARK_IMAGE_MAX_BYTES {
+            anyhow::bail!(
+                "Lark: image file too large: {} bytes exceeds {} bytes limit",
+                file_bytes.len(),
+                LARK_IMAGE_MAX_BYTES
+            );
+        }
+
+        let mime = match file_path.extension().and_then(|e| e.to_str()) {
+            Some("png") => "image/png",
+            Some("gif") => "image/gif",
+            Some("webp") => "image/webp",
+            Some("bmp") => "image/bmp",
+            _ => "image/jpeg",
+        };
+
+        let mut last_error = None;
+        for attempt in 0..=MAX_RETRIES {
+            let token = match self.get_tenant_access_token().await {
+                Ok(t) => t,
+                Err(e) => {
+                    last_error = Some(e);
+                    if attempt < MAX_RETRIES {
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        continue;
+                    }
+                    return Err(last_error.unwrap());
+                }
+            };
+
+            let form = reqwest::multipart::Form::new()
+                .text("image_type", "message")
+                .part(
+                    "image",
+                    reqwest::multipart::Part::bytes(file_bytes.clone())
+                        .file_name(file_name.clone())
+                        .mime_str(mime)?,
+                );
+
+            let url = format!("{}/im/v1/images", self.api_base());
+            let resp = match self
+                .http_client()
+                .post(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .multipart(form)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    last_error = Some(anyhow::Error::msg(format!(
+                        "Lark: upload request failed: {e}"
+                    )));
+                    if attempt < MAX_RETRIES {
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        continue;
+                    }
+                    return Err(last_error.unwrap());
+                }
+            };
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let err = resp.text().await.unwrap_or_default();
+                last_error = Some(anyhow::Error::msg(format!(
+                    "Lark: upload image failed ({status}): {err}"
+                )));
+                if attempt < MAX_RETRIES {
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                }
+                return Err(last_error.unwrap());
+            }
+
+            #[derive(Debug, Deserialize)]
+            struct UploadResponse {
+                code: Option<i32>,
+                msg: Option<String>,
+                data: Option<UploadData>,
+            }
+
+            #[derive(Debug, Deserialize)]
+            struct UploadData {
+                image_key: Option<String>,
+            }
+
+            let upload_resp: UploadResponse = match resp.json().await {
+                Ok(r) => r,
+                Err(e) => {
+                    last_error = Some(anyhow::Error::msg(format!(
+                        "Lark: parse response failed: {e}"
+                    )));
+                    if attempt < MAX_RETRIES {
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        continue;
+                    }
+                    return Err(last_error.unwrap());
+                }
+            };
+
+            if upload_resp.code != Some(0) {
+                last_error = Some(anyhow::Error::msg(format!(
+                    "Lark: upload failed: code={:?}, msg={:?}",
+                    upload_resp.code, upload_resp.msg
+                )));
+                if attempt < MAX_RETRIES {
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                }
+                return Err(last_error.unwrap());
+            }
+
+            let image_key = upload_resp
+                .data
+                .and_then(|d| d.image_key)
+                .ok_or_else(|| anyhow::Error::msg("Lark: no image_key in upload response"))?;
+
+            {
+                let mut cache = self.upload_cache.write().await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                cache.insert(
+                    file_path_str.clone(),
+                    UploadCacheEntry {
+                        image_key: image_key.clone(),
+                        expires_at: now + LARK_UPLOAD_CACHE_TTL,
+                    },
+                );
+            }
+
+            lark_info!(
+                ::serde_json::json!({
+                    "image_key": image_key.as_str(),
+                }),
+                "Lark: image uploaded successfully"
+            );
+            return Ok(image_key);
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow::Error::msg("Lark: upload failed after retries")))
+    }
+
+    /// Send an image message to the specified recipient.
+    async fn send_image_message(&self, recipient: &str, image_key: &str) -> anyhow::Result<()> {
+        let url = self.send_message_url();
+
+        let content = serde_json::json!({
+            "image_key": image_key,
+        });
+        let body = serde_json::json!({
+            "receive_id": recipient,
+            "msg_type": "image",
+            "content": content.to_string(),
+        });
+
+        self.send_api_message_with_retry(&url, &body, "image message")
+            .await?;
+
+        lark_info!(
+            ::serde_json::json!({
+                "recipient": recipient,
+            }),
+            "Lark: image message sent successfully"
+        );
+        Ok(())
+    }
+
+    /// Send a single image attachment: upload and send.
+    async fn send_image_attachment(&self, recipient: &str, image_path: &str) -> anyhow::Result<()> {
+        let Some(path) = Self::existing_local_image_path(image_path) else {
+            return Ok(());
+        };
+
+        let image_key = self.upload_image(path).await?;
+        self.send_image_message(recipient, &image_key).await
+    }
+
+    /// Download an image from the Lark API and return an `[IMAGE:/path]` marker string.
+    async fn download_image_as_marker(&self, message_id: &str, image_key: &str) -> Option<String> {
+        let token = match self.get_tenant_access_token().await {
+            Ok(t) => t,
+            Err(e) => {
+                lark_warn!(
+                    ::serde_json::json!({
+                        "image_key": image_key,
+                        "error": e.to_string(),
+                    }),
+                    "Lark: failed to get token for image download"
+                );
+                return None;
+            }
+        };
+
+        let url = self.image_resource_url(message_id, image_key);
+
+        let mut resp = match self
+            .http_client()
+            .get(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                lark_warn!(
+                    ::serde_json::json!({
+                        "image_key": image_key,
+                        "error": e.to_string(),
+                    }),
+                    "Lark: image download request failed"
+                );
+                return None;
+            }
+        };
+
+        let mut retried = false;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.invalidate_token().await;
+            retried = true;
+        }
+
+        if retried {
+            let new_token = match self.get_tenant_access_token().await {
+                Ok(t) => t,
+                Err(_) => {
+                    return None;
+                }
+            };
+            resp = match self
+                .http_client()
+                .get(&url)
+                .header("Authorization", format!("Bearer {new_token}"))
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(_) => {
+                    return None;
+                }
+            };
+        }
+
+        if !resp.status().is_success() {
+            lark_warn!(
+                ::serde_json::json!({
+                    "image_key": image_key,
+                    "status": resp.status().to_string(),
+                }),
+                "Lark: image download failed"
+            );
+            return None;
+        }
+
+        if let Some(cl) = resp.content_length()
+            && cl > LARK_IMAGE_MAX_BYTES as u64
+        {
+            lark_warn!(
+                ::serde_json::json!({
+                    "image_key": image_key,
+                    "size_bytes": cl,
+                }),
+                "Lark: image too large"
+            );
+            return None;
+        }
+
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                lark_warn!(
+                    ::serde_json::json!({
+                        "image_key": image_key,
+                        "error": e.to_string(),
+                    }),
+                    "Lark: image body read failed"
+                );
+                return None;
+            }
+        };
+
+        if bytes.is_empty() || bytes.len() > LARK_IMAGE_MAX_BYTES {
+            lark_warn!(
+                ::serde_json::json!({
+                    "image_key": image_key,
+                    "size_bytes": bytes.len(),
+                }),
+                "Lark: image body empty or too large"
+            );
+            return None;
+        }
+
+        let mime = lark_detect_image_mime(content_type.as_deref(), &bytes)?;
+
+        if !LARK_SUPPORTED_IMAGE_MIMES.contains(&mime.as_str()) {
+            lark_warn!(
+                ::serde_json::json!({
+                    "image_key": image_key,
+                    "mime": mime,
+                }),
+                "Lark: unsupported image MIME"
+            );
+            return None;
+        }
+
+        self.persist_downloaded_image(&bytes, &mime).await
+    }
+
+    /// Configure workspace directory for saving downloaded images.
+    pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
+        self.workspace_dir = Some(dir);
+        self
+    }
+
+    /// Send text message with automatic chunking and token refresh.
+    async fn send_text_message(&self, recipient: &str, text_content: &str) -> anyhow::Result<()> {
+        let url = self.send_message_url();
+
+        let chunks = split_markdown_chunks(text_content, LARK_CARD_MARKDOWN_MAX_BYTES);
+        for chunk in &chunks {
+            let body = build_interactive_card_body(recipient, chunk);
+            self.send_api_message_with_retry(&url, &body, "text message")
+                .await?;
+        }
+
         Ok(())
     }
 }
@@ -5023,6 +5563,14 @@ mod tests {
     #[test]
     fn lark_image_max_bytes_is_10_mib() {
         assert_eq!(LARK_IMAGE_MAX_BYTES, 10 * 1024 * 1024);
+    }
+
+    fn lark_image_resource_url_matches_region() {
+        let ch = make_channel();
+        assert_eq!(
+            ch.image_resource_url("om_msg123", "img_abc123"),
+            "https://open.larksuite.com/open-apis/im/v1/messages/om_msg123/resources/img_abc123?type=image"
+        );
     }
 
     #[test]
