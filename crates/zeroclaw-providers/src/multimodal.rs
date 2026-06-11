@@ -325,7 +325,7 @@ fn is_tool_result_carrier(message: &ChatMessage) -> bool {
     message.role == "tool" || is_prompt_tool_result_message(message)
 }
 
-fn latest_tool_result_indices(messages: &[ChatMessage]) -> HashSet<usize> {
+pub(crate) fn latest_tool_result_indices(messages: &[ChatMessage]) -> HashSet<usize> {
     let mut indices = HashSet::new();
     let Some((last_index, last_message)) = messages.iter().enumerate().next_back() else {
         return indices;
@@ -348,7 +348,7 @@ fn latest_tool_result_indices(messages: &[ChatMessage]) -> HashSet<usize> {
     indices
 }
 
-fn should_normalize_message_images(
+pub(crate) fn should_normalize_message_images(
     index: usize,
     message: &ChatMessage,
     latest_tool_result_indices: &HashSet<usize>,
@@ -401,7 +401,7 @@ fn strip_tool_result_image_markers(message: &ChatMessage) -> ChatMessage {
     }
 }
 
-fn replay_message_without_stale_tool_images(
+pub(crate) fn replay_message_without_stale_tool_images(
     index: usize,
     message: &ChatMessage,
     latest_tool_result_indices: &HashSet<usize>,
@@ -528,9 +528,9 @@ async fn prepare_messages_inner(
     let remote_client = build_runtime_proxy_client_with_timeouts("model_provider.ollama", 30, 10);
     let latest_tool_indices = latest_tool_result_indices(&trimmed);
 
-    let mut normalized_messages = Vec::with_capacity(messages.len());
+    let mut normalized_messages = Vec::with_capacity(trimmed.len());
     let mut has_successful_images = false;
-    for (index, message) in messages.iter().enumerate() {
+    for (index, message) in trimmed.iter().enumerate() {
         if !should_normalize_message_images(index, message, &latest_tool_indices) {
             normalized_messages.push(replay_message_without_stale_tool_images(
                 index,
@@ -701,57 +701,8 @@ fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMes
         .collect()
 }
 
-/// Strip image markers from older messages (oldest first) until total image
-/// count is within `max_images`. Keeps the text content of each message.
 fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessage> {
-    let latest_tool_indices = latest_tool_result_indices(messages);
-    // Find which messages (by index) contain images, oldest first.
-    let image_positions: Vec<(usize, usize)> = messages
-        .iter()
-        .enumerate()
-        .filter(|(index, message)| {
-            should_normalize_message_images(*index, message, &latest_tool_indices)
-        })
-        .filter_map(|(i, m)| {
-            let count = parse_image_markers(&m.content).1.len();
-            if count > 0 { Some((i, count)) } else { None }
-        })
-        .collect();
-
-    // Determine how many images to drop (from the oldest messages).
-    let total: usize = image_positions.iter().map(|(_, c)| c).sum();
-    let mut to_drop = total.saturating_sub(max_images);
-
-    // Collect indices of messages whose images should be stripped.
-    let mut strip_indices = std::collections::HashSet::new();
-    for &(idx, count) in &image_positions {
-        if to_drop == 0 {
-            break;
-        }
-        strip_indices.insert(idx);
-        to_drop = to_drop.saturating_sub(count);
-    }
-
-    messages
-        .iter()
-        .enumerate()
-        .map(|(i, m)| {
-            if strip_indices.contains(&i) {
-                let (cleaned, _) = parse_image_markers(&m.content);
-                let text = if cleaned.trim().is_empty() {
-                    "[image removed from history]".to_string()
-                } else {
-                    cleaned
-                };
-                ChatMessage {
-                    role: m.role.clone(),
-                    content: text,
-                }
-            } else {
-                replay_message_without_stale_tool_images(i, m, &latest_tool_indices)
-            }
-        })
-        .collect()
+    crate::multimodal_trim::trim_old_images(messages, max_images)
 }
 
 fn compose_multimodal_message(text: &str, data_uris: &[String]) -> String {
@@ -1842,11 +1793,9 @@ mod tests {
     }
 
     #[test]
-    fn trim_old_images_multi_image_message_stripped_as_unit() {
+    fn trim_old_images_multi_image_message_keeps_newest_marker() {
         // A single message has 3 images. We need to drop 2 to reach max=1.
-        // But trimming works at message granularity — the entire message gets
-        // stripped (all 3 images removed), which over-trims to 0. The newest
-        // message (text-only) is untouched.
+        // Marker-level trimming should keep only the newest marker in place.
         let messages = vec![
             ChatMessage::user(
                 "[IMAGE:/tmp/a.png]\n[IMAGE:/tmp/b.png]\n[IMAGE:/tmp/c.png]\nThree pics"
@@ -1857,9 +1806,10 @@ mod tests {
 
         let trimmed = trim_old_images(&messages, 1);
         assert_eq!(trimmed.len(), 2);
-        // All images in the first message are gone, but text remains
+        // Only the newest image survives, and text remains.
         let (_, refs0) = parse_image_markers(&trimmed[0].content);
-        assert!(refs0.is_empty());
+        assert_eq!(refs0.len(), 1);
+        assert_eq!(refs0[0], "/tmp/c.png");
         assert!(trimmed[0].content.contains("Three pics"));
         // Second message unchanged
         assert_eq!(trimmed[1].content, "Just text, no images");

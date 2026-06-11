@@ -31,6 +31,7 @@ pub mod kilocli;
 pub mod model_pin;
 pub mod models_dev;
 pub mod multimodal;
+pub(crate) mod multimodal_trim;
 pub mod ollama;
 pub mod openai;
 pub mod openai_codex;
@@ -624,6 +625,9 @@ pub struct ModelProviderRuntimeOptions {
     /// When set, the provider is asked to use its native tool-calling
     /// schema instead of OpenAI-compat tool calls. Generic across families.
     pub native_tools: Option<bool>,
+    /// Override the provider's default vision capability for this alias.
+    /// `None` preserves the provider's built-in flag.
+    pub supports_vision: Option<bool>,
     /// Wire protocol to use for this provider.
     /// `Some("responses")` routes the provider through the OpenResponses
     /// `/v1/responses` API instead of chat_completions.  `None` uses the
@@ -653,6 +657,7 @@ impl Default for ModelProviderRuntimeOptions {
             merge_system_into_user: false,
             provider_extra: None,
             native_tools: None,
+            supports_vision: None,
             wire_api: None,
             think: None,
             chat_template_kwargs: None,
@@ -719,6 +724,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         merge_system_into_user,
         provider_extra: entry.and_then(|e| e.provider_extra.clone()),
         native_tools: entry.and_then(|e| e.native_tools),
+        supports_vision: entry.and_then(|e| e.supports_vision),
         wire_api: entry.and_then(|e| e.wire_api.map(|w| w.as_str().to_string())),
         think: entry.and_then(|e| e.think),
         chat_template_kwargs: entry.and_then(|e| e.chat_template_kwargs.clone()),
@@ -791,6 +797,7 @@ pub fn options_for_provider_ref(
             let mut options = fallback.clone();
             options.provider_kind = None;
             options.provider_api_url = None;
+            options.supports_vision = None;
             options
         }
     }
@@ -2291,6 +2298,17 @@ mod tests {
     }
 
     #[test]
+    fn factory_minimax_defaults_to_no_vision() {
+        let minimax =
+            create_model_provider("minimax", Some("key")).expect("model_provider should resolve");
+        assert!(!minimax.supports_vision());
+
+        let minimax_cn = create_model_provider("minimax-cn", Some("key"))
+            .expect("model_provider should resolve");
+        assert!(!minimax_cn.supports_vision());
+    }
+
+    #[test]
     fn factory_bedrock() {
         // Bedrock uses AWS env vars for credentials, not API key.
         assert!(create_model_provider("bedrock", None).is_ok());
@@ -2528,6 +2546,26 @@ mod tests {
     }
 
     #[test]
+    fn provider_runtime_options_from_config_propagates_supports_vision() {
+        use zeroclaw_config::schema::{MinimaxModelProviderConfig, ModelProviderConfig};
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.minimax.insert(
+            "default".to_string(),
+            MinimaxModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some("https://api.minimax.io/v1".to_string()),
+                    supports_vision: Some(true),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let options = provider_runtime_options_from_config(&config);
+        assert_eq!(options.supports_vision, Some(true));
+    }
+
+    #[test]
     fn provider_runtime_options_from_config_propagates_provider_kind() {
         use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
         let mut config = zeroclaw_config::schema::Config::default();
@@ -2661,6 +2699,28 @@ mod tests {
         let model_provider = create_model_provider("deepseek", Some("key"))
             .expect("deepseek model_provider should build");
         assert!(!model_provider.supports_vision());
+    }
+
+    #[test]
+    fn factory_supports_vision_override_off() {
+        let options = ModelProviderRuntimeOptions {
+            supports_vision: Some(false),
+            ..Default::default()
+        };
+        let qwen = create_model_provider_with_options("qwen", Some("key"), &options)
+            .expect("qwen model_provider should build");
+        assert!(!qwen.supports_vision());
+    }
+
+    #[test]
+    fn factory_supports_vision_override_on() {
+        let options = ModelProviderRuntimeOptions {
+            supports_vision: Some(true),
+            ..Default::default()
+        };
+        let minimax = create_model_provider_with_options("minimax", Some("key"), &options)
+            .expect("minimax model_provider should build");
+        assert!(minimax.supports_vision());
     }
 
     #[test]

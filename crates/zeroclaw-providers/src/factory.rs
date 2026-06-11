@@ -157,7 +157,8 @@ impl<T: CompatFamilySpec> FamilyProviderFactory for T {
 }
 
 /// Apply cross-cutting compat post-processing (timeout, headers, api_path,
-/// max_tokens, reasoning effort) to a freshly-constructed compat provider
+/// max_tokens, reasoning effort, and vision overrides to a freshly-constructed
+/// compat provider
 /// and box it for trait-object dispatch. Single source of the post-process
 /// chain — every compat impl funnels through here.
 pub fn apply_compat_options(
@@ -178,6 +179,9 @@ pub fn apply_compat_options(
     }
     if let Some(mt) = opts.provider_max_tokens {
         p = p.with_max_tokens(Some(mt));
+    }
+    if let Some(supports_vision) = opts.supports_vision {
+        p = p.with_vision(supports_vision);
     }
     Box::new(p)
 }

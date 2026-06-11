@@ -346,6 +346,14 @@ impl OpenAiCompatibleModelProvider {
         self
     }
 
+    /// Override the provider's vision capability for this runtime instance.
+    /// When disabled, image markers remain plain text instead of being
+    /// promoted to multimodal image parts.
+    pub fn with_vision(mut self, supports_vision: bool) -> Self {
+        self.supports_vision = supports_vision;
+        self
+    }
+
     /// Merge all system messages into the first user message before sending.
     /// Unlike `new_merge_system_into_user`, this preserves native tool calling.
     pub fn with_merge_system_into_user(mut self) -> Self {
@@ -2419,7 +2427,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
             messages.push(Message {
                 role: "user".to_string(),
-                content: Self::to_message_content("user", &content, !merge),
+                content: Self::to_message_content("user", &content, self.supports_vision),
             });
         } else {
             if let Some(sys) = system_prompt {
@@ -2430,7 +2438,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             }
             messages.push(Message {
                 role: "user".to_string(),
-                content: Self::to_message_content("user", &normalized_message, true),
+                content: Self::to_message_content(
+                    "user",
+                    &normalized_message,
+                    self.supports_vision,
+                ),
             });
         }
 
@@ -2516,7 +2528,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             .iter()
             .map(|m| Message {
                 role: m.role.clone(),
-                content: Self::to_message_content(&m.role, &m.content, !merge),
+                content: Self::to_message_content(&m.role, &m.content, self.supports_vision),
             })
             .collect();
 
@@ -2606,7 +2618,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             tools,
             model,
             temperature,
-            !merge,
+            self.supports_vision,
         );
 
         let url = self.chat_completions_url();
@@ -2708,7 +2720,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             tools,
             model,
             temperature,
-            !merge,
+            self.supports_vision,
         );
 
         let url = self.chat_completions_url();
@@ -2823,7 +2835,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let payload_result = if has_tools {
                 serde_json::to_value(NativeChatRequest {
                     model: model.clone(),
-                    messages: provider.convert_messages_for_native(&effective_messages, !merge),
+                    messages: provider
+                        .convert_messages_for_native(&effective_messages, provider.supports_vision),
                     temperature,
                     reasoning_effort: provider.reasoning_effort_for_model(&model),
                     tool_stream: if options_enabled {
@@ -2847,7 +2860,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     .iter()
                     .map(|message| Message {
                         role: message.role.clone(),
-                        content: Self::to_message_content(&message.role, &message.content, !merge),
+                        content: Self::to_message_content(
+                            &message.role,
+                            &message.content,
+                            provider.supports_vision,
+                        ),
                     })
                     .collect();
 
@@ -2983,7 +3000,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 };
                 messages.push(Message {
                     role: "user".to_string(),
-                    content: Self::to_message_content("user", &content, !merge),
+                    content: Self::to_message_content("user", &content, provider.supports_vision),
                 });
             } else {
                 if let Some(sys) = system_prompt_owned {
@@ -2994,7 +3011,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 }
                 messages.push(Message {
                     role: "user".to_string(),
-                    content: Self::to_message_content("user", &normalized_message_content, !merge),
+                    content: Self::to_message_content(
+                        "user",
+                        &normalized_message_content,
+                        provider.supports_vision,
+                    ),
                 });
             }
 
@@ -3104,7 +3125,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 .iter()
                 .map(|m| Message {
                     role: m.role.clone(),
-                    content: Self::to_message_content(&m.role, &m.content, !merge),
+                    content: Self::to_message_content(
+                        &m.role,
+                        &m.content,
+                        provider.supports_vision,
+                    ),
                 })
                 .collect();
 
@@ -4332,6 +4357,31 @@ mod tests {
         assert!(caps.native_tool_calling);
         assert!(caps.vision);
         assert_eq!(p.user_agent.as_deref(), Some("zeroclaw-test/vision"));
+    }
+
+    #[test]
+    fn merge_system_into_user_does_not_disable_vision_parts() {
+        let p = OpenAiCompatibleModelProvider::new(
+            "test",
+            "MiniMax",
+            "https://api.minimax.chat/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+        )
+        .with_merge_system_into_user()
+        .with_vision(true);
+
+        let value = serde_json::to_value(OpenAiCompatibleModelProvider::to_message_content(
+            "user",
+            "Merged prompt [IMAGE:data:image/png;base64,abcd]",
+            p.supports_vision,
+        ))
+        .unwrap();
+        let parts = value
+            .as_array()
+            .expect("vision-enabled merged user content should stay multimodal");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[1]["type"], "image_url");
     }
 
     #[test]
