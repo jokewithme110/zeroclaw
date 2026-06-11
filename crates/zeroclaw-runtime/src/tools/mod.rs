@@ -256,6 +256,29 @@ fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
     tools.into_iter().map(ArcDelegatingTool::boxed).collect()
 }
 
+fn cleanup_config_from_config(
+    config: &Config,
+) -> zeroclaw_infra::temp_file_manager::TempFileConfig {
+    zeroclaw_infra::temp_file_manager::TempFileConfig {
+        enabled: config.files_cleanup.enabled,
+        temp_file_retention_hours: config.files_cleanup.temp_file_retention_hours,
+        temp_file_max_size_mb: config.files_cleanup.temp_file_max_size_mb,
+        scheduled_cleanup_enabled: config.files_cleanup.scheduled_cleanup_enabled,
+        scheduled_cleanup_interval_hours: config.files_cleanup.scheduled_cleanup_interval_hours,
+        rules: config
+            .files_cleanup
+            .rules
+            .iter()
+            .map(|rule| zeroclaw_infra::temp_file_manager::TempCleanupRule {
+                path: rule.path.clone(),
+                pattern: rule.pattern.clone(),
+                retention_hours: rule.retention_hours,
+                max_size_mb: rule.max_size_mb,
+            })
+            .collect(),
+    }
+}
+
 /// Create the default tool registry
 pub fn default_tools(security: Arc<SecurityPolicy>) -> Vec<Box<dyn Tool>> {
     default_tools_with_runtime(security, Arc::new(NativeRuntime::new()))
@@ -677,10 +700,14 @@ pub fn all_tools_with_runtime(
     }
 
     if config.gateway.node_control.enabled {
-        tool_arcs.push(Arc::new(NodesTool::new(
-            ConnectedNodeRegistry::global(),
-            workspace_dir,
-        )));
+        let cleanup_config_resolver = {
+            let config = config.clone();
+            Arc::new(move || cleanup_config_from_config(config.as_ref()))
+        };
+        tool_arcs.push(Arc::new(
+            NodesTool::new(ConnectedNodeRegistry::global(), workspace_dir)
+                .with_cleanup_config_resolver(cleanup_config_resolver),
+        ));
     }
 
     if browser_config.enabled {

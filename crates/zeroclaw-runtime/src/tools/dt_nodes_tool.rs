@@ -14,6 +14,8 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 use zeroclaw_api::attribution::{Attributable, Role, ToolKind};
+type CleanupConfigResolver =
+    Arc<dyn Fn() -> zeroclaw_infra::temp_file_manager::TempFileConfig + Send + Sync>;
 /// Tool that exposes node list, describe, invoke, and run to the agent.
 /// Only registered when gateway runs with node_control.enabled and injects
 /// a concrete NodeRegistry.
@@ -21,6 +23,7 @@ use zeroclaw_api::attribution::{Attributable, Role, ToolKind};
 pub struct NodesTool {
     registry: Arc<dyn NodeRegistry>,
     workspace_dir: PathBuf,
+    cleanup_config_resolver: Option<CleanupConfigResolver>,
 }
 
 impl NodesTool {
@@ -28,7 +31,13 @@ impl NodesTool {
         Self {
             registry,
             workspace_dir: workspace_dir.into(),
+            cleanup_config_resolver: None,
         }
+    }
+
+    pub fn with_cleanup_config_resolver(mut self, resolver: CleanupConfigResolver) -> Self {
+        self.cleanup_config_resolver = Some(resolver);
+        self
     }
 
     /// Returns a path for node media files under workspace/media/.
@@ -830,6 +839,29 @@ impl Tool for NodesTool {
                         );
                         anyhow::Error::msg(format!("camera.snap: write file: {e}"))
                     })?;
+
+                    if let Some(resolve_cleanup_config) = self.cleanup_config_resolver.as_ref() {
+                        let cleanup_config = resolve_cleanup_config();
+                        if let Err(error) = zeroclaw_infra::temp_file_manager::TempFileManager::trigger_cleanup_by_path(
+                            &self.workspace_dir,
+                            &path,
+                            &cleanup_config,
+                        ) {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({
+                                    "file_path": path.display().to_string(),
+                                    "error": error.to_string(),
+                                })),
+                                "camera.snap: cleanup trigger failed"
+                            );
+                        }
+                    }
 
                     files_out.push_str(&format!("MEDIA:{}\n", path.display()));
                     results.push(serde_json::json!({

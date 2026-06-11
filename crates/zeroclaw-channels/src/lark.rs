@@ -63,6 +63,8 @@ const LARK_SEND_MAX_ATTEMPTS: u32 = 4;
 const LARK_SEND_RETRY_DELAY: Duration = Duration::from_millis(500);
 const LARK_STREAM_CONNECT_MAX_ATTEMPTS: u32 = 3;
 const LARK_STREAM_CONNECT_RETRY_DELAY: Duration = Duration::from_secs(1);
+type CleanupConfigResolver =
+    Arc<dyn Fn() -> zeroclaw_infra::temp_file_manager::TempFileConfig + Send + Sync>;
 
 macro_rules! lark_info {
     ($message:expr) => {
@@ -770,6 +772,8 @@ pub struct LarkChannel {
     last_draft_edit: Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
     /// Workspace directory for saving downloaded images.
     workspace_dir: Option<PathBuf>,
+    /// Resolves cleanup config from canonical state at write-time.
+    cleanup_config_resolver: Option<CleanupConfigResolver>,
     /// Upload cache: avoids re-uploading the same image within TTL.
     upload_cache: Arc<RwLock<HashMap<String, UploadCacheEntry>>>,
     #[cfg(test)]
@@ -838,6 +842,7 @@ impl LarkChannel {
             draft_update_interval_ms: 1000,
             last_draft_edit: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             workspace_dir: None,
+            cleanup_config_resolver: None,
             upload_cache: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(test)]
             api_base_override: None,
@@ -3175,6 +3180,24 @@ impl LarkChannel {
             }),
             "Lark: image saved"
         );
+        if let Some(resolve_cleanup_config) = self.cleanup_config_resolver.as_ref() {
+            let cleanup_config = resolve_cleanup_config();
+            if let Err(error) =
+                zeroclaw_infra::temp_file_manager::TempFileManager::trigger_cleanup_by_path(
+                    workspace,
+                    &path,
+                    &cleanup_config,
+                )
+            {
+                lark_warn!(
+                    ::serde_json::json!({
+                        "path": path.display().to_string(),
+                        "error": error.to_string(),
+                    }),
+                    "Lark: cleanup trigger failed after saving image"
+                );
+            }
+        }
         Some(format!("[IMAGE:{}]", path.display()))
     }
 
@@ -3524,6 +3547,12 @@ impl LarkChannel {
     /// Configure workspace directory for saving downloaded images.
     pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
         self.workspace_dir = Some(dir);
+        self
+    }
+
+    /// Resolve cleanup config from canonical state whenever a file is saved.
+    pub fn with_cleanup_config_resolver(mut self, resolver: CleanupConfigResolver) -> Self {
+        self.cleanup_config_resolver = Some(resolver);
         self
     }
 

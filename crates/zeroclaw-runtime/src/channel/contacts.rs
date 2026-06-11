@@ -125,7 +125,7 @@ impl ChannelContactsStore {
             .collect();
 
         // Sort by last_seen descending
-        result.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+        result.sort_by_key(|b| std::cmp::Reverse(b.last_seen));
 
         Ok(result)
     }

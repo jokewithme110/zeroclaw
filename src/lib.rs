@@ -812,3 +812,30 @@ pub enum SopCommands {
         name: String,
     },
 }
+
+/// Data management subcommands (temporary file cleanup)
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DataManagementCommands {
+    /// Show temporary file usage and cleanup status
+    #[command(long_about = "\
+Show temporary file usage and cleanup configuration status.
+\n\
+Displays total size, file count, and age information for managed \
+temporary file directories (qq_files/, media/node_snap_*, etc.).
+\n\
+Examples:
+  zeroclaw data-management status
+  zeroclaw data-management temp-status")]
+    TempStatus,
+    /// Manually trigger temporary file cleanup
+    #[command(long_about = "\
+Manually trigger a cleanup of temporary files.
+\n\
+Executes all configured cleanup rules immediately, deleting files \
+that exceed retention time or space limits.
+\n\
+Examples:
+  zeroclaw data-management clean
+  zeroclaw data-management temp-clean")]
+    TempClean,
+}

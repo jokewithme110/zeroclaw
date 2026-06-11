@@ -260,6 +260,8 @@ mod cron;
 #[cfg(feature = "agent-runtime")]
 mod daemon;
 #[cfg(feature = "agent-runtime")]
+mod data_management;
+#[cfg(feature = "agent-runtime")]
 mod doctor;
 mod dt_nodes;
 mod dt_nodes_registry;
@@ -321,9 +323,9 @@ use config::Config;
 
 // Re-export so binary modules can use crate::<CommandEnum> while keeping a single source of truth.
 pub use zeroclaw::{
-    ChannelCommands, ContactsCommands, CronCommands, GatewayCommands, HardwareCommands,
-    IntegrationCommands, MigrateCommands, PeripheralCommands, ServiceCommands, SkillBundleCommands,
-    SkillCommands, SopCommands,
+    ChannelCommands, ContactsCommands, CronCommands, DataManagementCommands, GatewayCommands,
+    HardwareCommands, IntegrationCommands, MigrateCommands, PeripheralCommands, ServiceCommands,
+    SkillBundleCommands, SkillCommands, SopCommands,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -1000,7 +1002,23 @@ Examples:
         #[command(subcommand)]
         plugin_command: PluginCommands,
     },
-
+    /// Manage data retention and temporary file cleanup
+    #[command(long_about = "\
+Manage data retention and temporary file cleanup.
+\n\
+Query temporary file usage, manually trigger cleanup, and configure \
+retention policies for QQ attachments, Node camera snapshots, and \
+other temporary directories.
+\n\
+Examples:
+  zeroclaw data-management status       # show usage
+  zeroclaw data-management clean        # trigger cleanup
+  zeroclaw data-management temp-status  # alias for status
+  zeroclaw data-management temp-clean   # alias for clean")]
+    DataManagement {
+        #[command(subcommand)]
+        dm_command: DataManagementCommands,
+    },
     /// Fetch translated locale files (FTL) from upstream
     // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
@@ -3902,6 +3920,93 @@ async fn main() -> Result<()> {
             let canvas_store_for_gateway = canvas_store.clone();
             let canvas_store_for_channels = canvas_store.clone();
 
+            // Initialize temporary file manager (independent of channels/tools)
+            use std::sync::Arc;
+            let temp_file_manager = if config.files_cleanup.enabled {
+                use zeroclaw_infra::temp_file_manager::{
+                    TempCleanupRule as InfraRule, TempFileConfig, TempFileManager,
+                };
+
+                let infra_config = TempFileConfig {
+                    enabled: config.files_cleanup.enabled,
+                    temp_file_retention_hours: config.files_cleanup.temp_file_retention_hours,
+                    temp_file_max_size_mb: config.files_cleanup.temp_file_max_size_mb,
+                    scheduled_cleanup_enabled: config.files_cleanup.scheduled_cleanup_enabled,
+                    scheduled_cleanup_interval_hours: config
+                        .files_cleanup
+                        .scheduled_cleanup_interval_hours,
+                    rules: config
+                        .files_cleanup
+                        .rules
+                        .iter()
+                        .map(|r| InfraRule {
+                            path: r.path.clone(),
+                            pattern: r.pattern.clone(),
+                            retention_hours: r.retention_hours,
+                            max_size_mb: r.max_size_mb,
+                        })
+                        .collect(),
+                };
+
+                match TempFileManager::from_config(config.data_dir.clone(), &infra_config) {
+                    Ok(mgr) => {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "rules_count": mgr.rules_count()
+                            })),
+                            "Temporary file manager initialized"
+                        );
+                        Some(Arc::new(mgr))
+                    }
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "error": e.to_string()
+                            })),
+                            "Failed to initialize temporary file manager"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            // Start scheduled cleanup task if enabled
+            if let Some(ref mgr) = temp_file_manager {
+                if mgr.scheduled_cleanup_enabled() && mgr.is_enabled() {
+                    let cancel_token = tokio_util::sync::CancellationToken::new();
+                    let mgr_clone = Arc::clone(mgr);
+                    zeroclaw_spawn::spawn!(async move {
+                        if let Err(e) = mgr_clone.start_scheduled_cleanup(cancel_token).await {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Fail
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "error": e.to_string()
+                                })),
+                                "Scheduled cleanup task failed"
+                            );
+                        }
+                    });
+                }
+            }
+
             // Reload loop. `daemon::run` returns DaemonExit::Shutdown on
             // SIGINT/SIGTERM (loop ends) or DaemonExit::Reload on SIGUSR1
             // (loop re-reads config from disk and re-runs). The PID stays
@@ -4392,6 +4497,20 @@ async fn main() -> Result<()> {
                                 tz_name.parse()
                             }
                             .map_err(|_| {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Reject
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "default_timezone": config.cost.default_timezone
+                                        })
+                                    ),
+                                    "Invalid cost default timezone"
+                                );
                                 anyhow::Error::msg(format!(
                                     "Invalid cost default timezone: {}",
                                     config.cost.default_timezone
@@ -4418,6 +4537,20 @@ async fn main() -> Result<()> {
                                 tz_name.parse()
                             }
                             .map_err(|_| {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Reject
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "default_timezone": config.cost.default_timezone
+                                        })
+                                    ),
+                                    "Invalid cost default timezone"
+                                );
                                 anyhow::Error::msg(format!(
                                     "Invalid cost default timezone: {}",
                                     config.cost.default_timezone
@@ -4555,6 +4688,11 @@ async fn main() -> Result<()> {
 
         Commands::Memory { memory_command } => {
             memory::cli::handle_command(memory_command, &config).await
+        }
+
+        #[cfg(feature = "agent-runtime")]
+        Commands::DataManagement { dm_command } => {
+            data_management::handle_command(dm_command, &config)
         }
 
         Commands::Auth { auth_command } => handle_auth_command(auth_command, &config).await,

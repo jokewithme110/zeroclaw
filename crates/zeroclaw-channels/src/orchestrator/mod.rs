@@ -5711,6 +5711,41 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
     Ok(false)
 }
 
+#[allow(dead_code)]
+fn cleanup_config_from_config(
+    config: &Config,
+) -> zeroclaw_infra::temp_file_manager::TempFileConfig {
+    zeroclaw_infra::temp_file_manager::TempFileConfig {
+        enabled: config.files_cleanup.enabled,
+        temp_file_retention_hours: config.files_cleanup.temp_file_retention_hours,
+        temp_file_max_size_mb: config.files_cleanup.temp_file_max_size_mb,
+        scheduled_cleanup_enabled: config.files_cleanup.scheduled_cleanup_enabled,
+        scheduled_cleanup_interval_hours: config.files_cleanup.scheduled_cleanup_interval_hours,
+        rules: config
+            .files_cleanup
+            .rules
+            .iter()
+            .map(|rule| zeroclaw_infra::temp_file_manager::TempCleanupRule {
+                path: rule.path.clone(),
+                pattern: rule.pattern.clone(),
+                retention_hours: rule.retention_hours,
+                max_size_mb: rule.max_size_mb,
+            })
+            .collect(),
+    }
+}
+
+#[allow(dead_code)]
+fn make_cleanup_config_resolver(
+    config_arc: &Arc<RwLock<Config>>,
+) -> Arc<dyn Fn() -> zeroclaw_infra::temp_file_manager::TempFileConfig + Send + Sync> {
+    let config_arc = config_arc.clone();
+    Arc::new(move || {
+        let config = config_arc.read();
+        cleanup_config_from_config(&config)
+    })
+}
+
 /// Build a single channel instance by config section name (e.g. "telegram").
 fn build_channel_by_id(
     config_arc: &Arc<RwLock<Config>>,
@@ -5956,12 +5991,18 @@ fn build_channel_by_id(
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_external_peers("qq", &alias))
             };
-            Ok(Arc::new(QQChannel::new(
-                qq.app_id.clone(),
-                qq.app_secret.clone(),
-                alias,
-                peer_resolver,
-            )))
+            let cleanup_config_resolver = make_cleanup_config_resolver(config_arc);
+            Ok(Arc::new(
+                QQChannel::new(
+                    qq.app_id.clone(),
+                    qq.app_secret.clone(),
+                    alias,
+                    peer_resolver,
+                )
+                .with_workspace_dir(config.channel_workspace_dir("qq.default"))
+                .with_proxy_url(qq.proxy_url.clone())
+                .with_cleanup_config_resolver(cleanup_config_resolver),
+            ))
         }
         #[cfg(not(feature = "channel-qq"))]
         "qq" => {
@@ -5981,12 +6022,14 @@ fn build_channel_by_id(
                     let alias = alias.clone();
                     Arc::new(move || cfg_arc.read().channel_external_peers("lark", &alias))
                 };
+                let cleanup_config_resolver = make_cleanup_config_resolver(config_arc);
                 Ok(Arc::new(
                     LarkChannel::from_config(lk, alias, peer_resolver)
                         .with_approval_timeout_secs(lk.approval_timeout_secs)
                         .with_per_user_session(lk.per_user_session)
                         .with_streaming(lk.stream_mode, lk.draft_update_interval_ms)
-                        .with_workspace_dir(config.channel_workspace_dir("lark.default")),
+                        .with_workspace_dir(config.channel_workspace_dir("lark.default"))
+                        .with_cleanup_config_resolver(cleanup_config_resolver),
                 ))
             }
             #[cfg(not(feature = "channel-lark"))]
@@ -6017,10 +6060,11 @@ fn build_channel_by_id(
                     Arc::new(move || cfg_arc.read().channel_external_peers("lark", &alias))
                 };
                 let channel_ref = format!("feishu.{alias}");
+                let cleanup_config_resolver = make_cleanup_config_resolver(config_arc);
                 Ok(Arc::new(
                     LarkChannel::from_config(lk, alias, peer_resolver)
-                        .with_transcription(config.transcription.clone())
-                        .with_workspace_dir(config.channel_workspace_dir(&channel_ref)),
+                        .with_workspace_dir(config.channel_workspace_dir(&channel_ref))
+                        .with_cleanup_config_resolver(cleanup_config_resolver),
                 ))
             }
             #[cfg(not(feature = "channel-lark"))]
@@ -6041,6 +6085,7 @@ fn build_channel_by_id(
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_external_peers("dingtalk", &alias))
             };
+            let cleanup_config_resolver = make_cleanup_config_resolver(config_arc);
             Ok(Arc::new(
                 DingTalkChannel::new(
                     dt.client_id.clone(),
@@ -6049,7 +6094,8 @@ fn build_channel_by_id(
                     peer_resolver,
                 )
                 .with_proxy_url(dt.proxy_url.clone())
-                .with_workspace_dir(config.channel_workspace_dir("dingtalk.default")),
+                .with_workspace_dir(config.channel_workspace_dir("dingtalk.default"))
+                .with_cleanup_config_resolver(cleanup_config_resolver),
             ))
         }
         #[cfg(not(feature = "channel-dingtalk"))]
@@ -6144,6 +6190,7 @@ fn build_channel_by_id(
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_external_peers("wechat", &alias))
             };
+            let cleanup_config_resolver = make_cleanup_config_resolver(config_arc);
             Ok(Arc::new(
                 WeChatChannel::new(
                     alias,
@@ -6153,7 +6200,8 @@ fn build_channel_by_id(
                     wc.state_dir.as_ref().map(|s| expand_tilde_in_path(s)),
                 )?
                 .with_persistence(config_arc.clone())
-                .with_workspace_dir(config.data_dir.clone()),
+                .with_workspace_dir(config.data_dir.clone())
+                .with_cleanup_config_resolver(cleanup_config_resolver),
             ))
         }
         #[cfg(not(feature = "channel-wechat"))]
@@ -7416,6 +7464,7 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_external_peers("amqp", &alias))
         };
+
         channels.push(ConfiguredChannel {
             display_name: "AMQP",
             alias: Some(alias.clone()),
@@ -7499,6 +7548,7 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_external_peers("lark", &alias))
         };
+        let cleanup_config_resolver = make_cleanup_config_resolver(config_arc);
         let display_name = if lk.use_feishu { "Feishu" } else { "Lark" };
         channels.push(ConfiguredChannel {
             display_name,
@@ -7508,7 +7558,8 @@ fn collect_configured_channels(
                     .with_approval_timeout_secs(lk.approval_timeout_secs)
                     .with_per_user_session(lk.per_user_session)
                     .with_streaming(lk.stream_mode, lk.draft_update_interval_ms)
-                    .with_transcription(config.transcription.clone()),
+                    .with_transcription(config.transcription.clone())
+                    .with_cleanup_config_resolver(cleanup_config_resolver),
             ),
         });
     }
@@ -7570,6 +7621,7 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_external_peers("dingtalk", &alias))
         };
+        let cleanup_config_resolver = make_cleanup_config_resolver(config_arc);
         channels.push(ConfiguredChannel {
             display_name: "DingTalk",
             alias: Some(alias.clone()),
@@ -7611,6 +7663,7 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_external_peers("qq", &alias))
         };
+        let cleanup_config_resolver = make_cleanup_config_resolver(config_arc);
         channels.push(ConfiguredChannel {
             display_name: "QQ",
             alias: Some(alias.clone()),
@@ -7623,7 +7676,8 @@ fn collect_configured_channels(
                 )
                 .with_workspace_dir(config.channel_workspace_dir(&format!("qq.{alias}")))
                 .with_proxy_url(qq.proxy_url.clone())
-                .with_transcription(config.transcription.clone()),
+                .with_transcription(config.transcription.clone())
+                .with_cleanup_config_resolver(cleanup_config_resolver),
             ),
         });
     }
@@ -7826,6 +7880,7 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_external_peers("wechat", &alias))
         };
+        let cleanup_config_resolver = make_cleanup_config_resolver(config_arc);
         match WeChatChannel::new(
             alias.clone(),
             peer_resolver,
@@ -7842,7 +7897,8 @@ fn collect_configured_channels(
                             .with_persistence(config_arc.clone())
                             .with_workspace_dir(
                                 config.channel_workspace_dir(&format!("wechat.{alias}")),
-                            ),
+                            )
+                            .with_cleanup_config_resolver(cleanup_config_resolver),
                     ),
                 });
             }

@@ -22,6 +22,8 @@ const DINGTALK_USER_BATCH_SEND_URL: &str =
     "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend";
 const DINGTALK_GROUP_SEND_URL: &str = "https://api.dingtalk.com/v1.0/robot/groupMessages/send";
 type DingTalkWsStream = zeroclaw_config::schema::ProxiedWsStream;
+type CleanupConfigResolver =
+    Arc<dyn Fn() -> zeroclaw_infra::temp_file_manager::TempFileConfig + Send + Sync>;
 
 macro_rules! dingtalk_info {
     ($message:expr) => {
@@ -100,6 +102,8 @@ pub struct DingTalkChannel {
     proxy_url: Option<String>,
     /// Workspace directory for saving downloaded images.
     workspace_dir: Option<PathBuf>,
+    /// Resolves cleanup config from canonical state at write-time.
+    cleanup_config_resolver: Option<CleanupConfigResolver>,
     /// Upload cache: avoids re-uploading the same image within TTL.
     upload_cache: Arc<RwLock<HashMap<String, UploadCacheEntry>>>,
 }
@@ -146,6 +150,7 @@ impl DingTalkChannel {
             reply_targets: Arc::new(RwLock::new(HashMap::new())),
             proxy_url: None,
             workspace_dir: None,
+            cleanup_config_resolver: None,
             upload_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -159,6 +164,12 @@ impl DingTalkChannel {
     /// Set a per-channel proxy URL that overrides the global proxy config.
     pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
         self.proxy_url = proxy_url;
+        self
+    }
+
+    /// Resolve cleanup config from canonical state whenever a file is saved.
+    pub fn with_cleanup_config_resolver(mut self, resolver: CleanupConfigResolver) -> Self {
+        self.cleanup_config_resolver = Some(resolver);
         self
     }
 
@@ -970,6 +981,22 @@ impl DingTalkChannel {
                         }),
                         "DingTalk: image saved"
                     );
+                    if let Some(resolve_cleanup_config) = self.cleanup_config_resolver.as_ref() {
+                        let cleanup_config = resolve_cleanup_config();
+                        if let Err(error) = zeroclaw_infra::temp_file_manager::TempFileManager::trigger_cleanup_by_path(
+                            workspace,
+                            &path,
+                            &cleanup_config,
+                        ) {
+                            dingtalk_warn!(
+                                ::serde_json::json!({
+                                    "path": path.display().to_string(),
+                                    "error": error.to_string(),
+                                }),
+                                "DingTalk: cleanup trigger failed after saving image"
+                            );
+                        }
+                    }
                     return Some(format!("[IMAGE:{}]", path.display()));
                 }
             }
