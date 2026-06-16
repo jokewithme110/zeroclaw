@@ -1,0 +1,23 @@
+[package]
+name = "json-to-toon"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "ZeroClaw WASM hook plugin: converts JSON tool results to TOON format."
+publish = false
+
+[lib]
+name = "json_to_toon"
+crate-type = ["cdylib"]
+
+[dependencies]
+extism-pdk = "1.4"
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+
+[workspace]

@@ -277,6 +277,26 @@ impl PluginHost {
             .collect()
     }
 
+    /// Get hook-capable plugins.
+    pub fn hook_plugins(&self) -> Vec<&PluginManifest> {
+        self.loaded
+            .values()
+            .filter(|p| p.manifest.capabilities.contains(&PluginCapability::Hook))
+            .map(|p| &p.manifest)
+            .collect()
+    }
+
+    /// Get hook-capable plugins with their resolved WASM file paths.
+    /// Returns `(manifest, resolved_wasm_path)` tuples for building `WasmHook`s.
+    /// Hook plugins without a `wasm_path` are skipped.
+    pub fn hook_plugin_details(&self) -> Vec<(&PluginManifest, &Path)> {
+        self.loaded
+            .values()
+            .filter(|p| p.manifest.capabilities.contains(&PluginCapability::Hook))
+            .filter_map(|p| p.wasm_path.as_deref().map(|wp| (&p.manifest, wp)))
+            .collect()
+    }
+
     /// Get skill-capable plugins paired with the absolute path to their `skills/`
     /// directory. Plugins without an existing `skills/` subdirectory are skipped.
     ///

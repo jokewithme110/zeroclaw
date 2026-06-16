@@ -1,0 +1,7 @@
+name = "json-to-toon"
+version = "0.1.0"
+description = "Hook plugin: converts JSON tool results to TOON (Token-Optimized Object Notation) format."
+author = "ZeroClaw Labs"
+wasm_path = "json_to_toon.wasm"
+capabilities = ["hook"]
+permissions = ["log"]

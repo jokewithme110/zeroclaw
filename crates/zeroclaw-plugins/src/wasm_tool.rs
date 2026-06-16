@@ -46,15 +46,36 @@ impl WasmTool {
         fallback_description: String,
     ) -> Self {
         // Try to load metadata from the WASM module itself.
-        let (name, description, schema) = match runtime::create_plugin(&wasm_path, &permissions) {
-            Ok(mut plugin) => match runtime::call_tool_metadata(&mut plugin) {
-                Ok(meta) => (meta.name, meta.description, meta.parameters_schema),
+        let (name, description, schema) =
+            match runtime::create_plugin(&wasm_path, &permissions, &fallback_name) {
+                Ok(mut plugin) => match runtime::call_tool_metadata(&mut plugin) {
+                    Ok(meta) => (meta.name, meta.description, meta.parameters_schema),
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            &format!(
+                                "plugin at {} has no tool_metadata export ({e}), using fallback",
+                                wasm_path.display()
+                            )
+                        );
+                        (
+                            fallback_name.clone(),
+                            fallback_description.clone(),
+                            default_schema(),
+                        )
+                    }
+                },
                 Err(e) => {
                     ::zeroclaw_log::record!(
-                        DEBUG,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                         &format!(
-                            "plugin at {} has no tool_metadata export ({e}), using fallback",
+                            "failed to load WASM plugin at {} for metadata: {e}",
                             wasm_path.display()
                         )
                     );
@@ -64,24 +85,7 @@ impl WasmTool {
                         default_schema(),
                     )
                 }
-            },
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                    &format!(
-                        "failed to load WASM plugin at {} for metadata: {e}",
-                        wasm_path.display()
-                    )
-                );
-                (
-                    fallback_name.clone(),
-                    fallback_description.clone(),
-                    default_schema(),
-                )
-            }
-        };
+            };
 
         Self {
             name,
@@ -126,11 +130,12 @@ impl Tool for WasmTool {
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
         let wasm_path = self.wasm_path.clone();
         let permissions = self.permissions.clone();
+        let plugin_name = self.name.clone();
         let args_json = serde_json::to_vec(&args)?;
 
         // Extism Plugin is !Send, so we must create it inside spawn_blocking.
         tokio::task::spawn_blocking(move || {
-            let mut plugin = runtime::create_plugin(&wasm_path, &permissions)?;
+            let mut plugin = runtime::create_plugin(&wasm_path, &permissions, &plugin_name)?;
             runtime::call_execute(&mut plugin, &args_json)
         })
         .await?

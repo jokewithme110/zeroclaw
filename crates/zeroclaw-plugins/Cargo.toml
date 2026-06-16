@@ -18,7 +18,7 @@ serde_json = { version = "1.0", default-features = false, features = ["std"] }
 extism = "1.21"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
 thiserror = "2.0"
-tokio = { version = "1.50", default-features = false, features = ["sync", "macros", "rt"] }
+tokio = { version = "1.50", default-features = false, features = ["sync", "macros", "rt", "time"] }
 toml = "1.0"
 
 [dev-dependencies]

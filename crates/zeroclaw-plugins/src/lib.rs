@@ -8,6 +8,7 @@ pub mod host;
 pub mod runtime;
 pub mod signature;
 pub mod wasm_channel;
+pub mod wasm_hook;
 pub mod wasm_tool;
 
 use serde::{Deserialize, Serialize};
@@ -25,7 +26,7 @@ pub struct PluginManifest {
     /// Author name or organization
     pub author: Option<String>,
     /// Path to the .wasm file (relative to manifest).
-    /// Required for tool/channel/memory/observer plugins; optional (and ignored)
+    /// Required for tool/channel/memory/observer/hook plugins; optional (and ignored)
     /// for skill-only plugins, which carry no WASM payload.
     #[serde(default)]
     pub wasm_path: Option<String>,
@@ -55,6 +56,8 @@ pub enum PluginCapability {
     Memory,
     /// Provides an observer/metrics backend
     Observer,
+    /// Provides lifecycle and policy hooks
+    Hook,
     /// Provides one or more agentskills.io-format skills under `skills/`
     Skill,
 }
@@ -75,6 +78,10 @@ pub enum PluginPermission {
     MemoryRead,
     /// Can write agent memory
     MemoryWrite,
+    /// Can emit log records via the host's `zc_log` host function.
+    /// Records are attributed to the plugin by name and surfaced through
+    /// the standard `zeroclaw_log` pipeline.
+    Log,
 }
 
 /// Information about a loaded plugin.

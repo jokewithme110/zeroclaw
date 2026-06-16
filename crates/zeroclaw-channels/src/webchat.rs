@@ -200,7 +200,12 @@ impl Channel for WebchatChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
-        self.finalize_draft(&message.recipient, "", &message.content)
+        let message_id = if message.subject.as_deref() == Some("[webchat message]") {
+            "[webchat message]".to_string()
+        } else {
+            "".to_string()
+        };
+        self.finalize_draft(&message.recipient, &message_id, &message.content)
             .await
     }
     async fn send_draft(&self, message: &SendMessage) -> Result<Option<String>> {
@@ -343,7 +348,7 @@ impl Channel for WebchatChannel {
     }
 
     // 最终的结果非流式返回
-    async fn finalize_draft(&self, recipient: &str, _message_id: &str, text: &str) -> Result<()> {
+    async fn finalize_draft(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
         let entry = {
             let mut sessions = self.sessions.lock().await;
             sessions.remove(recipient)
@@ -354,7 +359,9 @@ impl Channel for WebchatChannel {
 
         match entry.mode {
             SessionMode::Stream(tx) => {
-                if !text.is_empty() && !self.support_reasoning {
+                if (!text.is_empty() && !self.support_reasoning)
+                    || message_id == "[webchat message]"
+                {
                     let delta = if entry.first_chunk_sent {
                         serde_json::json!({ "content": text })
                     } else {

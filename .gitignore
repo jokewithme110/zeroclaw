@@ -112,4 +112,13 @@ target/openapi.json
 # icodemate
 .icodemate
 .claude/skills
-ipient and cli query
+
+# SpecStory VSCode extension — local AI chat history and cache
+.specstory/
+
+# spec-kit framework (personal tool, not project workflow)
+.specify/
+.claude/skills/speckit-*/
+specs/
+plugins/*/target
+plugins/*/*.wasm

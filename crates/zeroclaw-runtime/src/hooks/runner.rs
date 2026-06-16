@@ -40,6 +40,28 @@ impl HookRunner {
             .sort_by_key(|h| std::cmp::Reverse(h.priority()));
     }
 
+    #[allow(unused_variables)]
+    pub fn register_wasm_plugin(&mut self, workspace_dir: &std::path::Path) -> &mut Self {
+        #[cfg(feature = "plugins-wasm")]
+        {
+            use crate::hooks::wasm::WasmHook;
+            match zeroclaw_plugins::host::PluginHost::new(workspace_dir) {
+                Ok(host) => {
+                    let details = host.hook_plugin_details();
+                    for (manifest, wasm_path) in details {
+                        self.register(Box::new(WasmHook::from_wasm(
+                            wasm_path.to_path_buf(),
+                            manifest.permissions.clone(),
+                            manifest.name.clone(),
+                        )));
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        self
+    }
+
     // ---------------------------------------------------------------
     // Void dispatchers (parallel, fire-and-forget)
     // ---------------------------------------------------------------
@@ -117,6 +139,22 @@ impl HookRunner {
             .handlers
             .iter()
             .map(|h| h.on_heartbeat_tick())
+            .collect();
+        join_all(futs).await;
+    }
+
+    pub async fn fire_agent_end(
+        &self,
+        channel: &str,
+        sender: &str,
+        user_input: &str,
+        agent_response: &str,
+        history: &[ChatMessage],
+    ) {
+        let futs: Vec<_> = self
+            .handlers
+            .iter()
+            .map(|h| h.on_agent_end(channel, sender, user_input, agent_response, history))
             .collect();
         join_all(futs).await;
     }
@@ -250,6 +288,46 @@ impl HookRunner {
         HookResult::Continue((name, args))
     }
 
+    pub async fn run_after_tool_result_build(
+        &self,
+        tool_name: String,
+        tool_args: serde_json::Value,
+        mut tool_call_id: Option<String>,
+        mut output: String,
+    ) -> HookResult<(Option<String>, String)> {
+        for h in &self.handlers {
+            let hook_name = h.name();
+            match AssertUnwindSafe(h.after_tool_result_build(
+                tool_name.clone(),
+                tool_args.clone(),
+                tool_call_id.clone(),
+                output.clone(),
+            ))
+            .catch_unwind()
+            .await
+            {
+                Ok(HookResult::Continue((cid, out))) => {
+                    tool_call_id = cid;
+                    output = out;
+                }
+                Ok(HookResult::Cancel(reason)) => {
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hook": hook_name, "reason": reason.to_string()})), "after_tool_result_build cancelled by hook");
+                    return HookResult::Cancel(reason);
+                }
+                Err(_) => {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"hook": hook_name})),
+                        "after_tool_result_build hook panicked; continuing with previous values"
+                    );
+                }
+            }
+        }
+        HookResult::Continue((tool_call_id, output))
+    }
+
     pub async fn run_on_message_received(
         &self,
         mut message: ChannelMessage,
@@ -316,6 +394,72 @@ impl HookRunner {
             }
         }
         HookResult::Continue((channel, recipient, content))
+    }
+
+    // ---------------------------------------------------------------
+    // Modifying dispatchers (sequential by priority, short-circuit on Cancel)
+    // ---------------------------------------------------------------
+
+    /// Execute before_agent_reply hooks sequentially by priority.
+    /// First hook to return Some(response) wins and short-circuits the agent loop.
+    /// Returns None to continue with normal agent reply execution.
+    ///
+    /// Hooks receive `&[ChatMessage]` (read-only snapshot of the original
+    /// history) and return `(short_circuit_response, messages_to_append)`.
+    /// The dispatcher accumulates the appended messages from every hook and
+    /// returns the union; the **caller** is responsible for doing the actual
+    /// `history.extend(...)` so this function stays free of in-place mutation.
+    pub async fn run_before_agent_reply(
+        &self,
+        msg: &str,
+        history: Vec<ChatMessage>,
+        agent_alias: &str,
+    ) -> HookResult<(Option<String>, Vec<ChatMessage>)> {
+        let mut short_circuit: Option<String> = None;
+        let mut appended: Vec<ChatMessage> = Vec::new();
+
+        for h in &self.handlers {
+            let hook_name = h.name();
+            match AssertUnwindSafe(h.before_agent_reply(msg, &history, agent_alias))
+                .catch_unwind()
+                .await
+            {
+                Ok(HookResult::Continue((Some(response), new_appended))) => {
+                    appended.extend(new_appended);
+                    short_circuit = Some(response);
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"hook": hook_name})),
+                        "before_agent_reply short-circuited"
+                    );
+                    // Short-circuit: stop iterating subsequent hooks.
+                    break;
+                }
+                Ok(HookResult::Continue((None, new_appended))) => {
+                    appended.extend(new_appended);
+                }
+                Ok(HookResult::Cancel(reason)) => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"hook": hook_name, "reason": reason})),
+                        "before_agent_reply cancelled by hook"
+                    );
+                    return HookResult::Cancel(reason);
+                }
+                Err(_) => {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"hook": hook_name})),
+                        "before_agent_reply hook panicked; continuing with accumulated messages"
+                    );
+                }
+            }
+        }
+        HookResult::Continue((short_circuit, appended))
     }
 }
 

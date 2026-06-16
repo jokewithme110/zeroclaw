@@ -1649,9 +1649,10 @@ fn replace_available_skills_section(base_prompt: &str, refreshed_skills: &str) -
 
 fn refreshed_new_session_system_prompt(ctx: &ChannelRuntimeContext) -> String {
     let refreshed_skills = zeroclaw_runtime::skills::skills_to_prompt_with_mode(
-        &zeroclaw_runtime::skills::load_skills_with_config(
+        &zeroclaw_runtime::skills::load_skills_for_agent(
             ctx.workspace_dir.as_ref(),
             ctx.prompt_config.as_ref(),
+            &ctx.agent_alias,
         ),
         ctx.workspace_dir.as_ref(),
         ctx.prompt_config.skills.prompt_injection_mode,
@@ -4151,6 +4152,54 @@ async fn process_channel_message_body(
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
 
+    // ── Hook: before_agent_reply ─────────────────────────────────────
+    // Allow hooks to short-circuit message processing before entering
+    // the full agent loop. Hooks have access to tools, skills, provider,
+    // and conversation history.
+    //
+    // Variables to store hook modifications, applied later before run_tool_call_loop
+    if let Some(hooks) = &ctx.hooks {
+        // Allow hooks to potentially short-circuit or contribute extra
+        // messages to history. The dispatcher returns
+        // `(short_circuit_response, appended_messages)`: we own the
+        // append step here, after the hook chain has finished.
+        match hooks
+            .run_before_agent_reply(&msg.content, history.clone(), ctx.agent_alias.as_str())
+            .await
+        {
+            zeroclaw_runtime::hooks::HookResult::Continue((Some(response_text), appended)) => {
+                history.extend(appended);
+
+                // Record assistant response
+                append_sender_turn(
+                    ctx.as_ref(),
+                    &history_key,
+                    zeroclaw_providers::ChatMessage::assistant(&response_text),
+                );
+
+                // Send response to channel
+                if let Some(channel) = target_channel.as_ref() {
+                    let _ = channel
+                        .send(
+                            &SendMessage::new(&response_text, &msg.reply_target)
+                                .in_thread(msg.thread_ts.clone())
+                                .subject("[webchat message]"),
+                        )
+                        .await;
+                }
+                return; // Short-circuit - skip full agent loop
+            }
+            zeroclaw_runtime::hooks::HookResult::Continue((None, appended)) => {
+                // Hook chain finished without short-circuit. Merge every
+                // hook's appended messages into the history we will hand
+                // to the agent loop.
+                history.extend(appended);
+            }
+            zeroclaw_runtime::hooks::HookResult::Cancel(_reason) => {
+                return;
+            }
+        }
+    }
     // ── Proactive context compression ────────────────────────────
     // Use the existing ContextCompressor to summarize older history
     // before the LLM call, preventing context-window-exceeded errors
@@ -5077,6 +5126,27 @@ async fn process_channel_message_body(
                         "failed to send tool receipts block"
                     );
                 }
+            }
+
+            // ── Hook: on_agent_end (non-blocking) ────────────
+            if let Some(hooks) = &ctx.hooks {
+                let hooks = Arc::clone(hooks);
+                let channel_name = msg.channel.clone();
+                let sender = msg.sender.clone();
+                let user_input = msg.content.clone();
+                let agent_response = delivered_response.clone();
+                let history_clone = history.clone();
+                ::zeroclaw_spawn::spawn!(async move {
+                    hooks
+                        .fire_agent_end(
+                            &channel_name,
+                            &sender,
+                            &user_input,
+                            &agent_response,
+                            &history_clone,
+                        )
+                        .await;
+                });
             }
         }
         LlmExecutionResult::Completed(Ok(Err(e))) => {
@@ -8993,6 +9063,7 @@ pub async fn start_channels(
                     cancel.clone(),
                 ));
             }
+
             drop(tx);
 
             // Composite-key registry (see `composite_channel_key`).
@@ -9135,6 +9206,7 @@ pub async fn start_channels(
                         ),
                     ));
                 }
+                runner.register_wasm_plugin(&config.data_dir);
                 Some(Arc::new(runner))
             } else {
                 None

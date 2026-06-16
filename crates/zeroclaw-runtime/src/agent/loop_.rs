@@ -2923,7 +2923,7 @@ pub async fn run_tool_call_loop(
         let mut detection_relevant_output = String::new();
         // Use enumerate *before* filter_map so result_index stays aligned with
         // tool_calls even when some ordered_results entries are None.
-        for (result_index, (tool_name, tool_call_id, outcome)) in ordered_results
+        for (result_index, (tool_name, mut tool_call_id, outcome)) in ordered_results
             .into_iter()
             .enumerate()
             .filter_map(|(i, opt)| opt.map(|v| (i, v)))
@@ -3012,6 +3012,34 @@ pub async fn run_tool_call_loop(
                     v.push(format!("{tool_name}: {receipt}"));
                 }
             }
+
+            // ── Hook: after_tool_result_build (modifying) ─────────────────
+            // Allows hooks to modify or filter tool output based on name, args, and result
+            if let Some(hooks) = hooks {
+                let tool_args = tool_calls
+                    .get(result_index)
+                    .map(|c| c.arguments.clone())
+                    .unwrap_or(serde_json::Value::Null);
+                match hooks
+                    .run_after_tool_result_build(
+                        tool_name.clone(),
+                        tool_args,
+                        tool_call_id.clone(),
+                        result_output.clone(),
+                    )
+                    .await
+                {
+                    crate::hooks::HookResult::Cancel(reason) => {
+                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"tool": tool_name, "reason": reason.to_string()})), "tool result blocked by hook");
+                        continue;
+                    }
+                    crate::hooks::HookResult::Continue((cid, out)) => {
+                        tool_call_id = cid;
+                        result_output = out;
+                    }
+                }
+            }
+
             individual_results.push((tool_call_id, result_output.clone()));
             let _ = writeln!(
                 tool_results,
@@ -4015,7 +4043,6 @@ pub async fn run(
                 return Ok(final_output);
             }
 
-            // Auto-save user message to memory (skip short/trivial messages)
             if config.memory.auto_save
                 && effective_msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
                 && !zeroclaw_memory::should_skip_autosave_content(&effective_msg)

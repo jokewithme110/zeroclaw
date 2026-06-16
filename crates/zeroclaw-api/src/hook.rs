@@ -38,6 +38,15 @@ pub trait HookHandler: Send + Sync {
     async fn on_after_tool_call(&self, _tool: &str, _result: &ToolResult, _duration: Duration) {}
     async fn on_message_sent(&self, _channel: &str, _recipient: &str, _content: &str) {}
     async fn on_heartbeat_tick(&self) {}
+    async fn on_agent_end(
+        &self,
+        _channel: &str,
+        _sender: &str,
+        _user_input: &str,
+        _agent_response: &str,
+        _history: &[ChatMessage],
+    ) {
+    }
 
     // --- Modifying hooks (sequential by priority, can cancel) ---
     async fn before_model_resolve(
@@ -75,6 +84,57 @@ pub trait HookHandler: Send + Sync {
         content: String,
     ) -> HookResult<(String, String, String)> {
         HookResult::Continue((channel, recipient, content))
+    }
+
+    // ------------- xydt custom hook -----------
+    /// Called before agent reply executes.
+    ///
+    /// Returns a tuple of `(short_circuit_response, messages_to_append)`:
+    /// - `Some(response)` in the first slot: skip the agent loop and return the
+    ///   response directly. The append list is still merged into history by
+    ///   the dispatcher before short-circuiting.
+    /// - `None` in the first slot: continue with the normal agent loop, after
+    ///   the dispatcher has appended the second-slot messages to history.
+    /// - `Cancel(reason)`: abort the request.
+    ///
+    /// `history` is passed by shared reference so the dispatcher can keep
+    /// ownership and avoid cloning the whole conversation per hook. The hook
+    /// only needs to inspect history to decide what to append.
+    ///
+    /// Example use cases:
+    /// - Keyword-based short-circuit responses (e.g., "/help" → show help)
+    /// - Simple agent fallback with limited tools for short messages
+    /// - Custom routing logic based on message content
+    /// - Injecting extra context messages before the agent loop
+    /// - Dynamic tool exclusion based on context
+    async fn before_agent_reply(
+        &self,
+        _msg: &str,
+        _history: &[ChatMessage],
+        _agent_alias: &str,
+    ) -> HookResult<(Option<String>, Vec<ChatMessage>)> {
+        HookResult::Continue((None, Vec::new()))
+    }
+    /// Called after a tool result is built but before it's added to history.
+    /// Allows hooks to modify or filter tool output.
+    ///
+    /// Parameters:
+    /// - tool_name: Name of the tool that was executed
+    /// - tool_args: Arguments passed to the tool (as JSON)
+    /// - tool_call_id: Unique identifier for this tool call (if available)
+    /// - output: The tool's output string (not yet wrapped in <tool_result> tags)
+    ///
+    /// Returns:
+    /// - Continue((tool_call_id, modified_output)): Use the (possibly modified) result
+    /// - Cancel(reason): Skip adding this tool result to history
+    async fn after_tool_result_build(
+        &self,
+        _tool_name: String,
+        _tool_args: serde_json::Value,
+        tool_call_id: Option<String>,
+        output: String,
+    ) -> HookResult<(Option<String>, String)> {
+        HookResult::Continue((tool_call_id, output))
     }
 }
 

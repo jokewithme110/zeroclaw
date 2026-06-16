@@ -1,6 +1,8 @@
 pub mod builtin;
 mod runner;
 mod traits;
+#[cfg(feature = "plugins-wasm")]
+pub mod wasm;
 
 pub use runner::HookRunner;
 // HookHandler and HookResult are part of the crate's public hook API surface.

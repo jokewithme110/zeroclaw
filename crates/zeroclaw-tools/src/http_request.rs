@@ -424,33 +424,24 @@ impl Tool for HttpRequestTool {
                 let status = response.status();
                 let status_code = status.as_u16();
 
-                // Get response headers (redact sensitive ones)
-                let response_headers = response.headers().iter();
-                let headers_text = response_headers
-                    .map(|(k, _)| {
-                        let is_sensitive = k.as_str().to_lowercase().contains("set-cookie");
-                        if is_sensitive {
-                            format!("{}: ***REDACTED***", k.as_str())
-                        } else {
-                            format!("{}: {:?}", k.as_str(), k.as_str())
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-
                 // Get response body with size limit
                 let response_text = match response.text().await {
                     Ok(text) => self.truncate_response(&text),
                     Err(e) => format!("[Failed to read response body: {e}]"),
                 };
 
-                let output = format!(
-                    "Status: {} {}\nResponse Headers: {}\n\nResponse Body:\n{}",
-                    status_code,
-                    status.canonical_reason().unwrap_or("Unknown"),
-                    headers_text,
+                let output = if status.is_success() {
+                    // Only return body for successful requests
                     response_text
-                );
+                } else {
+                    // Include status for errors
+                    format!(
+                        "HTTP {}: {}\n\n{}",
+                        status_code,
+                        status.canonical_reason().unwrap_or("Unknown"),
+                        response_text
+                    )
+                };
 
                 Ok(ToolResult {
                     success: status.is_success(),
