@@ -155,6 +155,9 @@ impl Observer for LangfuseObserver {
             ObserverEvent::AgentStart {
                 model_provider,
                 model,
+                channel: _,
+                agent_alias: _,
+                turn_id: _,
             } => {
                 let mut root = self.tracer.build(
                     opentelemetry::trace::SpanBuilder::from_name("agent.invocation")
@@ -189,6 +192,9 @@ impl Observer for LangfuseObserver {
                 input_tokens,
                 cached_input_tokens,
                 output_tokens,
+                channel: _,
+                agent_alias: _,
+                turn_id: _,
                 cost_usd,
                 output_text,
                 output_tool_calls_json,
@@ -351,8 +357,7 @@ impl Observer for LangfuseObserver {
                 cost_usd,
                 ..
             } => {
-                let mut root_guard = self.current_root.lock();
-                let Some(mut root) = root_guard.take() else {
+                let Some(mut root) = self.current_root.lock().take() else {
                     return;
                 };
 
@@ -360,7 +365,8 @@ impl Observer for LangfuseObserver {
                 let secs = duration.as_secs_f64();
                 root.set_attribute(KeyValue::new("duration_s", secs));
                 if let Some(t) = tokens_used {
-                    root.set_attribute(KeyValue::new("tokens_used", *t as i64));
+                    let total_tokens = t.input_tokens + t.output_tokens;
+                    root.set_attribute(KeyValue::new("tokens_used", total_tokens as i64));
                 }
                 if let Some(c) = cost_usd {
                     root.set_attribute(KeyValue::new(
@@ -369,6 +375,7 @@ impl Observer for LangfuseObserver {
                     ));
                 }
                 root.end();
+                self.flush();
             }
 
             // ── Ignored events ──────────────────────────────────────
