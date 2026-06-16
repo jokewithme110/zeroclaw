@@ -11719,7 +11719,10 @@ impl ChannelsConfig {
     /// entries (e.g. partially-configured or disabled bots) must not start the
     /// supervisor, otherwise it exits immediately and restarts in a tight loop.
     pub fn has_any_enabled(&self) -> bool {
-        self.telegram.values().any(|c| c.enabled)
+        self.bot_service
+            .values()
+            .any(|c| c.enabled && !c.ws_url.trim().is_empty())
+            || self.telegram.values().any(|c| c.enabled)
             || self.discord.values().any(|c| c.enabled)
             || self.slack.values().any(|c| c.enabled)
             || self.mattermost.values().any(|c| c.enabled)
@@ -11860,6 +11863,9 @@ fn default_matrix_draft_update_interval_ms() -> u64 {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.bot_service"]
 pub struct BotServiceConfig {
+    /// Whether this channel is active.
+    #[serde(default)]
+    pub enabled: bool,
     /// Base WebSocket URL for iCenter BotService (e.g. "ws://host:port/zte-icenter-igpt-coclaw/clawbot").
     pub ws_url: String,
     /// Optional secret key appended as ?key= when not already present in ws_url.

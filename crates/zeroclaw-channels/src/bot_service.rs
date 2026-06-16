@@ -190,6 +190,24 @@ impl BotServiceChannel {
     }
     async fn connect(&self) -> Result<()> {
         let ws_url = self.build_ws_url()?;
+        let via_proxy = self
+            .cfg
+            .http_proxy
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty());
+        zeroclaw_log::record!(
+            INFO,
+            zeroclaw_log::Event::new("bot_service", zeroclaw_log::Action::Connect)
+                .with_category(zeroclaw_log::EventCategory::Channel)
+                .with_outcome(zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(serde_json::json!({
+                    "url": sanitize_ws_url_for_log(&ws_url),
+                    "via_proxy": via_proxy,
+                    "account_id_present": self.cfg.account_id.as_deref().is_some_and(|v| !v.trim().is_empty()),
+                    "allowed_from_count": self.cfg.allowed_from.len(),
+                })),
+            "Starting WebSocket dial",
+        );
         let mut request = ws_url.as_str().into_client_request()?;
         if let Some(account_id) = self.cfg.account_id.as_deref().map(str::trim)
             && !account_id.is_empty()
@@ -273,6 +291,17 @@ impl BotServiceChannel {
                 *self.conn_write.lock().await = Some(write_half);
                 *self.conn_read.lock().await = Some(read_half);
                 self.closed.store(false, Ordering::SeqCst);
+                zeroclaw_log::record!(
+                    INFO,
+                    zeroclaw_log::Event::new("bot_service", zeroclaw_log::Action::Connect)
+                        .with_category(zeroclaw_log::EventCategory::Channel)
+                        .with_outcome(zeroclaw_log::EventOutcome::Success)
+                        .with_attrs(serde_json::json!({
+                            "url": sanitize_ws_url_for_log(&ws_url),
+                            "via_proxy": via_proxy,
+                        })),
+                    "WebSocket connected",
+                );
                 Ok(())
             }
             Err(err) => {
@@ -301,6 +330,13 @@ impl BotServiceChannel {
         let mut backoff = self.reconnect_initial_delay;
         loop {
             if self.closed.load(Ordering::SeqCst) {
+                zeroclaw_log::record!(
+                    INFO,
+                    zeroclaw_log::Event::new("bot_service", zeroclaw_log::Action::Note)
+                        .with_category(zeroclaw_log::EventCategory::Channel)
+                        .with_outcome(zeroclaw_log::EventOutcome::Success),
+                    "Read loop exiting because channel is closed",
+                );
                 return;
             }
             let has_reader = self.conn_read.lock().await.is_some();
@@ -308,10 +344,13 @@ impl BotServiceChannel {
                 if let Err(err) = self.connect().await {
                     zeroclaw_log::record!(
                         WARN,
-                        zeroclaw_log::Event::new("bot_service", zeroclaw_log::Action::Retry)
+                        zeroclaw_log::Event::new("bot_service", zeroclaw_log::Action::Reconnect)
                             .with_category(zeroclaw_log::EventCategory::Channel)
                             .with_outcome(zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(serde_json::json!({ "error": err.to_string() })),
+                            .with_attrs(serde_json::json!({
+                                "error": err.to_string(),
+                                "next_backoff_secs": backoff.as_secs(),
+                            })),
                         "Reconnect failed",
                     );
                     sleep(backoff).await;
@@ -319,6 +358,16 @@ impl BotServiceChannel {
                         next_backoff(backoff, self.reconnect_max_delay, self.reconnect_multiplier);
                     continue;
                 }
+                zeroclaw_log::record!(
+                    INFO,
+                    zeroclaw_log::Event::new("bot_service", zeroclaw_log::Action::Reconnect)
+                        .with_category(zeroclaw_log::EventCategory::Channel)
+                        .with_outcome(zeroclaw_log::EventOutcome::Success)
+                        .with_attrs(serde_json::json!({
+                            "reset_backoff_secs": self.reconnect_initial_delay.as_secs(),
+                        })),
+                    "Reconnect succeeded; resetting backoff",
+                );
                 backoff = self.reconnect_initial_delay;
                 continue;
             }
@@ -344,7 +393,36 @@ impl BotServiceChannel {
                         );
                     }
                 }
-                Ok(Some(Err(_))) | Ok(None) => {
+                Ok(Some(Err(err))) => {
+                    zeroclaw_log::record!(
+                        WARN,
+                        zeroclaw_log::Event::new("bot_service", zeroclaw_log::Action::Receive)
+                            .with_category(zeroclaw_log::EventCategory::Channel)
+                            .with_outcome(zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(serde_json::json!({
+                                "error": err.to_string(),
+                                "next_backoff_secs": backoff.as_secs(),
+                            })),
+                        "WebSocket read failed",
+                    );
+                    *read_guard = None;
+                    *self.conn_write.lock().await = None;
+                    drop(read_guard);
+                    sleep(backoff).await;
+                    backoff =
+                        next_backoff(backoff, self.reconnect_max_delay, self.reconnect_multiplier);
+                }
+                Ok(None) => {
+                    zeroclaw_log::record!(
+                        WARN,
+                        zeroclaw_log::Event::new("bot_service", zeroclaw_log::Action::Disconnect)
+                            .with_category(zeroclaw_log::EventCategory::Channel)
+                            .with_outcome(zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(serde_json::json!({
+                                "next_backoff_secs": backoff.as_secs(),
+                            })),
+                        "WebSocket stream ended; scheduling reconnect",
+                    );
                     *read_guard = None;
                     *self.conn_write.lock().await = None;
                     drop(read_guard);
@@ -353,6 +431,13 @@ impl BotServiceChannel {
                         next_backoff(backoff, self.reconnect_max_delay, self.reconnect_multiplier);
                 }
                 Err(_) => {
+                    zeroclaw_log::record!(
+                        DEBUG,
+                        zeroclaw_log::Event::new("bot_service", zeroclaw_log::Action::Receive)
+                            .with_category(zeroclaw_log::EventCategory::Channel)
+                            .with_outcome(zeroclaw_log::EventOutcome::Unknown),
+                        "WebSocket read timeout; keeping connection open",
+                    );
                     drop(read_guard);
                 }
             }
@@ -408,6 +493,16 @@ impl BotServiceChannel {
             return Ok(());
         }
         if !self.is_sender_allowed(&inbound.chat_uuid) {
+            zeroclaw_log::record!(
+                INFO,
+                zeroclaw_log::Event::new("bot_service", zeroclaw_log::Action::Reject)
+                    .with_category(zeroclaw_log::EventCategory::Channel)
+                    .with_outcome(zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(serde_json::json!({
+                        "chat_uuid": inbound.chat_uuid,
+                    })),
+                "Inbound message rejected by allowed_from",
+            );
             return Ok(());
         }
         if let Some(id) = inbound.msg_id {
@@ -441,11 +536,29 @@ impl BotServiceChannel {
         loop {
             interval.tick().await;
             if self.closed.load(Ordering::SeqCst) {
+                zeroclaw_log::record!(
+                    INFO,
+                    zeroclaw_log::Event::new("bot_service", zeroclaw_log::Action::Note)
+                        .with_category(zeroclaw_log::EventCategory::Channel)
+                        .with_outcome(zeroclaw_log::EventOutcome::Success),
+                    "Heartbeat loop exiting because channel is closed",
+                );
                 return;
             }
             let mut guard = self.conn_write.lock().await;
-            if let Some(writer) = guard.as_mut() {
-                let _ = writer.send(WsMessage::Ping(b"ping".to_vec().into())).await;
+            if let Some(writer) = guard.as_mut()
+                && let Err(err) = writer.send(WsMessage::Ping(b"ping".to_vec().into())).await
+            {
+                zeroclaw_log::record!(
+                    WARN,
+                    zeroclaw_log::Event::new("bot_service", zeroclaw_log::Action::Send)
+                        .with_category(zeroclaw_log::EventCategory::Channel)
+                        .with_outcome(zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(serde_json::json!({
+                            "error": err.to_string(),
+                        })),
+                    "Heartbeat ping failed",
+                );
             }
         }
     }
@@ -517,18 +630,70 @@ impl Channel for BotServiceChannel {
                 return Err(Error::msg("bot_service websocket not connected"));
             }
         };
+        zeroclaw_log::record!(
+            DEBUG,
+            zeroclaw_log::Event::new("bot_service", zeroclaw_log::Action::Outbound)
+                .with_category(zeroclaw_log::EventCategory::Channel)
+                .with_outcome(zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(serde_json::json!({
+                    "chat_uuid": chat_uuid,
+                    "payload_len": payload.len(),
+                    "has_reply_message_id": !outbound.bo.message_id.is_empty(),
+                })),
+            "Sending outbound message",
+        );
         writer.send(WsMessage::Text(payload.into())).await?;
         Ok(())
     }
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
         self.closed.store(false, Ordering::SeqCst);
-        self.connect().await?;
+        zeroclaw_log::record!(
+            INFO,
+            zeroclaw_log::Event::new("bot_service", zeroclaw_log::Action::Start)
+                .with_category(zeroclaw_log::EventCategory::Channel)
+                .with_outcome(zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(serde_json::json!({
+                    "ws_url_present": !self.cfg.ws_url.trim().is_empty(),
+                    "proxy_enabled": self.cfg.http_proxy.as_deref().is_some_and(|v| !v.trim().is_empty()),
+                    "account_id_present": self.cfg.account_id.as_deref().is_some_and(|v| !v.trim().is_empty()),
+                    "allowed_from_count": self.cfg.allowed_from.len(),
+                    "heartbeat_secs": self.heartbeat_interval.as_secs(),
+                })),
+            "BotService listen starting",
+        );
+        if let Err(err) = self.connect().await {
+            zeroclaw_log::record!(
+                ERROR,
+                zeroclaw_log::Event::new("bot_service", zeroclaw_log::Action::Connect)
+                    .with_category(zeroclaw_log::EventCategory::Channel)
+                    .with_outcome(zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(serde_json::json!({
+                        "error": err.to_string(),
+                    })),
+                "Initial connect failed; bot_service listener will not enter background loops",
+            );
+            return Err(err);
+        }
+        zeroclaw_log::record!(
+            INFO,
+            zeroclaw_log::Event::new("bot_service", zeroclaw_log::Action::Connect)
+                .with_category(zeroclaw_log::EventCategory::Channel)
+                .with_outcome(zeroclaw_log::EventOutcome::Success),
+            "Initial connect succeeded; starting read and heartbeat loops",
+        );
         let read_self = self.clone();
         zeroclaw_spawn::spawn!(async move { read_self.read_loop(tx).await });
         let hb_self = self.clone();
         zeroclaw_spawn::spawn!(async move { hb_self.heartbeat_loop().await });
         loop {
             if self.closed.load(Ordering::SeqCst) {
+                zeroclaw_log::record!(
+                    INFO,
+                    zeroclaw_log::Event::new("bot_service", zeroclaw_log::Action::Note)
+                        .with_category(zeroclaw_log::EventCategory::Channel)
+                        .with_outcome(zeroclaw_log::EventOutcome::Success),
+                    "Listen loop observed closed channel; exiting",
+                );
                 break;
             }
             sleep(Duration::from_secs(3600)).await;

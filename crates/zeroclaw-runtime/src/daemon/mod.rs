@@ -1629,6 +1629,51 @@ mod tests {
     }
 
     #[test]
+    fn detects_bot_service_as_supervised_channel() {
+        let mut config = Config::default();
+        config.channels.bot_service.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::BotServiceConfig {
+                enabled: true,
+                ws_url: "ws://example.com/zte-icenter-igpt-coclaw/clawbot".into(),
+                allowed_from: vec!["*".into()],
+                ..Default::default()
+            },
+        );
+        assert!(has_supervised_channels(&config));
+    }
+
+    #[test]
+    fn skips_disabled_bot_service_in_supervised_channel_check() {
+        let mut config = Config::default();
+        config.channels.bot_service.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::BotServiceConfig {
+                enabled: false,
+                ws_url: "ws://example.com/zte-icenter-igpt-coclaw/clawbot".into(),
+                allowed_from: vec!["*".into()],
+                ..Default::default()
+            },
+        );
+        assert!(!has_supervised_channels(&config));
+    }
+
+    #[test]
+    fn skips_bot_service_without_ws_url_in_supervised_channel_check() {
+        let mut config = Config::default();
+        config.channels.bot_service.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::BotServiceConfig {
+                enabled: true,
+                ws_url: String::new(),
+                allowed_from: vec!["*".into()],
+                ..Default::default()
+            },
+        );
+        assert!(!has_supervised_channels(&config));
+    }
+
+    #[test]
     fn detects_qq_as_supervised_channel() {
         let mut config = Config::default();
         config.channels.qq.insert(

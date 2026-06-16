@@ -6976,13 +6976,31 @@ fn collect_configured_channels(
     }
 
     for (alias, bs) in &config.channels.bot_service {
-        if !bs.ws_url.trim().is_empty() {
-            channels.push(ConfiguredChannel {
-                display_name: "BotService",
-                alias: Some(alias.clone()),
-                channel: Arc::new(BotServiceChannel::new(bs.clone())),
-            });
+        if !bs.enabled {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"alias": alias})),
+                "BotService channel is configured but disabled; skipping BotService."
+            );
+            continue;
         }
+        if bs.ws_url.trim().is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"alias": alias})),
+                "BotService channel is enabled but ws_url is empty; skipping BotService."
+            );
+            continue;
+        }
+        channels.push(ConfiguredChannel {
+            display_name: "BotService",
+            alias: Some(alias.clone()),
+            channel: Arc::new(BotServiceChannel::new(bs.clone())),
+        });
     }
 
     for (alias, wc) in &config.channels.webchat {
@@ -17876,6 +17894,80 @@ This is an example JSON object for profile settings."#;
                 .iter()
                 .any(|entry| entry.display_name == "Mattermost"),
             "enabled channels should still load when no enabled agent declares channel bindings"
+        );
+    }
+
+    #[test]
+    fn collect_configured_channels_includes_bot_service_when_enabled() {
+        let mut config = Config::default();
+        config.channels.bot_service.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::BotServiceConfig {
+                enabled: true,
+                ws_url: "ws://example.com/zte-icenter-igpt-coclaw/clawbot".to_string(),
+                allowed_from: vec!["*".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[]);
+
+        assert!(
+            channels
+                .iter()
+                .any(|entry| entry.display_name == "BotService")
+        );
+        assert!(
+            channels
+                .iter()
+                .any(|entry| entry.channel.name() == "bot_service")
+        );
+    }
+
+    #[test]
+    fn collect_configured_channels_skips_disabled_bot_service() {
+        let mut config = Config::default();
+        config.channels.bot_service.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::BotServiceConfig {
+                enabled: false,
+                ws_url: "ws://example.com/zte-icenter-igpt-coclaw/clawbot".to_string(),
+                allowed_from: vec!["*".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[]);
+        assert!(
+            !channels
+                .iter()
+                .any(|entry| entry.display_name == "BotService"),
+            "disabled bot_service should not be collected"
+        );
+    }
+
+    #[test]
+    fn collect_configured_channels_skips_bot_service_with_empty_ws_url() {
+        let mut config = Config::default();
+        config.channels.bot_service.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::BotServiceConfig {
+                enabled: true,
+                ws_url: String::new(),
+                allowed_from: vec!["*".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[]);
+        assert!(
+            !channels
+                .iter()
+                .any(|entry| entry.display_name == "BotService"),
+            "bot_service without ws_url should not be collected"
         );
     }
 
