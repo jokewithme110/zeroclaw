@@ -3453,6 +3453,7 @@ pub async fn run(
         } else {
             (None, None)
         };
+        let agent_workspace_dir = config.agent_workspace_dir(agent_alias);
         let all_tools_result = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
@@ -3465,7 +3466,7 @@ pub async fn run(
             &config.browser,
             &config.http_request,
             &config.web_fetch,
-            &config.data_dir,
+            &agent_workspace_dir,
             &config.agents,
             agent_model_provider.and_then(|e| e.api_key.as_deref()),
             &config,
@@ -4885,6 +4886,8 @@ pub async fn process_message(
         } else {
             (None, None)
         };
+
+        let agent_workspace_dir = config.agent_workspace_dir(agent_alias);
         let all_tools_result_pm = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
@@ -4897,7 +4900,7 @@ pub async fn process_message(
             &config.browser,
             &config.http_request,
             &config.web_fetch,
-            &config.data_dir,
+            &agent_workspace_dir,
             &config.agents,
             agent_model_provider
                 .as_ref()
