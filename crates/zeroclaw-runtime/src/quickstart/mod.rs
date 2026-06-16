@@ -751,6 +751,8 @@ fn apply_into(
     errors: &mut Vec<QuickstartError>,
     ctx: Option<&RunCtx>,
 ) -> Option<AppliedAgent> {
+    materialize_default_skills_bundle(config);
+
     let provider_ref = apply_model_provider(config, &submission.model_provider, errors)?;
     emit_selector_pick(
         ctx,
@@ -855,8 +857,6 @@ fn apply_into(
         staged_files,
         errors,
     );
-
-    materialize_default_skills_bundle(config);
 
     if !errors.is_empty() {
         return None;
@@ -1502,7 +1502,7 @@ fn commit_personality_files(
 // ── Default skills bundle FTUE ─────────────────────────────────────
 
 fn materialize_default_skills_bundle(config: &mut Config) {
-    if !config.skill_bundles.is_empty() {
+    if config.skill_bundles.contains_key("default") {
         return;
     }
     // create_map_key returns Ok(false) on existing key (idempotent),
@@ -1571,6 +1571,17 @@ fn apply_agent(
             errors.push(QuickstartError::new(
                 QuickstartStep::Agent,
                 "channels",
+                err.to_string(),
+            ));
+            return None;
+        }
+    }
+    if config.skill_bundles.contains_key("default") {
+        let path = format!("{prefix}.skill-bundles");
+        if let Err(err) = config.set_prop_persistent(&path, "[\"default\"]") {
+            errors.push(QuickstartError::new(
+                QuickstartStep::Agent,
+                "skill_bundles",
                 err.to_string(),
             ));
             return None;
@@ -1983,6 +1994,24 @@ mod tests {
         let agent = reloaded.agents.get("bot").expect("agent persisted");
         assert_eq!(agent.risk_profile, "balanced");
         assert_eq!(agent.runtime_profile, "unbounded");
+    }
+
+    #[tokio::test]
+    async fn quickstart_new_agent_gets_default_skill_bundle() {
+        let (dir, _applied) = apply_to_temp(fresh_submission("bot")).await;
+        let reloaded = reload(&dir);
+
+        assert!(
+            reloaded.skill_bundles.contains_key("default"),
+            "quickstart should ensure skill_bundles.default exists"
+        );
+
+        let agent = reloaded.agents.get("bot").expect("agent persisted");
+        assert_eq!(
+            agent.skill_bundles,
+            vec!["default".to_string()],
+            "new quickstart agents should default to the shared default skill bundle"
+        );
     }
 
     #[tokio::test]

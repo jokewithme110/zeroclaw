@@ -70,6 +70,7 @@ cli-wechat-invalid-bind-code = ❌ Invalid bind code. Please try again.
 cli-skills-list-about = List all installed skills
 cli-skills-audit-about = Audit a skill source directory or installed skill name
 cli-skills-install-about = Install a new skill from a URL or local path
+cli-skills-bootstrap-templates-about = Bootstrap the built-in template skills in the local skills directory
 cli-skills-remove-about = Remove an installed skill
 cli-skills-test-about = Run TEST.sh validation for a skill (or all skills)
 cli-skills-install-start = Installing skill from: {$source}
@@ -82,6 +83,8 @@ cli-skills-install-tier-community =
     This skill is not audited by ZeroClaw. Review the skill content
     and run `zeroclaw skills audit {$name}` before granting any
     permissions or running it in production.
+cli-skills-bootstrap-created = Bootstrapped {$count} template files under {$dir}
+cli-skills-bootstrap-existing = Built-in template skills already exist under {$dir}
 
 cli-skills-add-scaffolded = Scaffolded skill {$target} at {$dir}
 

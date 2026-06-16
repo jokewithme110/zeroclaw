@@ -17,6 +17,7 @@ use zeroclaw_skill_security::types::ScanStatus;
 use zip::ZipArchive;
 
 pub mod audit;
+pub mod bootstrap;
 pub mod bundle;
 pub mod constants;
 pub mod creator;
@@ -29,6 +30,7 @@ pub mod service;
 mod suggestions;
 pub mod testing;
 
+pub use bootstrap::{BootstrapSummary, bootstrap_builtin_template_skills};
 pub use bundle::{BundleError, BundleSummary};
 pub use document::{DocumentParseError, SkillDocument};
 pub use frontmatter::SkillFrontmatter;

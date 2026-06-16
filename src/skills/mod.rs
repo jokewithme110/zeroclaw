@@ -4,7 +4,9 @@ pub use zeroclaw_runtime::skills::*;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
-use zeroclaw_runtime::skills::{ScaffoldOptions, SkillFrontmatter, SkillsService};
+use zeroclaw_runtime::skills::{
+    ScaffoldOptions, SkillFrontmatter, SkillsService, bootstrap_builtin_template_skills,
+};
 pub mod creator {
     #[allow(unused_imports)]
     pub use zeroclaw_runtime::skills::creator::*;
@@ -182,6 +184,38 @@ pub async fn handle_command(
                 "{}",
                 get_required_cli_string("cli-skills-install-security-audit-completed")
             );
+            Ok(())
+        }
+        crate::SkillCommands::BootstrapTemplates => {
+            let install_root = config.install_root_dir();
+            let mut working = config.clone();
+            let summary = bootstrap_builtin_template_skills(&mut working)?;
+            let skills_dir = zeroclaw_config::skill_bundles::resolve_directory(
+                &working,
+                &install_root,
+                "default",
+            )
+            .with_context(|| "failed to resolve default skill bundle directory")?;
+            if summary.files_created == 0 {
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-bootstrap-existing",
+                        &[("dir", &skills_dir.display().to_string())],
+                    )
+                );
+            } else {
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-bootstrap-created",
+                        &[
+                            ("count", &summary.files_created.to_string()),
+                            ("dir", &skills_dir.display().to_string()),
+                        ],
+                    )
+                );
+            }
             Ok(())
         }
         crate::SkillCommands::Remove { name } => {

@@ -419,6 +419,8 @@ Examples:
         #[arg(long)]
         no_tier_banner: bool,
     },
+    /// Bootstrap the built-in template skills in the local skills directory
+    BootstrapTemplates,
     /// Remove an installed skill
     Remove {
         /// Skill name to remove
