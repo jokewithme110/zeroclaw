@@ -971,38 +971,66 @@ impl From<RawResponseMessage> for ResponseMessage {
 }
 
 impl ResponseMessage {
-    /// Extract text content, falling back to `reasoning_content` when `content`
-    /// is missing or empty. Reasoning/thinking models (Qwen3, GLM-4, etc.)
-    /// often return their output solely in `reasoning_content`.
-    /// Strips `<think>...</think>` blocks that some models (e.g. MiniMax) embed
-    /// inline in `content` instead of using a separate field.
-    fn effective_content(&self) -> String {
-        if let Some(content) = self.content.as_ref().filter(|c| !c.is_empty()) {
-            let stripped = strip_think_tags(content);
-            if !stripped.is_empty() {
-                return stripped;
-            }
+    /// Resolve the user-visible text for this assistant message.
+    ///
+    /// Selection rules:
+    /// - Prefer `content` after stripping any inline `<think>...</think>` blocks.
+    /// - If visible `content` is empty and native `tool_calls` are present,
+    ///   return `None` so tool-call turns do not surface reasoning text.
+    /// - Otherwise fall back to `reasoning_content` after stripping
+    ///   `<think>...</think>` blocks.
+    fn effective_content_optional(&self) -> Option<String> {
+        let stripped_content = self
+            .content
+            .as_ref()
+            .filter(|c| !c.is_empty())
+            .map(|content| strip_think_tags(content))
+            .filter(|content| !content.is_empty());
+        let stripped_reasoning = self
+            .reasoning_content
+            .as_ref()
+            .filter(|c| !c.is_empty())
+            .map(|reasoning| strip_think_tags(reasoning))
+            .filter(|reasoning| !reasoning.is_empty());
+
+        if let Some(content) = stripped_content {
+            return Some(content);
         }
 
-        self.reasoning_content
+        if self
+            .tool_calls
             .as_ref()
-            .map(|c| strip_think_tags(c))
-            .filter(|c| !c.is_empty())
-            .unwrap_or_default()
+            .is_some_and(|tool_calls| !tool_calls.is_empty())
+        {
+            return None;
+        }
+
+        if self.content.as_deref().is_some_and(str::is_empty)
+            && let Some(reasoning) = self
+                .reasoning_content
+                .as_deref()
+                .filter(|reasoning| !reasoning.is_empty())
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"reasoning_len": reasoning.len()})),
+                "Received empty content with no tool_calls but non-empty reasoning_content; no heuristic extraction applied"
+            );
+        }
+
+        if let Some(reasoning) = stripped_reasoning {
+            return Some(reasoning);
+        }
+
+        None
     }
 
-    fn effective_content_optional(&self) -> Option<String> {
-        if let Some(content) = self.content.as_ref().filter(|c| !c.is_empty()) {
-            let stripped = strip_think_tags(content);
-            if !stripped.is_empty() {
-                return Some(stripped);
-            }
-        }
-
-        self.reasoning_content
-            .as_ref()
-            .map(|c| strip_think_tags(c))
-            .filter(|c| !c.is_empty())
+    /// Return the visible text as a concrete string, using `""` when
+    /// [`Self::effective_content_optional`] resolves to `None`.
+    fn effective_content(&self) -> String {
+        self.effective_content_optional().unwrap_or_default()
     }
 }
 
@@ -4875,6 +4903,27 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_content_not_used_as_visible_text_when_tool_calls_present() {
+        let json = r#"{
+            "choices":[{
+                "message":{
+                    "content":"",
+                    "reasoning_content":"I should call the weather tool.",
+                    "tool_calls":[{
+                        "id":"call_1",
+                        "type":"function",
+                        "function":{"name":"weather","arguments":"{}"}
+                    }]
+                }
+            }]
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        assert_eq!(msg.effective_content_optional(), None);
+        assert_eq!(msg.effective_content(), "");
+    }
+
+    #[test]
     fn reasoning_content_not_used_when_content_present() {
         // Normal model: content populated, reasoning_content should be ignored
         let json = r#"{"choices":[{"message":{"content":"Normal response","reasoning_content":"Should be ignored"}}]}"#;
@@ -4893,6 +4942,47 @@ mod tests {
             msg.effective_content_optional().as_deref(),
             Some("Fallback text")
         );
+    }
+
+    #[test]
+    fn non_empty_content_is_preserved_even_when_reasoning_differs() {
+        let json = r#"{"choices":[{"message":{
+            "content":"The model should think first.\n\nFinal answer for the user.",
+            "reasoning_content":"The model should think first."
+        }}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        assert_eq!(
+            msg.effective_content_optional().as_deref(),
+            Some("The model should think first.\n\nFinal answer for the user.")
+        );
+    }
+
+    #[test]
+    fn warning_condition_matches_empty_content_without_tool_calls() {
+        let message = ResponseMessage {
+            content: Some(String::new()),
+            reasoning_content: Some("reasoning plus answer".to_string()),
+            tool_calls: None,
+        };
+        assert!(message.content.as_deref().is_some_and(str::is_empty));
+        assert!(message.tool_calls.as_ref().is_none_or(Vec::is_empty));
+        assert!(
+            message
+                .reasoning_content
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+        );
+    }
+
+    #[test]
+    fn warning_condition_ignores_non_empty_content() {
+        let message = ResponseMessage {
+            content: Some("visible answer".to_string()),
+            reasoning_content: Some("reasoning".to_string()),
+            tool_calls: None,
+        };
+        assert!(!message.content.as_deref().is_some_and(str::is_empty));
     }
 
     #[test]
