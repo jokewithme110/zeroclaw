@@ -164,6 +164,17 @@ pub async fn handle_node_socket(
         {
             return;
         }
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "event": "node_registered",
+                    "peer": peer_addr.to_string(),
+                    "node_id": node_id.as_str(),
+                })
+            ),
+            "node registered successfully"
+        );
         break (node_id, rx);
     };
 

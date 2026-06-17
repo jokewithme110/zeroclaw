@@ -6086,6 +6086,57 @@ pub struct NodeControlConfig {
     /// When set, inbound requests must include `X-Node-Control-Token`.
     #[serde(default)]
     pub auth_token: Option<String>,
+    /// Auto-discovery via soft-bus FIFO pipe (`[gateway.node_control.auto_discovery]`).
+    #[serde(default)]
+    #[nested]
+    pub auto_discovery: NodeAutoDiscoveryConfig,
+}
+
+/// Auto-discovery configuration via FIFO pipe.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "gateway.node_control.auto_discovery"]
+pub struct NodeAutoDiscoveryConfig {
+    /// Enable auto-discovery via FIFO pipe.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directory containing FIFO pipes (default: `/var`).
+    #[serde(default = "default_fifo_dir")]
+    pub fifo_dir: String,
+    /// Timeout in seconds waiting for FIFO pipe to become ready (default: 300).
+    #[serde(default = "default_fifo_wait_timeout_secs")]
+    pub fifo_wait_timeout_secs: u64,
+    /// Number of retries for publishing gateway info (default: 5).
+    #[serde(default = "default_gateway_announce_retries")]
+    pub gateway_announce_retries: u32,
+    /// Optional network interface name to use for LAN IP (e.g., "br0", "eth0").
+    /// If not set, the first non-virtual IPv4 interface is used.
+    #[serde(default)]
+    pub ip_intf: Option<String>,
+}
+
+fn default_fifo_dir() -> String {
+    "/var".to_string()
+}
+
+fn default_fifo_wait_timeout_secs() -> u64 {
+    300
+}
+
+fn default_gateway_announce_retries() -> u32 {
+    5
+}
+
+impl Default for NodeAutoDiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            fifo_dir: default_fifo_dir(),
+            fifo_wait_timeout_secs: default_fifo_wait_timeout_secs(),
+            gateway_announce_retries: default_gateway_announce_retries(),
+            ip_intf: None,
+        }
+    }
 }
 
 /// Manually declared skill on the A2A agent card (`[[gateway.a2a.agent_skills]]` in TOML).

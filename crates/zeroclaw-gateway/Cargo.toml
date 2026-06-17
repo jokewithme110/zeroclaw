@@ -84,6 +84,9 @@ rcgen = "0.13"
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 
+[dependencies.local-ip-address]
+workspace = true
+
 [features]
 default = ["schema-export"]
 plugins-wasm = ["dep:zeroclaw-plugins"]
@@ -104,3 +107,4 @@ gateway-voice-duplex = []
 schema-export = ["zeroclaw-config/schema-export", "dep:schemars"]
 embedded-web = ["dep:include_dir"]
 node-control = []
+auto_discovery = ["node-control"]

@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use tokio::signal;
 
 mod executor;
+#[cfg(feature = "auto_discovery")]
+mod fifo_listener;
 mod handlers;
 mod node_runtime_trace;
 mod ws_client;
@@ -141,6 +143,7 @@ pub async fn run_node(
     port: Option<u16>,
     name: Option<String>,
     token: Option<String>,
+    auto_discovery: bool,
 ) -> Result<()> {
     #[derive(Deserialize)]
     struct NodeConfigFile {
@@ -256,7 +259,169 @@ pub async fn run_node(
         );
         return Ok(());
     }
+
+    #[cfg(feature = "auto_discovery")]
+    if auto_discovery {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "event": "node_auto_discovery_enabled",
+                    "fifo_dir": config.gateway.node_control.auto_discovery.fifo_dir.as_str(),
+                })
+            ),
+            "Starting node with FIFO auto-discovery"
+        );
+
+        return run_with_fifo_listener(
+            &config.gateway.node_control.auto_discovery.fifo_dir,
+            config
+                .gateway
+                .node_control
+                .auto_discovery
+                .fifo_wait_timeout_secs,
+            &effective_name,
+            &workspace_dir,
+            config,
+        )
+        .await;
+    }
+
+    let _ = auto_discovery;
+
     let url = format!("ws://{}:{}/", identity.gateway.host, identity.gateway.port);
+
     let stop = signal::ctrl_c();
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "event": "node_starting_static",
+                "host": identity.gateway.host.as_str(),
+                "port": identity.gateway.port,
+            })
+        ),
+        "Connecting to gateway with static configuration"
+    );
     ws_client::run_loop(url, &identity, stop).await
+}
+
+/// Run node with FIFO-based auto-discovery.
+#[cfg(feature = "auto_discovery")]
+async fn run_with_fifo_listener(
+    fifo_dir: &str,
+    timeout_secs: u64,
+    effective_name: &str,
+    _workspace_dir: &Path,
+    _config: &zeroclaw_config::schema::Config,
+) -> Result<()> {
+    use fifo_listener::{GatewayInfo, run_fifo_listener};
+
+    // Create a cancellation token for graceful shutdown
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let cancel_clone = cancel_token.clone();
+
+    // Run FIFO listener with automatic reconnection
+    let fifo_fut = run_fifo_listener(
+        fifo_dir,
+        timeout_secs,
+        cancel_token.clone(),
+        move |gateway_info: GatewayInfo| {
+            let effective_name = effective_name.to_string();
+            let cancel_token_inner = cancel_token.child_token();
+
+            async move {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "event": "node_connecting_to_gateway",
+                            "ip": gateway_info.ip.as_str(),
+                            "port": gateway_info.port,
+                        })),
+                    "Connecting to discovered gateway"
+                );
+
+                // Create temporary identity with discovered gateway info
+                let temp_identity = NodeIdentityFile {
+                    device_id: format!("zeroclaw-node-{}", uuid::Uuid::new_v4()),
+                    public_key_b64: String::new(),
+                    private_key_b64: String::new(),
+                    gateway: GatewayConfig {
+                        host: gateway_info.ip.clone(),
+                        port: gateway_info.port,
+                        token: Some(gateway_info.token.clone()),
+                    },
+                    display_name: Some(effective_name),
+                };
+
+                let ws_url = gateway_info.ws_url();
+                let cancel_for_ws = cancel_token_inner.clone();
+
+                let ws_fut = ws_client::run_loop(ws_url, &temp_identity, async move {
+                    cancel_for_ws.cancelled().await;
+                    Ok(())
+                });
+
+                tokio::select! {
+                    result = ws_fut => result,
+                    _ = cancel_token_inner.cancelled() => {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_attrs(::serde_json::json!({
+                                    "event": "node_websocket_cancelled",
+                                })),
+                            "WebSocket cancelled by shutdown signal"
+                        );
+                        Ok(())
+                    }
+                }
+            }
+        },
+    );
+    tokio::pin!(fifo_fut);
+
+    // Wait for either FIFO listener to complete or Ctrl+C signal
+    tokio::select! {
+        _ = signal::ctrl_c() => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "event": "node_shutdown_signal",
+                    })),
+                "Received shutdown signal"
+            );
+            cancel_clone.cancel();
+            if let Err(e) = (&mut fifo_fut).await {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "event": "node_fifo_listener_error",
+                            "error": e.to_string(),
+                        })),
+                    "FIFO listener failed during shutdown"
+                );
+            }
+        }
+        result = &mut fifo_fut => {
+            if let Err(e) = result {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "event": "node_fifo_listener_error",
+                            "error": e.to_string(),
+                        })),
+                    "FIFO listener failed"
+                );
+            }
+        }
+    }
+
+    Ok(())
 }

@@ -5826,6 +5826,11 @@ async fn main() -> Result<()> {
             name,
             token,
         } => {
+            #[cfg(feature = "auto_discovery")]
+            let auto_discovery = config.gateway.node_control.auto_discovery.enabled;
+            #[cfg(not(feature = "auto_discovery"))]
+            let auto_discovery = false;
+
             dt_nodes::run_node(
                 &config,
                 interactive,
@@ -5835,6 +5840,7 @@ async fn main() -> Result<()> {
                 port,
                 name,
                 token,
+                auto_discovery,
             )
             .await
         }

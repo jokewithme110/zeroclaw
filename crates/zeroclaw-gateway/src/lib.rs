@@ -30,6 +30,8 @@ pub mod api_webauthn;
 pub mod auth_rate_limit;
 pub mod canvas;
 pub mod hardware_context;
+#[cfg(feature = "auto_discovery")]
+pub mod node_control;
 pub mod node_tool;
 pub mod nodes;
 pub mod nodes_server;
@@ -545,6 +547,9 @@ pub async fn run_gateway(
     tui_registry: Option<Arc<zeroclaw_runtime::rpc::tui_identity::TuiRegistry>>,
     canvas_store: Option<CanvasStore>,
 ) -> Result<()> {
+    #[allow(unused_mut)]
+    let mut config = config;
+
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
         && config.tunnel.tunnel_provider == "none"
@@ -560,6 +565,79 @@ pub async fn run_gateway(
              Docker/VM: if you are running inside a container or VM, this is expected."
         );
     }
+    #[cfg(feature = "auto_discovery")]
+    let node_control_mgr = if config.gateway.node_control.enabled {
+        let zeroclaw_dir = config
+            .config_path
+            .parent()
+            .unwrap_or(config.data_dir.as_path());
+        let secret_store = Arc::new(zeroclaw_config::secrets::SecretStore::new(
+            zeroclaw_dir,
+            config.secrets.encrypt,
+        ));
+        let mgr = Arc::new(node_control::NodeControlManager::new(
+            config.gateway.node_control.clone(),
+            config.gateway.paired_tokens.clone(),
+            config.config_path.clone(),
+            config.secrets.encrypt,
+            secret_store,
+        ));
+
+        if config.gateway.node_control.auto_discovery.enabled {
+            match mgr.initialize_paired_tokens().await {
+                Ok(initialized) => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_attrs(::serde_json::json!({
+                                "event": "node_control_paired_tokens_initialized",
+                                "token_count": initialized.paired_tokens.len(),
+                                "needs_persist": initialized.needs_persist,
+                            })),
+                        "Initialized gateway.paired_tokens for node auto-discovery"
+                    );
+
+                    config.gateway.paired_tokens = initialized.paired_tokens;
+
+                    if initialized.needs_persist
+                        && let Err(error) = config.save().await
+                    {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Save
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "event": "node_control_paired_token_persist_failed",
+                                "error": error.to_string(),
+                            })),
+                            "Failed to persist gateway.paired_tokens after auto-discovery initialization"
+                        );
+                    }
+                }
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "event": "node_control_paired_token_init_failed",
+                                "error": error.to_string(),
+                            })),
+                        "Failed to initialize gateway.paired_tokens for auto-discovery"
+                    );
+                }
+            }
+        }
+
+        Some(mgr)
+    } else {
+        None
+    };
+
     let config_state = Arc::new(RwLock::new(config.clone()));
 
     // ── Hooks ──────────────────────────────────────────────────────
@@ -1434,6 +1512,23 @@ pub async fn run_gateway(
 
     // Node registry for dynamic node discovery
     let node_registry = Arc::new(nodes::NodeRegistry::new(config.nodes.max_nodes));
+
+    #[cfg(feature = "auto_discovery")]
+    if let Some(mgr) = node_control_mgr.as_ref()
+        && mgr.is_auto_discovery_enabled()
+        && let Err(error) = mgr.publish_gateway_info(actual_port).await
+    {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "event": "gateway_info_publish_failed",
+                    "error": error.to_string(),
+                })),
+            "Failed to publish gateway info to soft-bus"
+        );
+    }
 
     // Device registry and pairing store (only when pairing is required)
     let device_registry = if config.gateway.require_pairing {
@@ -3892,8 +3987,11 @@ mod tests {
 
     /// Generate a random hex secret at runtime to avoid hard-coded cryptographic values.
     fn generate_test_secret() -> String {
-        let bytes: [u8; 32] = rand::random();
-        hex::encode(bytes)
+        format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        )
     }
 
     #[test]
