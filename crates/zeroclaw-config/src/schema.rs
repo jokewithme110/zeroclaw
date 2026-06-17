@@ -6060,6 +6060,10 @@ pub struct GatewayConfig {
     /// Default: 600s (10 minutes).
     #[serde(default = "default_gateway_long_running_request_timeout_secs")]
     pub long_running_request_timeout_secs: u64,
+    /// Node capability control configuration (`[gateway.capability_control]`).
+    #[serde(default)]
+    #[nested]
+    pub capability_control: GatewayCapabilityControlConfig,
     /// Enable node control (WebSocket nodes + nodes tool)
     #[serde(default)]
     #[nested]
@@ -6137,6 +6141,20 @@ impl Default for NodeAutoDiscoveryConfig {
             ip_intf: None,
         }
     }
+}
+
+/// Node capability control configuration (`[gateway.capability_control]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "gateway.capability_control"]
+pub struct GatewayCapabilityControlConfig {
+    /// Enable node capability control.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Optional capability control config path.
+    /// Relative paths are resolved from the workspace directory.
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 /// Manually declared skill on the A2A agent card (`[[gateway.a2a.agent_skills]]` in TOML).
@@ -6274,6 +6292,7 @@ impl Default for GatewayConfig {
             tls: None,
             request_timeout_secs: default_gateway_request_timeout_secs(),
             long_running_request_timeout_secs: default_gateway_long_running_request_timeout_secs(),
+            capability_control: GatewayCapabilityControlConfig::default(),
             node_control: NodeControlConfig::default(),
             a2a: A2aConfig::default(),
         }

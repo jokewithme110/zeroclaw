@@ -29,6 +29,7 @@ pub mod dt_nodes_tool;
 pub mod file_read;
 pub mod model_switch;
 pub mod native_deferred;
+pub mod nodes_capability;
 pub mod read_skill;
 pub mod schedule;
 pub mod security_ops;
@@ -706,8 +707,13 @@ pub fn all_tools_with_runtime(
             Arc::new(move || cleanup_config_from_config(config.as_ref()))
         };
         tool_arcs.push(Arc::new(
-            NodesTool::new(ConnectedNodeRegistry::global(), workspace_dir)
-                .with_cleanup_config_resolver(cleanup_config_resolver),
+            NodesTool::new_with_capability_control_root(
+                ConnectedNodeRegistry::global(),
+                workspace_dir,
+                &root_config.data_dir,
+                config.gateway.capability_control.clone(),
+            )
+            .with_cleanup_config_resolver(cleanup_config_resolver),
         ));
     }
 

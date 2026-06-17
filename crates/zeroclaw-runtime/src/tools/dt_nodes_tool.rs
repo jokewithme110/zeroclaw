@@ -5,15 +5,18 @@
 //! list, describe, invoke, and run actions to the agent.
 
 use super::{Tool, ToolResult};
-use crate::dt_nodes_registry::node_registry::NodeInfo;
-use crate::dt_nodes_registry::node_registry::NodeRegistry;
+use crate::dt_nodes_registry::node_registry::{NodeCommandResult, NodeInfo, NodeRegistry};
 use anyhow::Result;
 use async_trait::async_trait;
 use base64::Engine as _;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zeroclaw_api::attribution::{Attributable, Role, ToolKind};
+use zeroclaw_config::schema::GatewayCapabilityControlConfig;
+
+use super::nodes_capability::wrap_node_registry;
+
 type CleanupConfigResolver =
     Arc<dyn Fn() -> zeroclaw_infra::temp_file_manager::TempFileConfig + Send + Sync>;
 /// Tool that exposes node list, describe, invoke, and run to the agent.
@@ -28,9 +31,43 @@ pub struct NodesTool {
 
 impl NodesTool {
     pub fn new(registry: Arc<dyn NodeRegistry>, workspace_dir: impl Into<PathBuf>) -> Self {
-        Self {
+        Self::new_with_capability_control(
             registry,
-            workspace_dir: workspace_dir.into(),
+            workspace_dir,
+            GatewayCapabilityControlConfig::default(),
+        )
+    }
+
+    pub fn new_with_capability_control(
+        registry: Arc<dyn NodeRegistry>,
+        workspace_dir: impl Into<PathBuf>,
+        capability_control: GatewayCapabilityControlConfig,
+    ) -> Self {
+        let workspace_dir = workspace_dir.into();
+        Self::new_with_capability_control_root(
+            registry,
+            workspace_dir.clone(),
+            &workspace_dir,
+            capability_control,
+        )
+    }
+
+    pub fn new_with_capability_control_root(
+        registry: Arc<dyn NodeRegistry>,
+        workspace_dir: impl Into<PathBuf>,
+        capability_control_dir: impl AsRef<Path>,
+        capability_control: GatewayCapabilityControlConfig,
+    ) -> Self {
+        let workspace_dir = workspace_dir.into();
+        Self {
+            // Keep capability filtering isolated in its own helper module so the tool
+            // entrypoint stays close to the original implementation.
+            registry: wrap_node_registry(
+                registry,
+                capability_control_dir.as_ref(),
+                &capability_control,
+            ),
+            workspace_dir,
             cleanup_config_resolver: None,
         }
     }
@@ -217,6 +254,40 @@ impl NodesTool {
     fn format_json_output(value: &Value) -> String {
         serde_json::to_string_pretty(value)
             .unwrap_or_else(|_| serde_json::to_string(value).unwrap_or_default())
+    }
+
+    fn tool_result_from_node_result(res: NodeCommandResult) -> ToolResult {
+        let payload = Self::parse_result_output(&res.output);
+        ToolResult {
+            success: res.success,
+            output: Self::format_json_output(&payload),
+            error: res.error,
+        }
+    }
+
+    async fn invoke_node_capability(
+        &self,
+        node_id: &str,
+        capability: &str,
+        params: Value,
+    ) -> Result<NodeCommandResult> {
+        self.registry
+            .invoke(node_id, capability, params)
+            .await
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "node_id": node_id,
+                            "capability": capability,
+                            "error": e.to_string()
+                        })),
+                    "invoke failed"
+                );
+                anyhow::Error::msg(format!("invoke failed: {e}"))
+            })
     }
 
     fn parse_env_pairs(args: &Value) -> Option<Value> {
@@ -423,26 +494,9 @@ impl NodesTool {
         params: Value,
     ) -> Result<ToolResult> {
         let res = self
-            .registry
-            .invoke(node_id, capability, params)
-            .await
-            .map_err(|e| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"node_id" : node_id, "capability" : capability, "error" : e.to_string()})),
-                    "invoke failed"
-                );
-                anyhow::Error::msg(format!("invoke failed: {e}"))
-            })?;
-
-        let payload = Self::parse_result_output(&res.output);
-        Ok(ToolResult {
-            success: res.success,
-            output: Self::format_json_output(&payload),
-            error: res.error,
-        })
+            .invoke_node_capability(node_id, capability, params)
+            .await?;
+        Ok(Self::tool_result_from_node_result(res))
     }
 }
 
@@ -737,8 +791,7 @@ impl Tool for NodesTool {
                         "deviceId": Self::read_optional_nonempty_string(&args, "deviceId"),
                     });
                     let res = self
-                        .registry
-                        .invoke(&node_id, "camera.snap", arguments)
+                        .invoke_node_capability(&node_id, "camera.snap", arguments)
                         .await
                         .map_err(|e| {
                             ::zeroclaw_log::record!(
@@ -756,11 +809,7 @@ impl Tool for NodesTool {
                             anyhow::Error::msg(format!("camera.snap facing={}: {e}", f))
                         })?;
                     if !res.success {
-                        return Ok(ToolResult {
-                            success: false,
-                            output: String::new(),
-                            error: res.error.or_else(|| Some("invoke failed".to_string())),
-                        });
+                        return Ok(Self::tool_result_from_node_result(res));
                     }
                     let payload = Self::parse_result_output(&res.output);
                     let payload_obj = payload.as_object().ok_or_else(|| {

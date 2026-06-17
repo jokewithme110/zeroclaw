@@ -4,6 +4,7 @@ use std::fmt::Write;
 use std::path::Path;
 use zeroclaw_runtime::agent::system_prompt::load_openclaw_bootstrap_files;
 use zeroclaw_runtime::dt_nodes_registry::{ConnectedNodeRegistry, NodeRegistry};
+use zeroclaw_runtime::tools::nodes_capability::filter_visible_nodes;
 
 pub fn build_channel_system_prompt(
     base_prompt: &str,
@@ -129,7 +130,13 @@ fn inject_connected_nodes_prompt(prompt: &mut String, config: &Config) {
     if config.gateway.node_control.enabled {
         prompt.push_str("## Connected Nodes/Devices\n\n");
         prompt.push_str("You can use the nodes tool to control the nodes.\n");
-        let nodes = ConnectedNodeRegistry::global().list();
+        // Filter nodes based on capability control config to ensure the system
+        // prompt only shows capabilities that are actually available for use.
+        let nodes = filter_visible_nodes(
+            ConnectedNodeRegistry::global().list(),
+            &config.data_dir,
+            &config.gateway.capability_control,
+        );
         if nodes.is_empty() {
             prompt.push_str("- **No nodes connected.**\n\n");
         } else {
