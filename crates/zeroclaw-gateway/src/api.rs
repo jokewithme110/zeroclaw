@@ -83,6 +83,14 @@ pub struct MemoryDeleteQuery {
     pub agent: Option<String>,
 }
 
+#[cfg(feature = "channel-wechat")]
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WeChatQrLoginStartQuery {
+    #[serde(default)]
+    pub bind_mode: Option<zeroclaw_channels::wechat_binding::WeChatQrBindMode>,
+    pub timeout_ms: Option<u64>,
+}
+
 #[derive(Deserialize)]
 pub struct CronRunsQuery {
     pub limit: Option<u32>,
@@ -1176,6 +1184,136 @@ pub async fn handle_api_cli_tools(
     };
 
     Json(serde_json::json!({"cli_tools": tools})).into_response()
+}
+
+/// GET /api/channels/wechat/binding-status — WeChat binding status snapshot
+#[cfg(feature = "channel-wechat")]
+pub async fn handle_api_wechat_binding_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.read().clone();
+    // For backward compatibility, use the first WeChat config if any exists
+    let wechat_config = config.channels.wechat.values().next();
+    let status = zeroclaw_channels::wechat_binding::load_wechat_binding_status(wechat_config);
+    Json(status).into_response()
+}
+
+/// POST /api/channels/wechat/authorize-qr — return a scannable QR URL and poll in background
+#[cfg(feature = "channel-wechat")]
+pub async fn handle_api_wechat_authorize_qr(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<WeChatQrLoginStartQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    match start_wechat_qr_authorization(&state, query).await {
+        Ok(started) => Json(started).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+/// Start WeChat QR authorization and spawn background poll
+#[cfg(feature = "channel-wechat")]
+pub(crate) async fn start_wechat_qr_authorization(
+    state: &AppState,
+    query: WeChatQrLoginStartQuery,
+) -> Result<
+    zeroclaw_channels::wechat_binding::WeChatQrLoginStart,
+    (StatusCode, Json<serde_json::Value>),
+> {
+    let config = state.config.read().clone();
+    // For backward compatibility, use the first WeChat config if any exists
+    let wechat_config = config.channels.wechat.values().next().cloned();
+    match zeroclaw_channels::wechat_binding::start_wechat_qr_login(wechat_config.as_ref()).await {
+        Ok(started) => {
+            let session_key = started.session_key.clone();
+            let bind_mode = query.bind_mode.unwrap_or_default();
+            let timeout_ms = query.timeout_ms;
+            let shutdown_tx = state.shutdown_tx.clone();
+            let reload_tx = state.reload_tx.clone();
+            let wechat_config_for_poll = wechat_config.clone();
+            tokio::spawn(async move {
+                let result = zeroclaw_channels::wechat_binding::wait_for_wechat_qr_login(
+                    wechat_config_for_poll.as_ref(),
+                    &session_key,
+                    bind_mode,
+                    timeout_ms,
+                )
+                .await;
+
+                match result {
+                    Ok(result) if result.connected => {
+                        if let Some(reload_tx) = reload_tx {
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            let _ = shutdown_tx.send(true);
+                            let _ = reload_tx.send(true);
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new("gateway", ::zeroclaw_log::Action::Note)
+                                    .with_category(::zeroclaw_log::EventCategory::Channel)
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                                    .with_attrs(serde_json::json!({
+                                        "session_key": session_key,
+                                    })),
+                                "WeChat QR login confirmed; daemon reload requested"
+                            );
+                        } else {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new("gateway", ::zeroclaw_log::Action::Note)
+                                    .with_category(::zeroclaw_log::EventCategory::Channel)
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(serde_json::json!({
+                                        "session_key": session_key,
+                                    })),
+                                "WeChat QR login confirmed, but no daemon supervisor is running; restart manually to load the new account"
+                            );
+                        }
+                    }
+                    Ok(result) => {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new("gateway", ::zeroclaw_log::Action::Note)
+                                .with_category(::zeroclaw_log::EventCategory::Channel)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                                .with_attrs(serde_json::json!({
+                                    "session_key": session_key,
+                                    "connected": result.connected,
+                                    "status": format!("{:?}", result.status),
+                                })),
+                            "WeChat QR login finished"
+                        );
+                    }
+                    Err(error) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new("gateway", ::zeroclaw_log::Action::Fail)
+                                .with_category(::zeroclaw_log::EventCategory::Channel)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(serde_json::json!({
+                                    "session_key": session_key,
+                                    "error": format!("{}", error),
+                                })),
+                            "WeChat QR login background wait failed"
+                        );
+                    }
+                }
+            });
+            Ok(started)
+        }
+        Err(error) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{error}")})),
+        )),
+    }
 }
 
 /// GET /api/channels — list configured channels with status

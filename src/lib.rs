@@ -288,6 +288,16 @@ Examples:
         /// Telegram identity to allow (username without '@' or numeric user ID)
         identity: String,
     },
+    /// Show WeChat binding status
+    #[cfg(feature = "channel-wechat")]
+    WechatBindingStatus,
+    /// Start WeChat QR authorization from the CLI and wait for confirmation
+    #[cfg(feature = "channel-wechat")]
+    WechatAuthorizeQr {
+        /// Total time to wait for scan confirmation in milliseconds
+        #[arg(long)]
+        timeout_ms: Option<u64>,
+    },
     /// Send a message to a configured channel
     // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\

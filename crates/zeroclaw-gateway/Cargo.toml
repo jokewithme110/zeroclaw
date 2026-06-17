@@ -98,6 +98,7 @@ channel-linq = ["zeroclaw-channels/channel-linq"]
 channel-nextcloud = ["zeroclaw-channels/channel-nextcloud"]
 channel-nostr = ["zeroclaw-channels/channel-nostr"]
 channel-wati = ["zeroclaw-channels/channel-wati"]
+channel-wechat = ["zeroclaw-channels/channel-wechat"]
 channel-whatsapp-cloud = ["zeroclaw-channels/channel-whatsapp-cloud"]
 gateway-voice-duplex = []
 # Enables OPTIONS /api/config* responses with the schemars-generated

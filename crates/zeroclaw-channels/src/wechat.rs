@@ -522,6 +522,14 @@ fn random_wechat_uin() -> String {
     base64::engine::general_purpose::STANDARD.encode(uint32.to_string())
 }
 
+/// Encode a media AES key for outbound media items.
+/// Align with the working TS implementation, which sends
+/// base64(hex-string-of-key) on outbound media items.
+fn encode_media_aes_key(aes_key: &[u8; 16]) -> String {
+    let hex_key = hex::encode(aes_key);
+    base64::engine::general_purpose::STANDARD.encode(hex_key.as_bytes())
+}
+
 fn build_base_info() -> serde_json::Value {
     serde_json::json!({
         "channel_version": env!("CARGO_PKG_VERSION")
@@ -807,10 +815,10 @@ impl WeChatChannel {
             user_id: user_id.map(String::from),
             saved_at: Some(chrono::Utc::now().to_rfc3339()),
         };
-        let path = self.state_dir.join("account.json");
+        let account_path = self.state_dir.join("account.json");
         match serde_json::to_string_pretty(&data) {
             Ok(json) => {
-                if let Err(e) = write_private(&path, json.as_bytes()) {
+                if let Err(e) = write_private(&account_path, json.as_bytes()) {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -827,6 +835,65 @@ impl WeChatChannel {
                     .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                 "failed to serialize account data"
             ),
+        }
+
+        // Also persist bound user to bindings.json for consistency
+        if let Some(uid) = user_id.filter(|id| !id.trim().is_empty()) {
+            use std::collections::HashSet;
+            use std::fs;
+
+            let bindings_path = self.state_dir.join("bindings.json");
+            let mut bound_users: HashSet<String> = HashSet::new();
+
+            // Load existing bindings if any
+            if let Ok(data) = fs::read_to_string(&bindings_path) {
+                if let Ok(bindings) = serde_json::from_str::<serde_json::Value>(&data) {
+                    if let Some(users) = bindings.get("bound_users").and_then(|v| v.as_array()) {
+                        for user in users {
+                            if let Some(user_str) = user.as_str() {
+                                let normalized = user_str.trim();
+                                if !normalized.is_empty() && normalized != "*" {
+                                    bound_users.insert(normalized.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Add new user
+            let normalized = uid.trim().to_string();
+            if !normalized.is_empty() && normalized != "*" {
+                bound_users.insert(normalized);
+            }
+
+            // Save bindings
+            let bindings_data = serde_json::json!({
+                "bound_users": bound_users.into_iter().collect::<Vec<_>>()
+            });
+            match serde_json::to_string_pretty(&bindings_data) {
+                Ok(json) => {
+                    if let Err(e) = write_private(&bindings_path, json.as_bytes()) {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "failed to write bindings data"
+                        );
+                    }
+                }
+                Err(e) => ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "failed to serialize bindings data"
+                ),
+            }
         }
     }
 
@@ -1297,7 +1364,7 @@ impl WeChatChannel {
 
         Ok(UploadedWeChatMedia {
             encrypted_query_param,
-            aes_key_base64: base64::engine::general_purpose::STANDARD.encode(aes_key),
+            aes_key_base64: encode_media_aes_key(&aes_key),
             raw_size: payload.bytes.len(),
             encrypted_size: ciphertext.len(),
         })

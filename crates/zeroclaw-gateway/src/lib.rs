@@ -1820,6 +1820,18 @@ pub async fn run_gateway(
             get(canvas::handle_canvas_history),
         );
 
+    // ── WeChat binding API (requires channel-wechat feature) ──
+    #[cfg(feature = "channel-wechat")]
+    let inner = inner
+        .route(
+            "/api/channels/wechat/binding-status",
+            get(api::handle_api_wechat_binding_status),
+        )
+        .route(
+            "/api/channels/wechat/authorize-qr",
+            post(api::handle_api_wechat_authorize_qr),
+        );
+
     // ── WebAuthn hardware key authentication API (requires webauthn feature) ──
     #[cfg(feature = "webauthn")]
     let inner = inner
@@ -2444,6 +2456,16 @@ fn optional_channel_routes() -> Router<AppState> {
     let router = router.route("/nextcloud-talk", post(handle_nextcloud_talk_webhook));
     #[cfg(feature = "channel-email")]
     let router = router.route("/webhook/gmail", post(handle_gmail_push_webhook));
+    #[cfg(feature = "channel-wechat")]
+    let router = router
+        .route(
+            "/admin/channels/wechat/binding-status",
+            get(handle_admin_wechat_binding_status),
+        )
+        .route(
+            "/admin/channels/wechat/authorize-qr",
+            post(handle_admin_wechat_authorize_qr),
+        );
     router
 }
 
@@ -3942,6 +3964,34 @@ async fn handle_admin_paircode_new(
         "message": message,
     });
     Ok((StatusCode::OK, Json(body)))
+}
+
+/// GET /admin/channels/wechat/binding-status — localhost-only WeChat binding snapshot.
+#[cfg(feature = "channel-wechat")]
+async fn handle_admin_wechat_binding_status(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_localhost(&peer)?;
+
+    let config = state.config.read().clone();
+    // For backward compatibility, use the first WeChat config if any exists
+    let wechat_config = config.channels.wechat.values().next();
+    let status = zeroclaw_channels::wechat_binding::load_wechat_binding_status(wechat_config);
+    Ok((StatusCode::OK, Json(status)))
+}
+
+/// POST /admin/channels/wechat/authorize-qr — localhost-only WeChat QR start.
+#[cfg(feature = "channel-wechat")]
+async fn handle_admin_wechat_authorize_qr(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(query): Query<api::WeChatQrLoginStartQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_localhost(&peer)?;
+
+    let started = api::start_wechat_qr_authorization(&state, query).await?;
+    Ok((StatusCode::OK, Json(started)))
 }
 
 /// GET /pair/code — fetch the initial pairing code (no auth, no localhost restriction).
