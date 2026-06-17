@@ -6,6 +6,7 @@
 
 use crate::PluginPermission;
 use anyhow::{Context, Result};
+use extism::PluginBuilder;
 use extism::*;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -311,7 +312,39 @@ pub fn create_plugin(
 
     let manifest = Manifest::new([Wasm::file(wasm_path)]);
 
-    Plugin::new(manifest, [http_fn, env_fn, log_fn], true)
+    // Configure wasmtime compilation cache.
+    // Uses ZEROCLAW_CONFIG_DIR/data/plugins/wasmtime-cache.toml as config file
+    // and ZEROCLAW_CONFIG_DIR/data/plugins/cache as cache directory.
+    // Disables cache if ZEROCLAW_CONFIG_DIR is not set or cache directory cannot be created.
+    let mut builder = PluginBuilder::new(manifest)
+        .with_wasi(true)
+        .with_functions([http_fn, env_fn, log_fn]);
+
+    if let Ok(config_dir) = std::env::var("ZEROCLAW_CONFIG_DIR") {
+        let plugins_dir = std::path::PathBuf::from(&config_dir)
+            .join("data")
+            .join("plugins");
+        let config_file = plugins_dir.join("wasmtime-cache.toml");
+        let cache_dir = plugins_dir.join("wasmruntime");
+
+        match std::fs::create_dir_all(&cache_dir) {
+            Ok(()) => {
+                let cache_toml = format!(
+                    r#"[cache]
+directory = "{}"
+"#,
+                    cache_dir.display()
+                );
+                if std::fs::write(&config_file, cache_toml).is_ok() {
+                    builder = builder.with_cache_config(&config_file);
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
+    builder
+        .build()
         .with_context(|| format!("failed to load WASM plugin from {}", wasm_path.display()))
 }
 
