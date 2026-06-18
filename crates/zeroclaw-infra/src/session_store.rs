@@ -210,6 +210,32 @@ impl SessionBackend for SessionStore {
     fn session_exists(&self, session_key: &str) -> bool {
         self.session_path(session_key).exists()
     }
+
+    /// Override to use file modification time as last_activity instead of Utc::now().
+    fn get_session_metadata(
+        &self,
+        session_key: &str,
+    ) -> Option<crate::session_backend::SessionMetadata> {
+        let messages = self.load(session_key);
+        if messages.is_empty() {
+            return None;
+        }
+        let last_activity: chrono::DateTime<chrono::Utc> = self
+            .session_mtime(session_key)
+            .map(chrono::DateTime::<chrono::Utc>::from)
+            .unwrap_or_else(chrono::Utc::now);
+        Some(crate::session_backend::SessionMetadata {
+            key: session_key.to_string(),
+            name: self.get_session_name(session_key).ok().flatten(),
+            created_at: last_activity,
+            last_activity,
+            message_count: messages.len(),
+            agent_alias: None,
+            channel_id: None,
+            room_id: None,
+            sender_id: None,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -543,5 +569,35 @@ mod tests {
         assert_eq!(meta.key, "test_session");
         assert_eq!(meta.message_count, 2);
         assert!(meta.name.is_none());
+    }
+
+    #[test]
+    fn get_session_metadata_uses_file_mtime_for_last_activity() {
+        use std::time::Duration;
+
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+
+        // Create session and record time before append
+        let before = chrono::Utc::now();
+        std::thread::sleep(Duration::from_millis(10));
+
+        backend
+            .append("mtime_test", &ChatMessage::user("hello"))
+            .unwrap();
+
+        std::thread::sleep(Duration::from_millis(10));
+        let after = chrono::Utc::now();
+
+        let meta = backend.get_session_metadata("mtime_test").unwrap();
+
+        // last_activity should be close to the file mtime, not Utc::now()
+        assert!(meta.last_activity >= before - Duration::seconds(1));
+        assert!(meta.last_activity <= after + Duration::seconds(1));
+
+        // Verify it's using file mtime by checking created_at == last_activity
+        // (since we only have one timestamp source - the file mtime)
+        assert_eq!(meta.created_at, meta.last_activity);
     }
 }

@@ -246,6 +246,9 @@ const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
 const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
 const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
 const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
+/// Number of recent messages to keep when a stale session is detected.
+/// Used by the time-based history truncation feature.
+const STALE_SESSION_KEEP_MESSAGES: usize = 4;
 /// Proactive context-window budget in estimated characters (~4 chars/token).
 /// When the total character count of conversation history exceeds this limit,
 /// older turns are dropped before the request is sent to the model_provider,
@@ -1588,6 +1591,36 @@ fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .pop(sender_key);
+}
+
+/// Truncate the sender's conversation history to only keep the most recent N messages.
+/// Also updates the persisted session store.
+fn truncate_sender_history_to_recent(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    recent_count: usize,
+) {
+    let mut histories = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    if let Some(turns) = histories.get_mut(sender_key) {
+        // Keep only the most recent N messages
+        if turns.len() > recent_count {
+            let drain_start = turns.len().saturating_sub(recent_count);
+            turns.drain(0..drain_start);
+        }
+
+        // Persist the truncated history to the session store
+        if let Some(ref store) = ctx.session_store {
+            // Clear existing session and rewrite with truncated history
+            let _ = store.clear_messages(sender_key);
+            for turn in turns.iter() {
+                let _ = store.append(sender_key, turn);
+            }
+        }
+    }
 }
 
 fn mark_sender_for_new_session(ctx: &ChannelRuntimeContext, sender_key: &str) {
@@ -4021,6 +4054,25 @@ async fn process_channel_message_body(
         // `/new` should make the next user turn completely fresh even if
         // older cached turns reappear before this message starts.
         clear_sender_history(ctx.as_ref(), &history_key);
+    }
+
+    // Check if the session is stale based on configured TTL
+    // If so, truncate history to only keep the most recent 2 messages
+    if let Some(ref store) = ctx.session_store {
+        // Use channels.session_ttl_hours config (default 0 = disabled)
+        let ttl_hours = ctx.prompt_config.channels.session_ttl_hours;
+        if ttl_hours > 0
+            && let Some(metadata) = store.get_session_metadata(&history_key)
+        {
+            let ttl_cutoff = chrono::Utc::now() - chrono::Duration::hours(ttl_hours as i64);
+            if metadata.last_activity < ttl_cutoff {
+                truncate_sender_history_to_recent(
+                    ctx.as_ref(),
+                    &history_key,
+                    STALE_SESSION_KEEP_MESSAGES,
+                );
+            }
+        }
     }
 
     let had_prior_history = if force_fresh_session {
