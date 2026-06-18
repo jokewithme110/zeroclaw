@@ -28,6 +28,7 @@ struct NodeSession {
     node_id: String,
     capabilities: Vec<String>,
     meta: Option<Value>,
+    events: Option<Value>,
     tx: mpsc::Sender<OutgoingMessage>,
 }
 
@@ -63,12 +64,14 @@ impl ConnectedNodeRegistry {
         node_id: String,
         capabilities: Vec<String>,
         meta: Option<Value>,
+        events: Option<Value>,
     ) -> mpsc::Receiver<OutgoingMessage> {
         let (tx, rx) = mpsc::channel(32);
         let session = NodeSession {
             node_id: node_id.clone(),
             capabilities: capabilities.clone(),
             meta: meta.clone(),
+            events: events.clone(),
             tx,
         };
         self.sessions.write().insert(node_id, session);
@@ -117,6 +120,7 @@ impl ConnectedNodeRegistry {
                 status: "connected".to_string(),
                 capabilities: s.capabilities.clone(),
                 meta: s.meta.clone(),
+                events: s.events.clone(),
             })
             .collect()
     }
@@ -134,6 +138,7 @@ impl NodeRegistry for ConnectedNodeRegistry {
             status: "connected".to_string(),
             capabilities: s.capabilities.clone(),
             meta: s.meta.clone(),
+            events: s.events.clone(),
         })
     }
 
@@ -290,6 +295,8 @@ pub struct NodeInfo {
     pub capabilities: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub events: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -299,6 +306,8 @@ pub struct NodeDescription {
     pub capabilities: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub events: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

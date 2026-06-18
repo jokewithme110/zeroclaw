@@ -11826,6 +11826,7 @@ impl ChannelsConfig {
             || self.voice_duplex.values().any(|c| c.enabled)
             || self.mqtt.values().any(|c| c.enabled)
             || self.amqp.values().any(|c| c.enabled)
+            || !self.webchat.is_empty()
     }
 }
 

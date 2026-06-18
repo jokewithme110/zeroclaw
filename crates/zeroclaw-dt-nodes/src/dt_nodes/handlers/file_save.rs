@@ -15,11 +15,13 @@ struct FileSaveParams {
     file_name: String,
 }
 
-pub struct FileSaveHandler;
+pub struct FileSaveHandler {
+    workspace_dir: PathBuf,
+}
 
 impl FileSaveHandler {
-    pub fn new() -> Self {
-        Self
+    pub fn new(workspace_dir: PathBuf) -> Self {
+        Self { workspace_dir }
     }
 }
 
@@ -63,7 +65,7 @@ impl Handler for FileSaveHandler {
             }
         };
         let mut filename = sanitize_filename(&params.file_name, &params.mime_type);
-        let save_dir = default_save_dir();
+        let save_dir = self.workspace_dir.join("saved");
         if let Err(e) = fs::create_dir_all(&save_dir) {
             return InvokeOutcome {
                 ok: false,
@@ -140,10 +142,4 @@ fn sanitize_filename(file_name: &str, mime_type: &str) -> String {
     } else {
         base.to_string()
     }
-}
-
-fn default_save_dir() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("saved")
 }

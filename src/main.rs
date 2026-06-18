@@ -288,7 +288,6 @@ mod memory;
 mod migration;
 #[cfg(feature = "agent-runtime")]
 mod multimodal;
-mod nodes;
 #[cfg(feature = "agent-runtime")]
 mod observability;
 #[cfg(feature = "agent-runtime")]
@@ -965,37 +964,6 @@ Examples:
         #[command(subcommand)]
         props_command: DeprecatedPropsCommands,
     },
-    /// Connect this machine as nodes to a ZeroClaw gateway
-    Nodes {
-        /// Interactive setup: discover gateway via mDNS and prompt for token
-        #[arg(short = 'i', long = "interactive")]
-        interactive: bool,
-
-        /// Initialize node identity/config only (no WebSocket connection)
-        #[arg(long)]
-        init: bool,
-
-        /// Optional node config file (JSON)
-        #[arg(long)]
-        config: Option<String>,
-
-        /// Gateway host (defaults to config gateway.host)
-        #[arg(long)]
-        host: Option<String>,
-
-        /// Gateway port (defaults to config gateway.port)
-        #[arg(long)]
-        port: Option<u16>,
-
-        /// Logical node name / display name (defaults to system hostname)
-        #[arg(long)]
-        name: Option<String>,
-
-        /// Optional node-control token (overrides identity file)
-        #[arg(long)]
-        token: Option<String>,
-    },
-
     /// Manage WASM plugins
     #[cfg(feature = "plugins-wasm")]
     Plugin {
@@ -5817,33 +5785,6 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
-        Commands::Nodes {
-            interactive,
-            init,
-            config: node_config_path,
-            host,
-            port,
-            name,
-            token,
-        } => {
-            #[cfg(feature = "auto_discovery")]
-            let auto_discovery = config.gateway.node_control.auto_discovery.enabled;
-            #[cfg(not(feature = "auto_discovery"))]
-            let auto_discovery = false;
-
-            dt_nodes::run_node(
-                &config,
-                interactive,
-                init,
-                node_config_path,
-                host,
-                port,
-                name,
-                token,
-                auto_discovery,
-            )
-            .await
-        }
     }
 }
 

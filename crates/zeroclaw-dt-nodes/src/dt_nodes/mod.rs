@@ -1,309 +1,182 @@
-use anyhow::Result;
-use base64::Engine;
-use dialoguer::{Input, Password};
+//! zeroclaw-dt-nodes 运行时逻辑
+
+#[cfg(feature = "auto_discovery")]
+use crate::config::GatewayEndpoint;
+#[cfg(feature = "auto_discovery")]
+use crate::config::NodeIdentity;
+use crate::config::{NodeConfig as LocalNodeConfig, resolve_local_node_identity_context};
+#[cfg(feature = "auto_discovery")]
+use crate::config::{resolve_local_auto_discovery_context, resolve_local_node_profile_context};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "auto_discovery")]
+use std::path::PathBuf;
 use tokio::signal;
 
 mod executor;
 #[cfg(feature = "auto_discovery")]
 mod fifo_listener;
-mod handlers;
+pub mod handlers;
+mod node_client;
 mod node_runtime_trace;
-mod ws_client;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GatewayConfig {
-    pub host: String,
-    pub port: u16,
-    #[serde(default)]
+pub use handlers::event_store::EventSubscriptionsStore;
+
+/// Event management subcommands
+#[derive(clap::Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum EventCommands {
+    /// List event subscriptions
+    #[command(long_about = "\
+List event subscriptions.
+
+Shows the topic, channel, recipient and subscription timestamp for each \
+recorded event subscription.
+
+Examples:
+  zeroclaw-dt-nodes event list                  # list all subscriptions
+  zeroclaw-dt-nodes event list --event alert.cpu # filter by event type
+  zeroclaw-dt-nodes event list --json           # output as JSON")]
+    List {
+        /// Filter by event type (topic)
+        #[arg(long)]
+        event: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LocalStartOptions {
+    pub interactive: bool,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub name: Option<String>,
     pub token: Option<String>,
+    #[cfg(feature = "auto_discovery")]
+    pub auto_discovery: Option<bool>,
+    #[cfg(feature = "auto_discovery")]
+    pub fifo_dir: Option<String>,
+    #[cfg(feature = "auto_discovery")]
+    pub fifo_wait_timeout_secs: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeIdentityFile {
-    pub device_id: String,
-    pub public_key_b64: String,
-    pub private_key_b64: String,
-    pub gateway: GatewayConfig,
-    #[serde(default)]
-    pub display_name: Option<String>,
-}
-
-fn persist_node_config_file(
-    config_path: Option<&str>,
-    display_name: Option<&str>,
-    host: &str,
-    port: u16,
-    token: Option<&str>,
-) -> Result<()> {
-    let Some(path) = config_path else {
-        return Ok(());
-    };
-    if path.trim().is_empty() {
-        return Ok(());
-    }
-    let path_buf = PathBuf::from(path);
-    if let Some(parent) = path_buf.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-    let payload = serde_json::json!({
-        "display_name": display_name,
-        "gateway": { "host": host, "port": port, "token": token }
-    });
-    std::fs::write(path_buf, serde_json::to_string_pretty(&payload)?)?;
-    Ok(())
-}
-
-fn identity_path(workspace_dir: &Path) -> PathBuf {
-    let mut dir = workspace_dir.to_path_buf();
-    dir.push("identity");
-    std::fs::create_dir_all(&dir).ok();
-    dir.push("device.json");
-    dir
-}
-
-fn load_or_create_identity(
-    config: &zeroclaw_config::schema::Config,
-    workspace_dir: &Path,
-    display_name: &str,
-    host: String,
-    port: u16,
-    token: Option<String>,
-    update_gateway: bool,
-) -> Result<NodeIdentityFile> {
-    let zeroclaw_dir = config
-        .config_path
-        .parent()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_dir.to_path_buf());
-    let secret_store =
-        zeroclaw_config::secrets::SecretStore::new(&zeroclaw_dir, config.secrets.encrypt);
-    let path = identity_path(workspace_dir);
-    if path.exists() {
-        let data = std::fs::read_to_string(&path)?;
-        let mut id: NodeIdentityFile = serde_json::from_str(&data)?;
-        id.public_key_b64 = secret_store.decrypt(&id.public_key_b64)?;
-        id.private_key_b64 = secret_store.decrypt(&id.private_key_b64)?;
-        id.gateway.token = id
-            .gateway
-            .token
-            .as_deref()
-            .map(|v| secret_store.decrypt(v))
-            .transpose()?;
-        // 仅在交互式模式下更新 gateway 配置为用户新输入的值
-        if update_gateway {
-            id.gateway.host = host;
-            id.gateway.port = port;
-            id.gateway.token = token;
-        }
-        // Re-encrypt keys (they were decrypted above for use but need to be stored encrypted)
-        let mut id_persist = id.clone();
-        id_persist.public_key_b64 = secret_store.encrypt(&id.public_key_b64)?;
-        id_persist.private_key_b64 = secret_store.encrypt(&id.private_key_b64)?;
-        id_persist.gateway.token = id
-            .gateway
-            .token
-            .as_deref()
-            .map(|v| secret_store.encrypt(v))
-            .transpose()?;
-        std::fs::write(&path, serde_json::to_string_pretty(&id_persist)?)?;
-        return Ok(id);
-    }
-    let pub_bytes: [u8; 32] = rand::random();
-    let priv_bytes: [u8; 64] = rand::random();
-    let id = NodeIdentityFile {
-        device_id: format!("zeroclaw-node-{}", uuid::Uuid::new_v4()),
-        public_key_b64: base64::engine::general_purpose::STANDARD.encode(pub_bytes),
-        private_key_b64: base64::engine::general_purpose::STANDARD.encode(priv_bytes),
-        gateway: GatewayConfig { host, port, token },
-        display_name: Some(display_name.to_string()),
-    };
-    let mut id_persist = id.clone();
-    id_persist.public_key_b64 = secret_store.encrypt(&id.public_key_b64)?;
-    id_persist.private_key_b64 = secret_store.encrypt(&id.private_key_b64)?;
-    id_persist.gateway.token = id
-        .gateway
-        .token
-        .as_deref()
-        .map(|v| secret_store.encrypt(v))
-        .transpose()?;
-    std::fs::write(&path, serde_json::to_string_pretty(&id_persist)?)?;
-    Ok(id)
-}
-
-pub async fn run_node(
-    config: &zeroclaw_config::schema::Config,
-    interactive: bool,
-    init: bool,
-    config_path: Option<String>,
-    host: Option<String>,
-    port: Option<u16>,
-    name: Option<String>,
-    token: Option<String>,
-    auto_discovery: bool,
-) -> Result<()> {
-    #[derive(Deserialize)]
-    struct NodeConfigFile {
-        #[serde(default)]
-        display_name: Option<String>,
-        #[serde(default)]
-        gateway: Option<GatewayConfig>,
-    }
-    let mut display_name = name.clone();
-    let mut cfg_host: Option<String> = None;
-    let mut cfg_port: Option<u16> = None;
-    let mut cfg_token: Option<String> = None;
-    if let Some(path) = config_path.as_deref() {
-        if !path.trim().is_empty() {
-            let path_buf = PathBuf::from(path);
-            if path_buf.exists() {
-                let data = std::fs::read_to_string(&path_buf)?;
-                let file_cfg: NodeConfigFile = serde_json::from_str(&data)?;
-                if let Some(dn) = file_cfg.display_name {
-                    if !dn.trim().is_empty() {
-                        display_name = Some(dn);
-                    }
-                }
-                if let Some(gw) = file_cfg.gateway {
-                    if !gw.host.trim().is_empty() {
-                        cfg_host = Some(gw.host);
-                    }
-                    if gw.port != 0 {
-                        cfg_port = Some(gw.port);
-                    }
-                    cfg_token = gw.token;
-                }
-            }
-        }
-    }
-    let initial_host = host.or(cfg_host);
-    let initial_port = port.or(cfg_port);
-    let initial_token = token.or(cfg_token);
-    let gateway_host: String;
-    let gateway_port: u16;
-    let final_token: Option<String>;
-    if interactive {
-        gateway_host = Input::new()
-            .with_prompt("Gateway host")
-            .default(initial_host.unwrap_or_else(|| config.gateway.host.clone()))
-            .interact_text()?;
-        gateway_port = Input::new()
-            .with_prompt("Gateway port")
-            .default(initial_port.unwrap_or(config.gateway.port))
-            .interact_text()?;
-        let tok: String = Password::new()
-            .with_prompt("Gateway token")
-            .allow_empty_password(false)
-            .interact()?;
-        final_token = Some(tok);
-    } else {
-        // 非交互式模式：优先从 device.json 读取 gateway 配置
-        let workspace_dir = config.data_dir.clone();
-        let id_path = identity_path(&workspace_dir);
-        if id_path.exists() {
-            if let Ok(data) = std::fs::read_to_string(&id_path) {
-                if let Ok(id_file) = serde_json::from_str::<NodeIdentityFile>(&data) {
-                    gateway_host = id_file.gateway.host;
-                    gateway_port = id_file.gateway.port;
-                    final_token = id_file.gateway.token;
-                } else {
-                    gateway_host = initial_host.unwrap_or_else(|| config.gateway.host.clone());
-                    gateway_port = initial_port.unwrap_or(config.gateway.port);
-                    final_token = initial_token;
-                }
-            } else {
-                gateway_host = initial_host.unwrap_or_else(|| config.gateway.host.clone());
-                gateway_port = initial_port.unwrap_or(config.gateway.port);
-                final_token = initial_token;
-            }
-        } else {
-            gateway_host = initial_host.unwrap_or_else(|| config.gateway.host.clone());
-            gateway_port = initial_port.unwrap_or(config.gateway.port);
-            final_token = initial_token;
-        }
-    };
-    let workspace_dir = config.data_dir.clone();
-    let effective_name = display_name.unwrap_or_else(|| {
-        hostname::get()
-            .ok()
-            .and_then(|h| h.into_string().ok())
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "zeroclaw-node".to_string())
-    });
-    if interactive {
-        persist_node_config_file(
-            config_path.as_deref(),
-            Some(effective_name.as_str()),
-            &gateway_host,
-            gateway_port,
-            final_token.as_deref(),
-        )?;
-    }
-    let identity = load_or_create_identity(
+/// 独立 zeroclaw-dt-nodes 二进制入口。
+pub async fn run_node(config: &mut LocalNodeConfig, options: &LocalStartOptions) -> Result<()> {
+    #[cfg(feature = "auto_discovery")]
+    let auto_discovery_context = resolve_local_auto_discovery_context(
         config,
-        &workspace_dir,
-        &effective_name,
-        gateway_host.clone(),
-        gateway_port,
-        final_token,
-        interactive,
-    )?;
-    if init {
-        println!(
-            "Initialized node identity at {} (device_id={})",
-            identity_path(&workspace_dir).display(),
-            identity.device_id
-        );
-        return Ok(());
-    }
+        options.auto_discovery,
+        options.fifo_dir.clone(),
+        options.fifo_wait_timeout_secs,
+    );
 
     #[cfg(feature = "auto_discovery")]
-    if auto_discovery {
+    if auto_discovery_context.enabled {
+        let profile_context = resolve_local_node_profile_context(options.name.clone());
+        let identity = config.load_or_create_identity_profile(&profile_context)?;
+        let discovery_config = config.clone();
+        let fifo_dir = auto_discovery_context.fifo_dir;
+        let fifo_wait_timeout_secs = auto_discovery_context.fifo_wait_timeout_secs;
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
+                .with_category(::zeroclaw_log::EventCategory::System)
+                .with_attrs(::serde_json::json!({
                     "event": "node_auto_discovery_enabled",
-                    "fifo_dir": config.gateway.node_control.auto_discovery.fifo_dir.as_str(),
-                })
-            ),
+                    "fifo_dir": fifo_dir,
+                    "fifo_wait_timeout_secs": fifo_wait_timeout_secs,
+                })),
             "Starting node with FIFO auto-discovery"
         );
-
         return run_with_fifo_listener(
-            &config.gateway.node_control.auto_discovery.fifo_dir,
-            config
-                .gateway
-                .node_control
-                .auto_discovery
-                .fifo_wait_timeout_secs,
-            &effective_name,
-            &workspace_dir,
-            config,
+            &fifo_dir,
+            fifo_wait_timeout_secs,
+            &identity,
+            Some(config.zeroclaw_node_dir.clone()),
+            Some(discovery_config),
         )
         .await;
     }
 
-    let _ = auto_discovery;
+    let identity_context = resolve_local_node_identity_context(
+        config,
+        options.interactive,
+        options.host.clone(),
+        options.port,
+        options.name.clone(),
+        options.token.clone(),
+    )?;
 
-    let url = format!("ws://{}:{}/", identity.gateway.host, identity.gateway.port);
+    if options.interactive {
+        config.update_gateway_endpoint(identity_context.gateway.clone())?;
+        println!("配置已更新：{}", config.config_path.display());
+    }
 
-    let stop = signal::ctrl_c();
+    let identity = config.load_or_create_identity_with_context(&identity_context)?;
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
             ::serde_json::json!({
                 "event": "node_starting_static",
-                "host": identity.gateway.host.as_str(),
-                "port": identity.gateway.port,
+                "host": identity.host.as_str(),
+                "port": identity.port,
             })
         ),
         "Connecting to gateway with static configuration"
     );
-    ws_client::run_loop(url, &identity, stop).await
+    let url = format!("ws://{}:{}/", identity.host, identity.port);
+    let stop = signal::ctrl_c();
+    node_client::run_loop(url, &identity, Some(config.zeroclaw_node_dir.clone()), stop).await
+}
+
+/// 处理 event 命令
+pub fn handle_event_command(command: EventCommands, workspace_dir: &Path) -> anyhow::Result<()> {
+    match command {
+        EventCommands::List { event, json } => {
+            let store = EventSubscriptionsStore::new(workspace_dir)
+                .context("Failed to open event subscriptions store")?;
+
+            let subscriptions = store
+                .list_subscriptions(event.as_deref(), None, None)
+                .context("Failed to list subscriptions")?;
+
+            if subscriptions.is_empty() {
+                if json {
+                    println!("[]");
+                } else {
+                    println!("No event subscriptions found.");
+                }
+                return Ok(());
+            }
+
+            if json {
+                let json_output = serde_json::to_string_pretty(&subscriptions)
+                    .context("Failed to serialize subscriptions to JSON")?;
+                println!("{}", json_output);
+            } else {
+                println!(
+                    "{:<8} {:<20} {:<10} {:<35} Subscribed At",
+                    "ID", "Topic", "Channel", "Recipient"
+                );
+                println!("{:-<8} {:-<20} {:-<10} {:-<35} {:-<20}", "", "", "", "", "");
+
+                for sub in subscriptions {
+                    println!(
+                        "{:<8} {:<20} {:<10} {:<35} {}",
+                        sub.id,
+                        sub.topic,
+                        sub.channel,
+                        sub.recipient,
+                        sub.subscribed_at.format("%Y-%m-%d %H:%M:%S")
+                    );
+                }
+            }
+
+            Ok(())
+        }
+    }
 }
 
 /// Run node with FIFO-based auto-discovery.
@@ -311,24 +184,25 @@ pub async fn run_node(
 async fn run_with_fifo_listener(
     fifo_dir: &str,
     timeout_secs: u64,
-    effective_name: &str,
-    _workspace_dir: &Path,
-    _config: &zeroclaw_config::schema::Config,
+    base_identity: &NodeIdentity,
+    workspace_dir: Option<PathBuf>,
+    discovery_config: Option<LocalNodeConfig>,
 ) -> Result<()> {
     use fifo_listener::{GatewayInfo, run_fifo_listener};
 
-    // Create a cancellation token for graceful shutdown
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let cancel_clone = cancel_token.clone();
+    let base_identity = base_identity.clone();
 
-    // Run FIFO listener with automatic reconnection
     let fifo_fut = run_fifo_listener(
         fifo_dir,
         timeout_secs,
         cancel_token.clone(),
         move |gateway_info: GatewayInfo| {
-            let effective_name = effective_name.to_string();
             let cancel_token_inner = cancel_token.child_token();
+            let workspace_dir = workspace_dir.clone();
+            let discovery_config = discovery_config.clone();
+            let base_identity = base_identity.clone();
 
             async move {
                 ::zeroclaw_log::record!(
@@ -342,26 +216,28 @@ async fn run_with_fifo_listener(
                     "Connecting to discovered gateway"
                 );
 
-                // Create temporary identity with discovered gateway info
-                let temp_identity = NodeIdentityFile {
-                    device_id: format!("zeroclaw-node-{}", uuid::Uuid::new_v4()),
-                    public_key_b64: String::new(),
-                    private_key_b64: String::new(),
-                    gateway: GatewayConfig {
-                        host: gateway_info.ip.clone(),
-                        port: gateway_info.port,
-                        token: Some(gateway_info.token.clone()),
-                    },
-                    display_name: Some(effective_name),
-                };
-
-                let ws_url = gateway_info.ws_url();
+                let gateway_endpoint = GatewayEndpoint::new(
+                    gateway_info.ip.clone(),
+                    gateway_info.port,
+                    Some(gateway_info.token.clone()),
+                );
+                if let Some(mut discovery_config) = discovery_config {
+                    discovery_config.persist_discovered_gateway_endpoint(&gateway_endpoint)?;
+                }
+                let discovered_identity =
+                    base_identity.with_gateway_endpoint(gateway_endpoint.clone());
+                let ws_url = gateway_endpoint.websocket_url();
                 let cancel_for_ws = cancel_token_inner.clone();
 
-                let ws_fut = ws_client::run_loop(ws_url, &temp_identity, async move {
-                    cancel_for_ws.cancelled().await;
-                    Ok(())
-                });
+                let ws_fut = node_client::run_loop(
+                    ws_url,
+                    &discovered_identity,
+                    workspace_dir,
+                    async move {
+                        cancel_for_ws.cancelled().await;
+                        Ok(())
+                    },
+                );
 
                 tokio::select! {
                     result = ws_fut => result,
@@ -382,7 +258,6 @@ async fn run_with_fifo_listener(
     );
     tokio::pin!(fifo_fut);
 
-    // Wait for either FIFO listener to complete or Ctrl+C signal
     tokio::select! {
         _ = signal::ctrl_c() => {
             ::zeroclaw_log::record!(

@@ -3,6 +3,9 @@ members = [".","crates/zeroclaw-dt-nodes","crates/zeroclaw-skill-security",  "cr
 resolver = "2"
 exclude = ["plugins/image-gen-fal"]
 
+# 默认编译根包和 zeroclaw-dt-nodes
+default-members = [".", "crates/zeroclaw-dt-nodes"]
+
 [workspace.package]
 version = "0.8.0"
 edition = "2024"

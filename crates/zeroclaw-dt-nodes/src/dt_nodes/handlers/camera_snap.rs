@@ -2,7 +2,7 @@ use crate::dt_nodes::handlers::{Handler, InvokeOutcome};
 use base64::Engine;
 use serde_json::Value;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub struct CameraSnapHandler;
@@ -10,6 +10,12 @@ pub struct CameraSnapHandler;
 impl CameraSnapHandler {
     pub fn new() -> Self {
         Self
+    }
+}
+
+impl Default for CameraSnapHandler {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -61,7 +67,7 @@ fn default_snapshot_path() -> PathBuf {
     PathBuf::from("/home/0668000637/1.png")
 }
 
-fn read_with_retry(path: &PathBuf, attempts: usize, delay: Duration) -> std::io::Result<Vec<u8>> {
+fn read_with_retry(path: &Path, attempts: usize, delay: Duration) -> std::io::Result<Vec<u8>> {
     let mut last_err = None;
     for _ in 0..attempts {
         match fs::read(path) {

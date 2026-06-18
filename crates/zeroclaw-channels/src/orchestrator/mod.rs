@@ -5503,7 +5503,57 @@ async fn run_message_dispatch_loop(
 
     while let Some(msg) = rx.recv().await {
         let Some(ctx) = router.resolve(&msg) else {
-            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"channel_alias": msg.channel_alias, "sender": msg.sender})), "dropping inbound message: no agent owns this channel");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "channel": msg.channel,
+                        "channel_alias": msg.channel_alias,
+                        "sender": msg.sender,
+                    })),
+                "dropping inbound message because no agent owns the channel"
+            );
+            continue;
+        };
+
+        // Fast path: Immediately Message - reply to channel immediately without processing
+        if msg.id == "[Immediately Message]" {
+            println!(
+                "  💬 [{}] immediately message send to {}: {}",
+                msg.channel,
+                msg.sender,
+                truncate_with_ellipsis(&msg.content, 80)
+            );
+            let channel = ctx
+                .channels_by_name
+                .get(&msg.channel)
+                .or_else(|| {
+                    // Multi-room channels use "name:qualifier" format (e.g. "matrix:!roomId");
+                    // fall back to base channel name for routing.
+                    msg.channel
+                        .split_once(':')
+                        .and_then(|(base, _)| ctx.channels_by_name.get(base))
+                })
+                .cloned();
+            if let Some(channel) = channel {
+                let reply_target = msg.reply_target.clone();
+                let thread_ts = msg.thread_ts.clone();
+                let content = msg.content.clone();
+                zeroclaw_spawn::spawn!(async move {
+                    let _ = channel
+                        .send(&SendMessage::new(content, &reply_target).in_thread(thread_ts))
+                        .await;
+                });
+            } else {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"channel": msg.channel})),
+                    "immediately message: no registered channel found for reply"
+                );
+            }
             continue;
         };
         // Fast path: /stop cancels the in-flight task for this sender scope without
@@ -7085,6 +7135,7 @@ fn collect_configured_channels(
                 wc.support_reasoning,
                 config.gateway.require_pairing,
                 config.gateway.paired_tokens.clone(),
+                config.channel_workspace_dir(&format!("webchat.{alias}")),
             )),
         });
     }
@@ -7215,25 +7266,21 @@ fn collect_configured_channels(
                         let alias = alias.clone();
                         Arc::new(move || cfg_arc.read().channel_external_peers("whatsapp", &alias))
                     };
+                    let channel = WhatsAppChannel::new(
+                        wa.access_token.clone().unwrap_or_default(),
+                        wa.phone_number_id.clone().unwrap_or_default(),
+                        wa.verify_token.clone().unwrap_or_default(),
+                        alias.clone(),
+                        peer_resolver,
+                    )
+                    .with_proxy_url(wa.proxy_url.clone())
+                    .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
+                    .with_group_mention_patterns(wa.group_mention_patterns.clone())
+                    .with_approval_timeout_secs(wa.approval_timeout_secs);
                     channels.push(ConfiguredChannel {
                         display_name: "WhatsApp",
                         alias: Some(alias.clone()),
-                        channel: crate::paced_channel::PacedChannel::wrap(
-                            Arc::new(
-                                WhatsAppChannel::new(
-                                    wa.access_token.clone().unwrap_or_default(),
-                                    wa.phone_number_id.clone().unwrap_or_default(),
-                                    wa.verify_token.clone().unwrap_or_default(),
-                                    alias.clone(),
-                                    peer_resolver,
-                                )
-                                .with_proxy_url(wa.proxy_url.clone())
-                                .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
-                                .with_group_mention_patterns(wa.group_mention_patterns.clone())
-                                .with_approval_timeout_secs(wa.approval_timeout_secs),
-                            ),
-                            wa,
-                        ),
+                        channel: crate::paced_channel::PacedChannel::wrap(Arc::new(channel), wa),
                     });
                 } else {
                     ::zeroclaw_log::record!(

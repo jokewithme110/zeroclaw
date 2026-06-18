@@ -10,8 +10,9 @@ use axum::{
     },
     routing::post,
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
-use std::{collections::HashMap, convert::Infallible, sync::Arc};
+use std::{collections::HashMap, convert::Infallible, fs, path::PathBuf, sync::Arc};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use uuid::Uuid;
@@ -28,6 +29,7 @@ pub struct WebchatChannel {
     support_reasoning: bool,
     pairing: PairingGuard,
     sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
+    workspace_dir: PathBuf,
 }
 
 #[derive(Debug)]
@@ -61,6 +63,31 @@ struct HttpChatRequest {
     #[serde(default)]
     stream: bool,
     session_id: Option<String>,
+    /// Optional node request metadata for event emission
+    #[serde(default)]
+    node_req: Option<NodeRequest>,
+}
+
+/// Node request metadata for event emission
+#[derive(Debug, Deserialize, Clone)]
+pub struct NodeRequest {
+    /// Event type (e.g., "alert.cpu")
+    pub event: String,
+    /// Channel ID (e.g., "qq", "wechat")
+    pub channel_id: String,
+    /// Recipient identifier (e.g., "user:123")
+    pub recipient: String,
+    /// Original message content
+    pub message: String,
+    /// Optional image data (base64 encoded)
+    #[serde(default)]
+    pub images: Option<Vec<ImageData>>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ImageData {
+    pub filename: String,
+    pub base64: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,6 +106,7 @@ impl WebchatChannel {
         support_reasoning: bool,
         require_pairing: bool,
         paired_tokens: Vec<String>,
+        workspace_dir: PathBuf,
     ) -> Self {
         let path = listen_path.unwrap_or_else(|| "/webchat".to_string());
         let listen_path = if path.starts_with('/') {
@@ -94,6 +122,7 @@ impl WebchatChannel {
             support_reasoning,
             pairing: PairingGuard::new(require_pairing, &paired_tokens),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            workspace_dir,
         }
     }
 
@@ -104,6 +133,138 @@ impl WebchatChannel {
             .find(|m| m.role == "user")
             .map(|m| m.content.trim().to_string())
             .filter(|s| !s.is_empty())
+    }
+
+    /// 保存 base64 图片到本地并返回文件路径
+    fn save_image_from_base64(&self, base64_data: &str, filename: &str) -> Result<String, String> {
+        // 使用 workspace 目录下的 media 文件夹
+        let image_dir = self.workspace_dir.join("media");
+
+        fs::create_dir_all(&image_dir)
+            .map_err(|e| format!("Failed to create image directory: {}", e))?;
+
+        // 解析 base64 数据（移除 data:image/xxx;base64, 前缀）
+        let base64_str = base64_data.split(',').next_back().unwrap_or(base64_data);
+
+        let image_bytes = STANDARD
+            .decode(base64_str)
+            .map_err(|e| format!("Failed to decode base64: {}", e))?;
+
+        let file_path = image_dir.join(filename);
+
+        fs::write(&file_path, &image_bytes)
+            .map_err(|e| format!("Failed to write image file: {}", e))?;
+
+        Ok(file_path.to_string_lossy().to_string())
+    }
+
+    /// 从请求中提取用户消息内容和发送者标识
+    ///
+    /// 如果存在 node_req，使用 node_req 中的 message 和 recipient；
+    /// 如果有图片，保存到本地并在 message 后追加 [IMAGE:<path>] 占位符。
+    fn extract_user_content_and_sender(
+        &self,
+        body: &HttpChatRequest,
+        session_id: &str,
+    ) -> Result<(String, String), (axum::http::StatusCode, Json<serde_json::Value>)> {
+        if let Some(node_req) = &body.node_req {
+            let mut content = node_req.message.clone();
+
+            // 处理图片
+            if let Some(images) = &node_req.images {
+                for (i, image) in images.iter().enumerate() {
+                    match self.save_image_from_base64(&image.base64, &image.filename) {
+                        Ok(path) => {
+                            content.push_str(&format!(" [IMAGE:{}]", path));
+                        }
+                        Err(e) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Write
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "filename": image.filename.as_str(),
+                                    "error": e,
+                                })),
+                                "Failed to save webchat image"
+                            );
+                            content.push_str(&format!(" [IMAGE:{}:failed_to_save]", i));
+                        }
+                    }
+                }
+            }
+
+            Ok((content, node_req.recipient.clone()))
+        } else {
+            // 普通聊天模式
+            if body.messages.is_empty() {
+                return Err((
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "messages must not be empty" })),
+                ));
+            }
+
+            let Some(user_content) = Self::user_content_from_messages(&body.messages) else {
+                return Err((
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(
+                        serde_json::json!({ "error": "last user message content must not be empty" }),
+                    ),
+                ));
+            };
+            Ok((user_content, session_id.to_string()))
+        }
+    }
+
+    /// 构建 ChannelMessage 用于发送到代理通道
+    /// 返回 (ChannelMessage, is_immediate)
+    fn build_channel_message(
+        body: &HttpChatRequest,
+        sender: &str,
+        session_id: &str,
+        user_content: &str,
+    ) -> (ChannelMessage, bool) {
+        let channel_name = body
+            .node_req
+            .as_ref()
+            .map(|n| n.channel_id.as_str())
+            .unwrap_or("webchat");
+        let reply_target = body
+            .node_req
+            .as_ref()
+            .map(|n| n.recipient.as_str())
+            .unwrap_or(session_id);
+        let is_immediate = body
+            .node_req
+            .as_ref()
+            .map(|n| !n.event.is_empty())
+            .unwrap_or(false);
+        let msg_id = if is_immediate {
+            "[Immediately Message]".to_string()
+        } else {
+            format!("webchat_{}", Uuid::new_v4())
+        };
+
+        let msg = ChannelMessage {
+            id: msg_id,
+            sender: sender.to_string(),
+            reply_target: reply_target.to_string(),
+            content: user_content.to_string(),
+            channel: channel_name.to_string(),
+            channel_alias: None,
+            subject: None,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: Vec::new(),
+        };
+        (msg, is_immediate)
     }
 
     fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -175,6 +336,7 @@ impl Clone for WebchatChannel {
             support_reasoning: self.support_reasoning,
             pairing: self.pairing.clone(),
             sessions: Arc::clone(&self.sessions),
+            workspace_dir: self.workspace_dir.clone(),
         }
     }
 }
@@ -422,39 +584,61 @@ impl Channel for WebchatChannel {
                     .into_response();
             }
 
-            if body.messages.is_empty() {
-                return (
-                    axum::http::StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({ "error": "messages must not be empty" })),
-                )
-                    .into_response();
-            }
-
-            let Some(user_content) = WebchatChannel::user_content_from_messages(&body.messages)
-            else {
-                return (
-                    axum::http::StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({ "error": "last user message content must not be empty" })),
-                )
-                    .into_response();
-            };
-
             let session_id = body
                 .session_id
+                .clone()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "agent_default_session".to_string());
-            let sender = session_id.clone();
+
+            let (user_content, sender) = match state
+                .channel
+                .extract_user_content_and_sender(&body, &session_id)
+            {
+                Ok(v) => v,
+                Err(e) => return e.into_response(),
+            };
+
             let wants_stream = body.stream;
             let model_label = body
                 .model
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .unwrap_or("agemt::main")
+                .unwrap_or("agent::main")
                 .to_string();
             let completion_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
             let created = chrono::Utc::now().timestamp();
 
+            let (msg, is_immediate) =
+                WebchatChannel::build_channel_message(&body, &sender, &session_id, &user_content);
+
+            // 如果是立即响应场景，不注册 session，直接返回响应断开连接
+            if is_immediate {
+                if state.tx.send(msg).await.is_err() {
+                    return (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({ "error": "agent channel closed" })),
+                    )
+                        .into_response();
+                }
+                return (
+                    axum::http::StatusCode::OK,
+                    Json(serde_json::json!({
+                        "id": completion_id,
+                        "object": "chat.completion",
+                        "created": created,
+                        "model": model_label,
+                        "choices": [{
+                            "index": 0,
+                            "message": { "role": "assistant", "content": "事件已发送" },
+                            "finish_reason": "stop",
+                        }],
+                    })),
+                )
+                    .into_response();
+            }
+
+            // 普通场景：注册 session 并等待响应
             let (mode, sse, wait_rx) = if wants_stream {
                 let (evt_tx, evt_rx) = mpsc::channel::<StreamFrame>(128);
                 let stream = ReceiverStream::new(evt_rx).map(|evt| {
@@ -493,23 +677,6 @@ impl Channel for WebchatChannel {
                     },
                 );
             }
-
-            let msg = ChannelMessage {
-                id: format!("webchat_{}", Uuid::new_v4()),
-                sender,
-                reply_target: session_id.clone(),
-                content: user_content,
-                channel: "webchat".to_string(),
-                channel_alias: None,
-                subject: None,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-                thread_ts: None,
-                interruption_scope_id: None,
-                attachments: Vec::new(),
-            };
 
             if state.tx.send(msg).await.is_err() {
                 return (

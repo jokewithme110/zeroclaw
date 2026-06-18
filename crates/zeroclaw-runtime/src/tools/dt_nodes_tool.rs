@@ -516,7 +516,7 @@ impl Tool for NodesTool {
     }
 
     fn description(&self) -> &str {
-        "Discover and control paired nodes (status/describe/pairing/notify/camera/screen/location/run/media/invoke)."
+        "Discover and manage paired nodes, with event subscription capabilities. `status` for viewing node capabilities and event subscription"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -539,7 +539,10 @@ impl Tool for NodesTool {
                         "location_get",
                         "run",
                         "media_saveImage",
-                        "invoke"
+                        "invoke",
+                        "event_subscribe",
+                        "event_unsubscribe",
+                        "event_subscribe_query"
                     ],
                     "description": "Node action selector"
                 },
@@ -684,6 +687,19 @@ impl Tool for NodesTool {
                 "filename": {
                     "type": "string",
                     "description": "Optional target filename for media_saveImage"
+                },
+                "topics": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Event topics to subscribe/unsubscribe"
+                },
+                "channel": {
+                    "type": "string",
+                    "description": "Channel name for event subscription (e.g., qq, feishu, dingtalk)"
+                },
+                "recipient": {
+                    "type": "string",
+                    "description": "Recipient identifier (user/group/chat ID) for event subscription"
                 }
             },
             "required": ["action"]
@@ -1080,6 +1096,63 @@ impl Tool for NodesTool {
                 let node_id = self.resolve_node(&args)?;
                 let params = Self::build_media_save_image_params(&args).await?;
                 self.execute_invoke_action(&node_id, "media.saveImage", params)
+                    .await
+            }
+            "event_subscribe" => {
+                let node_id = self.resolve_node(&args)?;
+                let topics = args
+                    .get("topics")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| anyhow::Error::msg("topics array required"))?;
+                let topics_vec: Vec<String> = topics
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+                if topics_vec.is_empty() {
+                    return Err(anyhow::Error::msg("topics must not be empty"));
+                }
+                let channel = Self::read_required_string(&args, "channel")?;
+                let recipient = Self::read_required_string(&args, "recipient")?;
+                let params = serde_json::json!({
+                    "topics": topics_vec,
+                    "channel": channel,
+                    "recipient": recipient,
+                });
+                self.execute_invoke_action(&node_id, "event.subscribe", params)
+                    .await
+            }
+            "event_unsubscribe" => {
+                let node_id = self.resolve_node(&args)?;
+                let topics = args
+                    .get("topics")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| anyhow::Error::msg("topics array required"))?;
+                let topics_vec: Vec<String> = topics
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+                if topics_vec.is_empty() {
+                    return Err(anyhow::Error::msg("topics must not be empty"));
+                }
+                let channel = Self::read_required_string(&args, "channel")?;
+                let recipient = Self::read_required_string(&args, "recipient")?;
+                let params = serde_json::json!({
+                    "topics": topics_vec,
+                    "channel": channel,
+                    "recipient": recipient,
+                });
+                self.execute_invoke_action(&node_id, "event.unsubscribe", params)
+                    .await
+            }
+            "event_subscribe_query" => {
+                let node_id = self.resolve_node(&args)?;
+                let channel = Self::read_optional_nonempty_string(&args, "channel");
+                let params = if let Some(ch) = channel {
+                    serde_json::json!({ "channel": ch })
+                } else {
+                    serde_json::json!({})
+                };
+                self.execute_invoke_action(&node_id, "event.subscribe.query", params)
                     .await
             }
             _ => Ok(ToolResult {

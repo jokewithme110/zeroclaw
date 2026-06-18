@@ -10,24 +10,39 @@ publish = false
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"
+chrono = { version = "0.4", features = ["now"] }
+clap = { version = "4.5", features = ["derive"] }
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
+directories = "6.0"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 hostname = "0.4.2"
+once_cell = "1.21"
+parking_lot = "0.12"
 rand = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process", "io-std", "fs", "signal"] }
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", default-features = false, features = ["rt"], optional = true }
+toml = "0.8"
 tracing = { version = "0.1", default-features = false }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 zeroclaw-config.workspace = true
 zeroclaw-log.workspace = true
 zeroclaw-runtime.workspace = true
 
 [features]
+default = ["agent-runtime"]
+agent-runtime = [
+    "zeroclaw-runtime/observability-prometheus",
+]
 auto_discovery = ["dep:tokio-util"]
 
 [dev-dependencies]
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 tempfile = "3.26"
+
+[[bin]]
+name = "zeroclaw-dt-nodes"
+path = "src/main.rs"

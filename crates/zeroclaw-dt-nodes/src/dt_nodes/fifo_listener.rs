@@ -48,12 +48,6 @@ impl GatewayInfo {
         }
         Ok(())
     }
-
-    /// Build WebSocket URL from gateway info (without token in URL).
-    /// Token should be passed via Authorization header instead.
-    pub fn ws_url(&self) -> String {
-        format!("ws://{}:{}/", self.ip, self.port)
-    }
 }
 
 /// Listen on FIFO pipe for gateway information.

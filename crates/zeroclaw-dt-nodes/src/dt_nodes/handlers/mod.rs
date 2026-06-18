@@ -12,5 +12,9 @@ pub trait Handler: Send + Sync {
 }
 
 pub mod camera_snap;
+pub mod event_store;
+pub mod event_subscribe;
+pub mod event_subscribe_query;
+pub mod event_unsubscribe;
 pub mod file_save;
 pub mod system_run;

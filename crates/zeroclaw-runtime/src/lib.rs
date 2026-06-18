@@ -5,6 +5,8 @@
 )]
 //! Agent runtime — orchestration, security, observability, cron, SOP, skills, hardware, and more.
 
+#![recursion_limit = "256"]
+
 pub mod channel;
 pub mod cli_input;
 pub mod identity;

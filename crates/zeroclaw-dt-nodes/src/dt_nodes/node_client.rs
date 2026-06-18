@@ -1,10 +1,12 @@
+use crate::config::NodeIdentity;
 use crate::dt_nodes::{
-    NodeIdentityFile, executor,
+    executor,
     node_runtime_trace::{self, NodeTraceCtx},
 };
 use anyhow::{Error, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
 use tokio::select;
 use tokio::time::{Duration, sleep};
 use tokio_tungstenite::connect_async_tls_with_config;
@@ -19,7 +21,8 @@ type WsSink = futures_util::stream::SplitSink<WsStream, Message>;
 
 pub async fn run_loop(
     url: String,
-    identity: &NodeIdentityFile,
+    identity: &NodeIdentity,
+    workspace_dir: Option<PathBuf>,
     stop: impl std::future::Future<Output = std::io::Result<()>>,
 ) -> Result<()> {
     tokio::pin!(stop);
@@ -48,7 +51,7 @@ pub async fn run_loop(
                 return Err(e.into());
             }
         };
-        if let Some(token) = &identity.gateway.token {
+        if let Some(token) = &identity.token {
             if let Ok(value) = HeaderValue::from_str(token) {
                 request.headers_mut().insert("X-Node-Control-Token", value);
             }
@@ -97,12 +100,7 @@ pub async fn run_loop(
             req_id: "node_ws_session",
             node_id: &identity.device_id,
         };
-        node_runtime_trace::ws_connected(
-            &trace_ctx,
-            &identity.gateway.host,
-            identity.gateway.port,
-            attempt,
-        );
+        node_runtime_trace::ws_connected(&trace_ctx, &identity.host, identity.port, attempt);
         let session_result: Result<()> = loop {
             select! {
                 biased;
@@ -174,7 +172,14 @@ pub async fn run_loop(
                             break Err(Error::msg(format!("failed to send connect frame: {e}")));
                         }
                     } else if frame_type == "event" && event == "node.invoke.request" {
-                        if let Err(e) = handle_invoke_request(&mut sink, identity, &parsed).await {
+                        if let Err(e) = handle_invoke_request(
+                            &mut sink,
+                            identity,
+                            &parsed,
+                            workspace_dir.as_deref(),
+                        )
+                        .await
+                        {
                             break Err(e);
                         }
                     }
@@ -220,7 +225,7 @@ pub async fn run_loop(
     }
 }
 
-fn build_connect_request(identity: &NodeIdentityFile, nonce: String) -> serde_json::Value {
+fn build_connect_request(identity: &NodeIdentity, nonce: String) -> serde_json::Value {
     let client = serde_json::json!({
         "id": "zeroclaw-node",
         "version": env!("CARGO_PKG_VERSION"),
@@ -230,8 +235,16 @@ fn build_connect_request(identity: &NodeIdentityFile, nonce: String) -> serde_js
     });
     let device = serde_json::json!({ "id": identity.device_id, "nonce": nonce });
     let caps = vec!["system", "file", "camera"];
-    let commands = vec!["system.run", "media.saveImage", "camera.snap"];
-    let auth = serde_json::json!({ "token": identity.gateway.token.clone() });
+    let commands = vec![
+        "system.run",
+        "media.saveImage",
+        "camera.snap",
+        "event.subscribe",
+        "event.unsubscribe",
+        "event.subscribe.list",
+    ];
+    let auth = serde_json::json!({ "token": identity.token.clone() });
+    let events = &identity.events;
     serde_json::json!({
         "type": "req",
         "id": uuid::Uuid::new_v4().to_string(),
@@ -241,6 +254,7 @@ fn build_connect_request(identity: &NodeIdentityFile, nonce: String) -> serde_js
             "client": client,
             "device": device,
             "caps": caps,
+            "events": events,
             "commands": commands,
             "auth": auth,
         }
@@ -249,8 +263,9 @@ fn build_connect_request(identity: &NodeIdentityFile, nonce: String) -> serde_js
 
 async fn handle_invoke_request(
     sink: &mut WsSink,
-    identity: &NodeIdentityFile,
+    identity: &NodeIdentity,
     parsed: &Value,
+    workspace_dir: Option<&Path>,
 ) -> Result<()> {
     let payload = parsed.get("payload").cloned().unwrap_or(Value::Null);
     let req_id = payload
@@ -294,7 +309,14 @@ async fn handle_invoke_request(
         node_id: identity.device_id.as_str(),
     };
     node_runtime_trace::invoke_started(&trace_ctx, &command);
-    let outcome = executor::handle_invoke(&command, &params_json, Some(&trace_ctx)).await;
+    let outcome = executor::handle_invoke(
+        &command,
+        &params_json,
+        Some(&trace_ctx),
+        workspace_dir,
+        identity.events.clone(),
+    )
+    .await;
     node_runtime_trace::invoke_completed(&trace_ctx, &command, &outcome);
     zeroclaw_log::record!(
         INFO,

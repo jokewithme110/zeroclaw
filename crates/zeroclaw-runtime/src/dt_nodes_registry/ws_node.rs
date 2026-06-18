@@ -153,7 +153,9 @@ pub async fn handle_node_socket(
                 serde_json::Value::String(peer_addr.ip().to_string()),
             );
         }
-        let rx = registry.register(node_id.clone(), capabilities, Some(meta));
+        // Extract events from params (if provided by node)
+        let events = params.get("events").cloned();
+        let rx = registry.register(node_id.clone(), capabilities, Some(meta), events);
         let connect_res = serde_json::json!({
             "type":"res","id":connect_id,"ok":true,"payload":{"nodeId":node_id}
         });
