@@ -158,11 +158,21 @@ const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
 // History management moved to `super::history`.
 pub use super::history::{
-    append_or_merge_system_message, canonicalize_tool_result_media_markers, emergency_history_trim,
-    estimate_history_tokens, fast_trim_tool_results, load_interactive_session_history,
-    normalize_system_messages, save_interactive_session_history, trim_history,
-    truncate_tool_result,
+    append_or_merge_system_message, canonicalize_tool_result_media_markers,
+    effective_recent_history_keep, emergency_history_trim, estimate_history_tokens,
+    fast_trim_tool_results, load_interactive_session_history, normalize_system_messages,
+    save_interactive_session_history, trim_history, truncate_tool_result,
 };
+
+fn compression_error_trim_target(
+    max_history_messages: usize,
+    recent_history_keep: Option<usize>,
+) -> usize {
+    let half_history = max_history_messages / 2;
+    effective_recent_history_keep(max_history_messages, recent_history_keep)
+        .map(|keep| keep.min(half_history))
+        .unwrap_or(half_history)
+}
 
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
@@ -3388,6 +3398,7 @@ pub async fn run(
         // See `Config::effective_*` helpers for precedence rules.
         let _eff_max_tool_iterations = config.effective_max_tool_iterations(agent_alias);
         let eff_max_history_messages = config.effective_max_history_messages(agent_alias);
+        let eff_recent_history_keep = config.effective_recent_history_keep(agent_alias);
         let eff_max_context_tokens = config.effective_max_context_tokens(agent_alias);
         let eff_compact_context = config.effective_compact_context(agent_alias);
         let eff_max_system_prompt_chars = config.effective_max_system_prompt_chars(agent_alias);
@@ -4731,13 +4742,21 @@ pub async fn run(
                                 .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                                 "Context compression failed, falling back to history trim"
                             );
-                            trim_history(&mut history, eff_max_history_messages / 2);
+                            let fallback_target = compression_error_trim_target(
+                                eff_max_history_messages,
+                                eff_recent_history_keep,
+                            );
+                            trim_history(&mut history, fallback_target, None);
                         }
                     }
                 }
 
                 // Hard cap as a safety net.
-                trim_history(&mut history, eff_max_history_messages);
+                trim_history(
+                    &mut history,
+                    eff_max_history_messages,
+                    eff_recent_history_keep,
+                );
 
                 // Restore base system prompt (remove per-turn thinking prefix).
                 if thinking_params.system_prompt_prefix.is_some()
@@ -11015,7 +11034,7 @@ This is an example, not an invocation."#;
         let original_len = history.len();
         assert!(original_len > DEFAULT_MAX_HISTORY_MESSAGES + 1);
 
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES, None);
 
         // System prompt preserved
         assert_eq!(history[0].role, "system");
@@ -11037,7 +11056,7 @@ This is an example, not an invocation."#;
             ChatMessage::user("hello"),
             ChatMessage::assistant("hi"),
         ];
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES, None);
         assert_eq!(history.len(), 3);
     }
 
@@ -11296,7 +11315,7 @@ This is an example, not an invocation."#;
         for i in 0..DEFAULT_MAX_HISTORY_MESSAGES + 20 {
             history.push(ChatMessage::user(format!("msg {i}")));
         }
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES, None);
         assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES);
     }
 
@@ -11308,7 +11327,7 @@ This is an example, not an invocation."#;
             history.push(ChatMessage::user(format!("user {i}")));
             history.push(ChatMessage::assistant(format!("assistant {i}")));
         }
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES, None);
         assert_eq!(history[0].role, "system");
         assert_eq!(history[history.len() - 1].role, "assistant");
     }
@@ -11317,7 +11336,7 @@ This is an example, not an invocation."#;
     fn trim_history_with_only_system_prompt() {
         // Recovery: Only system prompt should not be trimmed
         let mut history = vec![ChatMessage::system("system prompt")];
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES, None);
         assert_eq!(history.len(), 1);
     }
 
@@ -11525,14 +11544,14 @@ Let me check the result."#;
     #[test]
     fn trim_history_empty_history() {
         let mut history: Vec<ChatMessage> = vec![];
-        trim_history(&mut history, 10);
+        trim_history(&mut history, 10, None);
         assert!(history.is_empty());
     }
 
     #[test]
     fn trim_history_system_only() {
         let mut history = vec![ChatMessage::system("system prompt")];
-        trim_history(&mut history, 10);
+        trim_history(&mut history, 10, None);
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].role, "system");
     }
@@ -11544,7 +11563,7 @@ Let me check the result."#;
             ChatMessage::user("msg 1"),
             ChatMessage::assistant("reply 1"),
         ];
-        trim_history(&mut history, 2); // 2 non-system messages = exactly at limit
+        trim_history(&mut history, 2, None); // 2 non-system messages = exactly at limit
         assert_eq!(history.len(), 3, "should not trim when exactly at limit");
     }
 
@@ -11563,7 +11582,7 @@ Let me check the result."#;
             ChatMessage::assistant("recent reply"),
         ];
         // max_history = 3 → keep anchor + 2 most recent (=3 non-system).
-        trim_history(&mut history, 3);
+        trim_history(&mut history, 3, None);
         assert_eq!(history[0].role, "system");
         assert_eq!(
             history[1].content, "anchor: what's the task",
@@ -11583,10 +11602,37 @@ Let me check the result."#;
             ChatMessage::assistant("middle"),
             ChatMessage::user("recent"),
         ];
-        trim_history(&mut history, 1);
+        trim_history(&mut history, 1, None);
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].role, "system");
         assert_eq!(history[1].content, "recent");
+    }
+
+    #[test]
+    fn trim_history_generational_keeps_anchor_and_recent_tail() {
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("anchor"),
+            ChatMessage::assistant("middle a1"),
+            ChatMessage::user("middle u1"),
+            ChatMessage::assistant("middle a2"),
+            ChatMessage::user("recent u"),
+            ChatMessage::assistant("recent a"),
+        ];
+        trim_history(&mut history, 4, Some(2));
+        assert_eq!(history[0].role, "system");
+        assert_eq!(history[1].content, "anchor");
+        assert_eq!(history[2].content, "recent u");
+        assert_eq!(history[3].content, "recent a");
+    }
+
+    #[test]
+    fn compression_error_trim_target_preserves_half_history_fallback() {
+        assert_eq!(compression_error_trim_target(10, None), 5);
+        assert_eq!(compression_error_trim_target(10, Some(0)), 5);
+        assert_eq!(compression_error_trim_target(10, Some(10)), 5);
+        assert_eq!(compression_error_trim_target(10, Some(8)), 5);
+        assert_eq!(compression_error_trim_target(10, Some(4)), 4);
     }
 
     /// When `build_system_prompt_with_mode` is called with `native_tools = true`,

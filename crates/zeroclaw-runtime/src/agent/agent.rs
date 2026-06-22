@@ -1534,6 +1534,11 @@ impl Agent {
 
     fn trim_history(&mut self) {
         let max = self.config.resolved.max_history_messages;
+        let target_keep = crate::agent::history::effective_recent_history_keep(
+            max,
+            self.config.resolved.recent_history_keep,
+        )
+        .unwrap_or(max);
         if self.history.len() <= max {
             return;
         }
@@ -1551,7 +1556,7 @@ impl Agent {
         }
 
         if other_messages.len() > max {
-            let initial_drop_count = other_messages.len() - max;
+            let initial_drop_count = other_messages.len() - target_keep;
             let mut drop_count = initial_drop_count;
 
             ::zeroclaw_log::record!(
@@ -1561,6 +1566,8 @@ impl Agent {
                     .with_attrs(::serde_json::json!({
                         "total_messages": other_messages.len(),
                         "max_history": max,
+                        "target_keep": target_keep,
+                        "recent_history_keep": self.config.resolved.recent_history_keep,
                         "initial_drop_count": initial_drop_count,
                     })),
                 "trim_history: dropping oldest messages"

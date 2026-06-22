@@ -366,7 +366,18 @@ pub fn append_or_merge_system_message(history: &mut Vec<ChatMessage>, content: i
 ///
 /// Drops from the middle. Emits a WARN with counts on every fire so silent
 /// amnesia is impossible to miss again.
-pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
+pub fn effective_recent_history_keep(
+    max_history: usize,
+    recent_keep: Option<usize>,
+) -> Option<usize> {
+    recent_keep.filter(|keep| *keep > 0 && *keep < max_history)
+}
+
+pub fn trim_history(
+    history: &mut Vec<ChatMessage>,
+    max_history: usize,
+    recent_keep: Option<usize>,
+) {
     let has_system = history.first().is_some_and(|m| m.role == "system");
     let non_system_count = if has_system {
         history.len() - 1
@@ -392,10 +403,12 @@ pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
 
     let messages_before = history.len();
 
+    let target_keep =
+        effective_recent_history_keep(max_history, recent_keep).unwrap_or(max_history);
     let dropped_range = match anchor_idx {
-        Some(anchor) if max_history >= 2 => {
-            // Reserve one slot for the anchor; keep `max_history - 1` most recent.
-            let tail_keep = max_history - 1;
+        Some(anchor) if target_keep >= 2 => {
+            // Reserve one slot for the anchor; keep `target_keep - 1` most recent.
+            let tail_keep = target_keep - 1;
             let tail_start = history.len().saturating_sub(tail_keep);
             // Middle range to drop: (anchor + 1) .. tail_start.
             let drop_start = anchor + 1;
@@ -413,8 +426,8 @@ pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
     if let Some(range) = dropped_range {
         history.drain(range);
     } else {
-        // No anchor, or `max_history < 2`: original head-drop behaviour.
-        let to_remove = non_system_count - max_history;
+        // No anchor, or `target_keep < 2`: original head-drop behaviour.
+        let to_remove = non_system_count - target_keep;
         history.drain(system_offset..system_offset + to_remove);
     }
 
@@ -432,7 +445,9 @@ pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
                     "messages_after": history.len(),
                     "dropped": dropped,
                     "max_history": max_history,
-                    "kept_anchor": anchor_idx.is_some() && max_history >= 2,
+                    "recent_keep": recent_keep,
+                    "target_keep": target_keep,
+                    "kept_anchor": anchor_idx.is_some() && target_keep >= 2,
                 })),
             "trim_history fired: middle of conversation dropped. Raise \
              [runtime_profiles.<name>] max_history_messages or enable \

@@ -3048,6 +3048,7 @@ pub struct ResolvedRuntime {
     pub compact_context: bool,
     pub max_tool_iterations: usize,
     pub max_history_messages: usize,
+    pub recent_history_keep: Option<usize>,
     pub max_context_tokens: usize,
     pub parallel_tools: bool,
     pub tool_dispatcher: String,
@@ -3071,6 +3072,7 @@ impl Default for ResolvedRuntime {
             compact_context: true,
             max_tool_iterations: 10,
             max_history_messages: 50,
+            recent_history_keep: None,
             max_context_tokens: 32_000,
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
@@ -3367,6 +3369,12 @@ impl Config {
     }
 
     #[must_use]
+    pub fn effective_recent_history_keep(&self, agent_alias: &str) -> Option<usize> {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.recent_history_keep)
+    }
+
+    #[must_use]
     pub fn effective_max_context_tokens(&self, agent_alias: &str) -> usize {
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.max_context_tokens)
@@ -3451,6 +3459,7 @@ impl Config {
         let mut resolved = ResolvedRuntime {
             max_tool_iterations: self.effective_max_tool_iterations(agent_alias),
             max_history_messages: self.effective_max_history_messages(agent_alias),
+            recent_history_keep: self.effective_recent_history_keep(agent_alias),
             max_context_tokens: self.effective_max_context_tokens(agent_alias),
             compact_context: self.effective_compact_context(agent_alias),
             parallel_tools: self.effective_parallel_tools(agent_alias),
@@ -10315,6 +10324,8 @@ pub struct RuntimeProfileConfig {
     // ── Per-agent runtime tunables (also live on AliasedAgentConfig) ─
     /// Maximum conversation history messages retained per session. `None` inherits.
     pub max_history_messages: Option<usize>,
+    /// Optional low-water mark for generational history eviction. `None` inherits.
+    pub recent_history_keep: Option<usize>,
     /// Maximum estimated tokens for context before compaction. `None` inherits.
     pub max_context_tokens: Option<usize>,
     /// Use compact bootstrap (6000 chars / 2 RAG chunks). `None` inherits.
@@ -10362,6 +10373,7 @@ impl Default for RuntimeProfileConfig {
             delegation_timeout_secs: None,
             agentic_timeout_secs: None,
             max_history_messages: None,
+            recent_history_keep: None,
             max_context_tokens: None,
             compact_context: None,
             parallel_tools: None,
@@ -19790,6 +19802,7 @@ auto_save = true
                 );
                 p
             },
+            files_cleanup: TempFileCleanupConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             data_dir: PathBuf::from("/tmp/test/workspace"),
@@ -20322,6 +20335,7 @@ reasoning_effort = "turbo"
         assert!(cfg.resolved.compact_context);
         assert_eq!(cfg.resolved.max_tool_iterations, 10);
         assert_eq!(cfg.resolved.max_history_messages, 50);
+        assert_eq!(cfg.resolved.recent_history_keep, None);
         assert!(!cfg.resolved.parallel_tools);
         assert_eq!(cfg.resolved.tool_dispatcher, "auto");
         assert!(!cfg.resolved.strict_tool_parsing);
@@ -20379,6 +20393,25 @@ runtime_profile = "fast"
 "#;
         let parsed = parse_test_config(raw);
         assert_eq!(parsed.effective_max_tool_iterations("default"), 10);
+    }
+
+    #[test]
+    async fn runtime_profile_recent_history_keep_is_honored() {
+        let raw = r#"
+[runtime_profiles.fast]
+max_history_messages = 80
+recent_history_keep = 4
+
+[agents.default]
+runtime_profile = "fast"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(parsed.effective_recent_history_keep("default"), Some(4));
+        let resolved = parsed
+            .resolved_agent_config("default")
+            .expect("agent should resolve");
+        assert_eq!(resolved.resolved.max_history_messages, 80);
+        assert_eq!(resolved.resolved.recent_history_keep, Some(4));
     }
 
     #[test]
@@ -20545,6 +20578,7 @@ default_temperature = 0.7
             degraded_security: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers,
+            files_cleanup: TempFileCleanupConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             data_dir: dir.join("workspace"),
@@ -21975,6 +22009,7 @@ allowed_numbers = ["+1", "+2"]
             webhook_rate_limit_per_minute: 80,
             trust_forwarded_headers: true,
             path_prefix: Some("/zeroclaw".into()),
+            capability_control: GatewayCapabilityControlConfig::default(),
             rate_limit_max_keys: 2048,
             idempotency_ttl_secs: 600,
             idempotency_max_keys: 4096,

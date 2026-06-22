@@ -127,6 +127,7 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider};
+use zeroclaw_runtime::agent::history::effective_recent_history_keep;
 use zeroclaw_runtime::agent::loop_::{
     apply_policy_tool_filter, apply_text_tool_prompt_policy, build_tool_instructions_for_names,
     clear_model_switch_request, get_model_switch_state, is_model_switch_requested,
@@ -212,12 +213,24 @@ type PendingNewSessionSet = Arc<Mutex<HashSet<String>>>;
 const MAX_CONVERSATION_SENDERS: usize = 1000;
 /// Maximum history messages to keep per sender.
 const MAX_CHANNEL_HISTORY: usize = 50;
+/// Multiplier applied to the effective `max_history_messages` to derive a loose
+/// per-sender cache cap before the LLM-side trim runs.
+const CHANNEL_CACHE_SAFETY_CAP_MULTIPLIER: usize = 4;
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Messages shorter than this (e.g. "ok", "thanks") are not stored,
 /// reducing noise in memory recall.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 const CURRENT_DATE_HEADING: &str = "## Current Date\n\n";
 const LEGACY_CURRENT_DATE_TIME_HEADING: &str = "## Current Date & Time\n\n";
+
+fn per_sender_cache_safety_cap(max_history_messages: usize) -> usize {
+    let effective = if max_history_messages > 0 {
+        max_history_messages
+    } else {
+        MAX_CHANNEL_HISTORY
+    };
+    effective.saturating_mul(CHANNEL_CACHE_SAFETY_CAP_MULTIPLIER)
+}
 
 // System prompt functions live in `zeroclaw_runtime::agent::system_prompt`.
 #[allow(unused_imports)]
@@ -1753,6 +1766,63 @@ fn proactive_trim_turns(turns: &mut Vec<ChatMessage>, budget: usize) -> usize {
     drop_count
 }
 
+/// Channel history must be trimmed on complete user-scoped turns rather than
+/// arbitrary message boundaries.  A "turn" starts at a user message and spans
+/// everything up to (but not including) the next user message. This preserves
+/// assistant replies and any retained tool context together, avoiding
+/// user/user or assistant/user boundary corruption after generational trim.
+fn trim_channel_history_preserving_turns(
+    history: &mut Vec<ChatMessage>,
+    max_history: usize,
+    recent_keep: Option<usize>,
+) -> usize {
+    let has_system = history.first().is_some_and(|m| m.role == "system");
+    let start = usize::from(has_system);
+    let non_system_count = history.len().saturating_sub(start);
+    if non_system_count <= max_history {
+        return 0;
+    }
+
+    let target_keep =
+        effective_recent_history_keep(max_history, recent_keep).unwrap_or(max_history);
+    let user_indices: Vec<usize> = history
+        .iter()
+        .enumerate()
+        .skip(start)
+        .filter_map(|(idx, msg)| (msg.role == "user").then_some(idx))
+        .collect();
+
+    if user_indices.is_empty() {
+        let to_remove = non_system_count.saturating_sub(target_keep);
+        history.drain(start..start + to_remove);
+        return to_remove;
+    }
+
+    let mut keep_start = history.len();
+    let mut kept = 0_usize;
+
+    for (pos, &seg_start) in user_indices.iter().enumerate().rev() {
+        let seg_end = user_indices
+            .get(pos + 1)
+            .copied()
+            .unwrap_or(history.len());
+        let seg_len = seg_end.saturating_sub(seg_start);
+        keep_start = seg_start;
+        kept += seg_len;
+        if kept >= target_keep {
+            break;
+        }
+    }
+
+    if keep_start <= start {
+        return 0;
+    }
+
+    let dropped = keep_start - start;
+    history.drain(start..keep_start);
+    dropped
+}
+
 fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
     // Persist to JSONL before adding to in-memory history.
     if let Some(ref store) = ctx.session_store
@@ -1767,16 +1837,7 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
         );
     }
 
-    // Use the user-configured max_history_messages (fall back to
-    // MAX_CHANNEL_HISTORY when the config value is 0 or absent).
-    let max_history = {
-        let configured = ctx.agent_cfg.resolved.max_history_messages;
-        if configured > 0 {
-            configured
-        } else {
-            MAX_CHANNEL_HISTORY
-        }
-    };
+    let safety_cap = per_sender_cache_safety_cap(ctx.agent_cfg.resolved.max_history_messages);
 
     let mut histories = ctx
         .conversation_histories
@@ -1784,9 +1845,7 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
         .unwrap_or_else(|e| e.into_inner());
     let turns = histories.get_or_insert_mut(sender_key.to_string(), Vec::new);
     turns.push(turn);
-    while turns.len() > max_history {
-        turns.remove(0);
-    }
+    let _ = trim_channel_history_preserving_turns(turns, safety_cap, None);
 }
 
 /// Extract tool-call (assistant with tool_call content) and tool-result
@@ -4256,6 +4315,11 @@ async fn process_channel_message_body(
     // Use the existing ContextCompressor to summarize older history
     // before the LLM call, preventing context-window-exceeded errors
     // and preserving key decisions through LLM-driven summarization.
+    let max_history = if ctx.agent_cfg.resolved.max_history_messages > 0 {
+        ctx.agent_cfg.resolved.max_history_messages
+    } else {
+        MAX_CHANNEL_HISTORY
+    };
     {
         let cc_config = ctx.agent_cfg.resolved.context_compression.clone();
         let compressor = zeroclaw_runtime::agent::context_compressor::ContextCompressor::new(
@@ -4281,10 +4345,43 @@ async fn process_channel_message_body(
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "Context compression failed, proceeding without"
+                    "Context compression failed, falling back to history trim"
                 );
+                let half = max_history / 2;
+                let fallback_target = effective_recent_history_keep(
+                    max_history,
+                    ctx.agent_cfg.resolved.recent_history_keep,
+                )
+                .map(|keep| keep.min(half))
+                .unwrap_or(half);
+                let _ = trim_channel_history_preserving_turns(&mut history, fallback_target, None);
             }
             _ => {}
+        }
+    }
+
+    let _ = trim_channel_history_preserving_turns(
+        &mut history,
+        max_history,
+        ctx.agent_cfg.resolved.recent_history_keep,
+    );
+
+    {
+        // Persist the post-trim view back into the per-sender cache so future
+        // turns continue from the same bounded history the model last saw,
+        // rather than rebuilding from a wider pre-trim cache on every request.
+        let mut trimmed_non_system: Vec<ChatMessage> = history[1..].to_vec();
+        if let Some(last) = trimmed_non_system.iter_mut().rfind(|m| m.role == "user") {
+            if last.content == timestamped_content {
+                last.content = timestamped_history_content.clone();
+            }
+        }
+        let mut histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(cache_entry) = histories.get_mut(&history_key) {
+            *cache_entry = trimmed_non_system;
         }
     }
 
@@ -11478,6 +11575,64 @@ api_key = "anthropic-key"
     }
 
     #[test]
+    fn per_sender_cache_safety_cap_scales_with_configured_max_history() {
+        let cap = per_sender_cache_safety_cap(500);
+        assert!(
+            cap >= 500,
+            "safety cap must never be tighter than max_history_messages, got {cap}"
+        );
+        assert_eq!(cap, 500 * CHANNEL_CACHE_SAFETY_CAP_MULTIPLIER);
+    }
+
+    #[test]
+    fn per_sender_cache_safety_cap_uses_default_when_config_is_zero() {
+        let cap = per_sender_cache_safety_cap(0);
+        assert_eq!(
+            cap,
+            MAX_CHANNEL_HISTORY * CHANNEL_CACHE_SAFETY_CAP_MULTIPLIER
+        );
+    }
+
+    #[test]
+    fn per_sender_cache_safety_cap_saturates_instead_of_overflowing() {
+        let cap = per_sender_cache_safety_cap(usize::MAX);
+        assert_eq!(cap, usize::MAX);
+    }
+
+    #[test]
+    fn trim_channel_history_preserving_turns_keeps_complete_recent_turns() {
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("[2026-06-22 16:31:40 +08:00] 6"),
+            ChatMessage::assistant("🎈"),
+            ChatMessage::user("[2026-06-22 16:32:38 +08:00] 7"),
+            ChatMessage::assistant("🐙"),
+            ChatMessage::user("[2026-06-22 16:32:44 +08:00] 9"),
+            ChatMessage::assistant("🦄"),
+            ChatMessage::user("[2026-06-22 16:32:51 +08:00] 556"),
+        ];
+
+        let dropped = trim_channel_history_preserving_turns(&mut history, 4, Some(2));
+        assert!(dropped > 0, "history should be trimmed");
+        assert_eq!(
+            history_signature(&history),
+            vec![
+                ("system".to_string(), "system".to_string()),
+                (
+                    "user".to_string(),
+                    "[2026-06-22 16:32:44 +08:00] 9".to_string()
+                ),
+                ("assistant".to_string(), "🦄".to_string()),
+                (
+                    "user".to_string(),
+                    "[2026-06-22 16:32:51 +08:00] 556".to_string()
+                ),
+            ],
+            "channel trim must keep complete recent turns and must not leave consecutive user messages"
+        );
+    }
+
+    #[test]
     fn rollback_orphan_user_turn_removes_only_latest_matching_user_turn() {
         let sender = "telegram_u3".to_string();
         let mut histories =
@@ -12818,7 +12973,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(ToolCallingModelProvider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -12836,12 +12991,17 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(prompt_config),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -12849,6 +13009,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -12877,6 +13038,7 @@ BTC is currently around $65,000 based on latest tool output."#
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         process_channel_message(
@@ -19120,7 +19282,7 @@ This is an example JSON object for profile settings."#;
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(AuthErrorModelProvider),
-            default_model_provider: Arc::new("dummy".to_string()),
+            model_provider_ref: Arc::new("dummy".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
@@ -19138,12 +19300,17 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -19151,6 +19318,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -19179,6 +19347,7 @@ This is an example JSON object for profile settings."#;
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         process_channel_message(
