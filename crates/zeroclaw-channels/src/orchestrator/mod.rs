@@ -1802,10 +1802,7 @@ fn trim_channel_history_preserving_turns(
     let mut kept = 0_usize;
 
     for (pos, &seg_start) in user_indices.iter().enumerate().rev() {
-        let seg_end = user_indices
-            .get(pos + 1)
-            .copied()
-            .unwrap_or(history.len());
+        let seg_end = user_indices.get(pos + 1).copied().unwrap_or(history.len());
         let seg_len = seg_end.saturating_sub(seg_start);
         keep_start = seg_start;
         kept += seg_len;
@@ -4371,10 +4368,10 @@ async fn process_channel_message_body(
         // turns continue from the same bounded history the model last saw,
         // rather than rebuilding from a wider pre-trim cache on every request.
         let mut trimmed_non_system: Vec<ChatMessage> = history[1..].to_vec();
-        if let Some(last) = trimmed_non_system.iter_mut().rfind(|m| m.role == "user") {
-            if last.content == timestamped_content {
-                last.content = timestamped_history_content.clone();
-            }
+        if let Some(last) = trimmed_non_system.iter_mut().rfind(|m| m.role == "user")
+            && last.content == timestamped_content
+        {
+            last.content = timestamped_history_content.clone();
         }
         let mut histories = ctx
             .conversation_histories
