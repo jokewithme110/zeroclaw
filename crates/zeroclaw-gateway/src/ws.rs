@@ -1450,7 +1450,17 @@ fn record_turn_cost(
         zeroclaw_runtime::agent::cost::PricingMapKeyMode::Alias,
     );
     drop(config);
-    let model_pricing = pricing_map.get(provider_name);
+    // provider_name comes from agent.model_provider_name which is just the
+    // provider type (e.g. "deepseek"). The pricing map is keyed by composite
+    // aliases (e.g. "deepseek.local_custom"). Try verbatim first, then fall
+    // back to the first matching `<type>.<alias>` key.
+    let model_pricing = pricing_map.get(provider_name).or_else(|| {
+        let prefix = format!("{provider_name}.");
+        pricing_map
+            .keys()
+            .find(|k| k.starts_with(&prefix))
+            .and_then(|k| pricing_map.get(k))
+    });
     let try_lookup = |key: &str| -> (f64, f64, f64) {
         let Some(map) = model_pricing else {
             return (0.0, 0.0, 0.0);
