@@ -253,6 +253,7 @@ impl Observer for OtelObserver {
                 channel,
                 agent_alias,
                 turn_id,
+                ..
             } => {
                 let parent_cx = self.parent_cx_for(turn_id.as_deref());
                 let mut span = tracer.build_with_context(
@@ -321,9 +322,7 @@ impl Observer for OtelObserver {
                 channel,
                 agent_alias,
                 turn_id,
-                input_tokens: _,
                 cached_input_tokens: _,
-                output_tokens: _,
                 cost_usd: _,
                 ..
             } => {
