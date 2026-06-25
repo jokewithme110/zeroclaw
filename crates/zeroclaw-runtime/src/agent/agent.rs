@@ -639,12 +639,11 @@ impl AgentBuilder {
                 anyhow::Error::msg("tool_dispatcher is required")
             })?,
             memory_strategy: memory_strategy.unwrap_or_else(|| {
-                Arc::new(
-                    crate::agent::memory_strategy::DefaultMemoryStrategy::with_config(
-                        memory.clone(),
-                        zeroclaw_config::schema::MemoryConfig::default(),
-                        workspace_dir.clone(),
-                    ),
+                crate::agent::memory_strategy::resolve_memory_strategy(
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    memory.clone(),
+                    workspace_dir.clone(),
+                    5,
                 )
             }),
             config: self.config.unwrap_or_default(),
@@ -1484,13 +1483,11 @@ impl Agent {
             .observer(observer)
             .response_cache(response_cache)
             .tool_dispatcher(tool_dispatcher)
-            .memory_strategy(Arc::new(
-                crate::agent::memory_strategy::DefaultMemoryStrategy::with_config_and_limit(
-                    memory.clone(),
-                    config.memory.clone(),
-                    security.workspace_dir.clone(),
-                    config.effective_memory_recall_limit(agent_alias),
-                ),
+            .memory_strategy(crate::agent::memory_strategy::resolve_memory_strategy(
+                config.memory.clone(),
+                memory.clone(),
+                security.workspace_dir.clone(),
+                config.effective_memory_recall_limit(agent_alias),
             ))
             .prompt_builder(SystemPromptBuilder::with_defaults())
             .config(

@@ -79,7 +79,7 @@ pub struct ComponentSpec {
     pub names: Vec<String>,
 }
 
-/// Component kinds recognized by the kernel. Matches the seven registries on
+/// Component kinds recognized by the kernel. Matches the eight registries on
 /// [`RegistrySet`](crate::plugin::RegistrySet).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -88,6 +88,7 @@ pub enum PluginCapability {
     Tool,
     Channel,
     Memory,
+    MemoryStrategy,
     Observer,
     Runtime,
     Peripheral,
@@ -163,6 +164,7 @@ mod tests {
             PluginCapability::Tool,
             PluginCapability::Channel,
             PluginCapability::Memory,
+            PluginCapability::MemoryStrategy,
             PluginCapability::Observer,
             PluginCapability::Runtime,
             PluginCapability::Peripheral,

@@ -99,6 +99,16 @@ pub type MemoryFactoryFn = unsafe extern "C" fn(
     out_memory: *mut *mut c_void,
 ) -> i32;
 
+/// Factory signature for a [`MemoryStrategy`](crate::memory_traits::MemoryStrategy) component.
+///
+/// Same contract as [`MemoryFactoryFn`]; the out-pointer refers to a
+/// `Box<dyn MemoryStrategy>`.
+pub type MemoryStrategyFactoryFn = unsafe extern "C" fn(
+    config_json: *const u8,
+    config_len: usize,
+    out_strategy: *mut *mut c_void,
+) -> i32;
+
 /// Factory signature for an [`Observer`](crate::observability_traits::Observer)
 /// component.
 pub type ObserverFactoryFn = unsafe extern "C" fn(
@@ -166,6 +176,14 @@ pub type RegisterMemoryFn = unsafe extern "C" fn(
     factory: MemoryFactoryFn,
 );
 
+/// Host callback for registering a [`MemoryStrategy`](crate::memory_traits::MemoryStrategy) factory.
+pub type RegisterMemoryStrategyFn = unsafe extern "C" fn(
+    handle: *mut c_void,
+    name: *const u8,
+    name_len: usize,
+    factory: MemoryStrategyFactoryFn,
+);
+
 /// Host callback for registering an [`Observer`](crate::observability_traits::Observer) factory.
 pub type RegisterObserverFn = unsafe extern "C" fn(
     handle: *mut c_void,
@@ -203,7 +221,7 @@ pub type RegisterPeripheralFn = unsafe extern "C" fn(
 /// # Layout
 ///
 /// `#[repr(C)]` guarantees a stable field order across compilers. The struct
-/// holds 8 pointer-sized fields.
+/// holds 9 pointer-sized fields.
 #[repr(C)]
 pub struct PluginHandle {
     /// Opaque host-side pointer. Plugins must not dereference.
@@ -220,6 +238,9 @@ pub struct PluginHandle {
 
     /// Register a Memory factory. See [`RegisterMemoryFn`].
     pub register_memory: RegisterMemoryFn,
+
+    /// Register a MemoryStrategy factory. See [`RegisterMemoryStrategyFn`].
+    pub register_memory_strategy: RegisterMemoryStrategyFn,
 
     /// Register an Observer factory. See [`RegisterObserverFn`].
     pub register_observer: RegisterObserverFn,
@@ -259,10 +280,10 @@ mod tests {
     impl DynPlugin for Probe {}
 
     #[test]
-    fn plugin_handle_size_is_eight_pointers() {
+    fn plugin_handle_size_is_nine_pointers() {
         assert_eq!(
             core::mem::size_of::<PluginHandle>(),
-            8 * core::mem::size_of::<*const c_void>(),
+            9 * core::mem::size_of::<*const c_void>(),
         );
     }
 

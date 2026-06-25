@@ -129,7 +129,6 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_backend::SessionBackend;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
 use zeroclaw_providers::{self, ModelProvider};
-use zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy;
 use zeroclaw_runtime::cost::CostTracker;
 use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::platform;
@@ -818,11 +817,13 @@ pub async fn run_gateway(
             Arc::new(platform::NativeRuntime::new())
         }
     };
-    let memory_strategy: Arc<dyn MemoryStrategy> = Arc::new(DefaultMemoryStrategy::with_config(
-        mem.clone(),
-        config.memory.clone(),
-        config.data_dir.clone(),
-    ));
+    let memory_strategy: Arc<dyn MemoryStrategy> =
+        zeroclaw_runtime::agent::memory_strategy::resolve_memory_strategy(
+            config.memory.clone(),
+            mem.clone(),
+            config.data_dir.clone(),
+            5,
+        );
     // Gateway is infrastructure — it doesn't run as an agent. Endpoints
     // that need an agent context (`/webhook?agent=`, `/ws/chat?agent=`,
     // ACP `session/new`, agent-scoped tools/memory) take it from the

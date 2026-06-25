@@ -9328,13 +9328,13 @@ pub async fn start_channels(
             effective_channel_message_timeout_secs(config.channels.message_timeout_secs);
         let interrupt_on_new_message = interrupt_on_new_message_config(&config.channels);
 
-        let memory_strategy: Arc<dyn MemoryStrategy> = Arc::new(
-            zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
-                Arc::clone(&mem),
+        let memory_strategy: Arc<dyn MemoryStrategy> =
+            zeroclaw_runtime::agent::memory_strategy::resolve_memory_strategy(
                 config.memory.clone(),
+                Arc::clone(&mem),
                 config.data_dir.clone(),
-            ),
-        );
+                5,
+            );
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::clone(&channels_by_name),

@@ -9649,6 +9649,11 @@ pub struct MemoryConfig {
     /// (`"sqlite"`) are treated as `"<backend>.default"`. Set to `"none"` to
     /// disable persistence entirely.
     pub backend: String,
+    /// Memory strategy to use for context loading, consolidation, and governance.
+    /// Defaults to the built-in `DefaultMemoryStrategy`. Set to the registered
+    /// name of a plugin-provided strategy to swap the implementation at runtime.
+    #[serde(default)]
+    pub strategy: Option<String>,
     /// Auto-save what *you* tell ZeroClaw into memory as conversation history — the agent's own replies are not saved. Turn off if you want memory to only hold things you explicitly record via the memory tool.
     #[serde(default = "default_auto_save")]
     pub auto_save: bool,
@@ -9858,6 +9863,7 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             backend: "sqlite".into(),
+            strategy: None,
             auto_save: true,
             hygiene_enabled: default_hygiene_enabled(),
             archive_after_days: default_archive_after_days(),

@@ -1,5 +1,5 @@
 //! Generic plugin registry: factory registration, component retrieval, and the unified
-//! [`RegistrySet`] that bundles all 7 component registries.
+//! [`RegistrySet`] that bundles all 8 component registries.
 
 use std::{
     collections::HashMap,
@@ -127,6 +127,8 @@ pub type ToolConfig = serde_json::Value;
 pub type ChannelConfig = serde_json::Value;
 /// Config type for [`Memory`](crate::memory_traits::Memory) factories.
 pub type MemoryConfig = serde_json::Value;
+/// Config type for [`MemoryStrategy`](crate::memory_traits::MemoryStrategy) factories.
+pub type MemoryStrategyConfig = serde_json::Value;
 /// Config type for [`Observer`](crate::observability_traits::Observer) factories.
 pub type ObserverConfig = serde_json::Value;
 /// Config type for [`RuntimeAdapter`](crate::runtime_traits::RuntimeAdapter) factories.
@@ -145,6 +147,9 @@ pub type ToolRegistry = HashMapRegistry<dyn crate::tool::Tool, ToolConfig>;
 pub type ChannelRegistry = HashMapRegistry<dyn crate::channel::Channel, ChannelConfig>;
 /// Registry for [`Memory`](crate::memory_traits::Memory) components.
 pub type MemoryRegistry = HashMapRegistry<dyn crate::memory_traits::Memory, MemoryConfig>;
+/// Registry for [`MemoryStrategy`](crate::memory_traits::MemoryStrategy) components.
+pub type MemoryStrategyRegistry =
+    HashMapRegistry<dyn crate::memory_traits::MemoryStrategy, MemoryStrategyConfig>;
 /// Registry for [`Observer`](crate::observability_traits::Observer) components.
 /// Note: `Observer` already has a `'static` supertrait; adding `+ 'static` here is redundant.
 pub type ObserverRegistry =
@@ -158,7 +163,7 @@ pub type PeripheralRegistry =
 
 // ── RegistrySet ───────────────────────────────────────────────────────────────
 
-/// Unified bundle of all 7 component registries.
+/// Unified bundle of all 8 component registries.
 ///
 /// Create one `RegistrySet` per runtime instance and pass it to plugin init functions.
 pub struct RegistrySet {
@@ -166,6 +171,7 @@ pub struct RegistrySet {
     pub tools: ToolRegistry,
     pub channels: ChannelRegistry,
     pub memory: MemoryRegistry,
+    pub memory_strategies: MemoryStrategyRegistry,
     pub observers: ObserverRegistry,
     pub runtimes: RuntimeRegistry,
     pub peripherals: PeripheralRegistry,
@@ -180,6 +186,7 @@ impl RegistrySet {
             tools: HashMapRegistry::default(),
             channels: HashMapRegistry::default(),
             memory: HashMapRegistry::default(),
+            memory_strategies: HashMapRegistry::default(),
             observers: HashMapRegistry::default(),
             runtimes: HashMapRegistry::default(),
             peripherals: HashMapRegistry::default(),
@@ -359,6 +366,7 @@ mod tests {
         assert!(rs.tools.list_registered().is_empty());
         assert!(rs.channels.list_registered().is_empty());
         assert!(rs.memory.list_registered().is_empty());
+        assert!(rs.memory_strategies.list_registered().is_empty());
         assert!(rs.observers.list_registered().is_empty());
         assert!(rs.runtimes.list_registered().is_empty());
         assert!(rs.peripherals.list_registered().is_empty());

@@ -27,8 +27,9 @@ use std::sync::Arc;
 
 use libloading::Library;
 use zeroclaw_api::plugin::{
-    ChannelFactoryFn, MemoryFactoryFn, ObserverFactoryFn, PeripheralFactoryFn, PluginRegistry,
-    ProviderFactoryFn, RegistrySet, RuntimeFactoryFn, ToolFactoryFn,
+    ChannelFactoryFn, MemoryFactoryFn, MemoryStrategyFactoryFn, ObserverFactoryFn,
+    PeripheralFactoryFn, PluginRegistry, ProviderFactoryFn, RegistrySet, RuntimeFactoryFn,
+    ToolFactoryFn,
 };
 
 /// Host-supplied context handed to every trampoline through `PluginHandle.inner`.
@@ -201,6 +202,14 @@ impl_trampoline! {
     registry_field = memory,
     dyn_trait = zeroclaw_api::memory_traits::Memory,
     kind_label = "memory",
+}
+
+impl_trampoline! {
+    fn trampoline_register_memory_strategy,
+    factory_ty = MemoryStrategyFactoryFn,
+    registry_field = memory_strategies,
+    dyn_trait = zeroclaw_api::memory_traits::MemoryStrategy,
+    kind_label = "memory_strategy",
 }
 
 impl_trampoline! {

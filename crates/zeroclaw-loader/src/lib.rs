@@ -41,8 +41,9 @@ mod trampoline;
 
 use trampoline::{
     LoaderContext, trampoline_register_channel, trampoline_register_memory,
-    trampoline_register_observer, trampoline_register_peripheral, trampoline_register_provider,
-    trampoline_register_runtime, trampoline_register_tool,
+    trampoline_register_memory_strategy, trampoline_register_observer,
+    trampoline_register_peripheral, trampoline_register_provider, trampoline_register_runtime,
+    trampoline_register_tool,
 };
 
 /// Entry point for loading a single dynamic plugin.
@@ -133,6 +134,7 @@ impl DynPluginLoader {
             register_tool: trampoline_register_tool,
             register_channel: trampoline_register_channel,
             register_memory: trampoline_register_memory,
+            register_memory_strategy: trampoline_register_memory_strategy,
             register_observer: trampoline_register_observer,
             register_runtime: trampoline_register_runtime,
             register_peripheral: trampoline_register_peripheral,

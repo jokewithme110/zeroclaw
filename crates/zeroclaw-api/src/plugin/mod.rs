@@ -1,5 +1,5 @@
 //! Plugin infrastructure: factory registration, component retrieval, and the unified
-//! [`RegistrySet`] that aggregates all 7 typed component registries.
+//! [`RegistrySet`] that aggregates all 8 typed component registries.
 //!
 //! # Overview
 //!
@@ -54,10 +54,10 @@ pub mod registry;
 pub mod runtime;
 
 pub use dynamic::{
-    ChannelFactoryFn, DynPlugin, MemoryFactoryFn, ObserverFactoryFn, PeripheralFactoryFn,
-    PluginHandle, ProviderFactoryFn, RegisterChannelFn, RegisterMemoryFn, RegisterObserverFn,
-    RegisterPeripheralFn, RegisterProviderFn, RegisterRuntimeFn, RegisterToolFn, RuntimeFactoryFn,
-    ToolFactoryFn,
+    ChannelFactoryFn, DynPlugin, MemoryFactoryFn, MemoryStrategyFactoryFn, ObserverFactoryFn,
+    PeripheralFactoryFn, PluginHandle, ProviderFactoryFn, RegisterChannelFn, RegisterMemoryFn,
+    RegisterMemoryStrategyFn, RegisterObserverFn, RegisterPeripheralFn, RegisterProviderFn,
+    RegisterRuntimeFn, RegisterToolFn, RuntimeFactoryFn, ToolFactoryFn,
 };
 pub use manifest::{ComponentSpec, PluginCapability, PluginManifest, PluginPermission};
 pub use registry::{
@@ -70,6 +70,8 @@ pub use registry::{
     HashMapRegistry,
     MemoryConfig,
     MemoryRegistry,
+    MemoryStrategyConfig,
+    MemoryStrategyRegistry,
     ObserverConfig,
     ObserverRegistry,
     PeripheralConfig,
