@@ -1850,15 +1850,27 @@ pub async fn run_tool_call_loop(
         };
 
         let prepared_messages = if degrade_strip_images {
-            // Text-only fallback: replace every media marker with a
-            // `[media attachment]` placeholder so no filesystem path or data
-            // URI reaches the text-only provider, while surrounding text
-            // (captions, tool metadata) survives.
+            // Text-only fallback: replace media markers with `[media attachment]`
+            // placeholder in **non-tool-result** messages only. This preserves
+            // Channel images (`[IMAGE:]` from tool results) while stripping
+            // Vision images (user messages) that the text-only model cannot process.
             let stripped: Vec<ChatMessage> = history
                 .iter()
-                .map(|m| ChatMessage {
-                    role: m.role.clone(),
-                    content: multimodal::strip_media_markers(&m.content),
+                .map(|m| {
+                    let is_tool_result_carrier = m.role == "tool"
+                        || (m.role == "user"
+                            && m.content.trim_start().starts_with("[Tool results]"));
+
+                    let processed_content = if is_tool_result_carrier {
+                        m.content.clone() // Preserve Channel images
+                    } else {
+                        multimodal::strip_media_markers(&m.content).to_string()
+                    };
+
+                    ChatMessage {
+                        role: m.role.clone(),
+                        content: processed_content,
+                    }
                 })
                 .collect();
             multimodal::prepare_messages_for_provider(&stripped, multimodal_config).await?
