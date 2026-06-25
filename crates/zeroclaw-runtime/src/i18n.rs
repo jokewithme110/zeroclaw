@@ -93,9 +93,12 @@ pub fn get_tool_description(tool_name: &str) -> Option<&'static str> {
 }
 
 /// Get a CLI string by key (e.g. "cli-config-about").
+/// Automatically injects brand parameters for Fluent variable substitution.
 pub fn get_cli_string(key: &str) -> Option<String> {
-    let map = CLI_STRINGS.get_or_init(|| load_cli_strings(active_locale()));
-    map.get(key).cloned()
+    // Automatically inject product_name as a Fluent external argument
+    let product_name = zeroclaw_api::branding::product_name();
+    let brand_args = [("product_name", product_name.as_str())];
+    get_cli_string_with_args(key, &brand_args)
 }
 
 /// Get a CLI string by key and format it with Fluent external arguments.
@@ -218,15 +221,28 @@ fn format_cli_string_with_args(
         && let Some(value) =
             crate::i18n_loader::format_ftl_message(locale_ftl, &sources.locale, key, args)
     {
-        return Some(value);
+        return Some(apply_brand_replacements(value));
     }
     if let Some(locale_ftl) = sources.builtin
         && let Some(value) =
             crate::i18n_loader::format_ftl_message(locale_ftl, &sources.locale, key, args)
     {
-        return Some(value);
+        return Some(apply_brand_replacements(value));
     }
     crate::i18n_loader::format_ftl_message(include_str!("../locales/en/cli.ftl"), "en", key, args)
+        .map(apply_brand_replacements)
+}
+
+/// One-shot post-processing: replace any hardcoded `zeroclaw` / `ZeroClaw`
+/// literal in the rendered FTL string with the runtime `BRAND` value, so
+/// localised strings track the brand without needing per-key placeholder
+/// rewriting in every locale. Runs after Fluent substitution, so existing
+/// `{$product_name}` callers and hardcoded literals both end up consistent.
+fn apply_brand_replacements(mut s: String) -> String {
+    let brand = zeroclaw_api::branding::bin_name();
+    s = s.replace("zeroclaw", &brand);
+    s = s.replace("ZeroClaw", &brand);
+    s
 }
 
 fn load_ftl_from_disk(locale: &str, filename: &str) -> Option<String> {

@@ -66,6 +66,19 @@ static RUNTIME_PROXY_CONFIG: OnceLock<RwLock<ProxyConfig>> = OnceLock::new();
 static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Client>>> =
     OnceLock::new();
 
+/// 品牌环境变量名称辅助函数
+fn env_config_dir() -> String {
+    format!("{}_CONFIG_DIR", zeroclaw_api::branding::env_prefix())
+}
+
+fn env_data_dir() -> String {
+    format!("{}_DATA_DIR", zeroclaw_api::branding::env_prefix())
+}
+
+fn env_workspace() -> String {
+    format!("{}_WORKSPACE", zeroclaw_api::branding::env_prefix())
+}
+
 // ── Top-level config ──────────────────────────────────────────────
 
 /// Top-level ZeroClaw configuration, loaded from `config.toml`.
@@ -15192,7 +15205,8 @@ impl Default for Config {
     fn default() -> Self {
         let home =
             UserDirs::new().map_or_else(|| PathBuf::from("."), |u| u.home_dir().to_path_buf());
-        let zeroclaw_dir = home.join(".zeroclaw");
+        let data_dir_name = zeroclaw_api::branding::data_dir();
+        let zeroclaw_dir = home.join(format!(".{}", data_dir_name));
 
         Self {
             data_dir: zeroclaw_dir.join("data"),
@@ -15297,7 +15311,10 @@ fn default_config_and_data_dirs() -> Result<(PathBuf, PathBuf)> {
 }
 
 fn default_config_dir() -> Result<PathBuf> {
-    if let Ok(custom) = std::env::var("ZEROCLAW_CONFIG_DIR") {
+    let env_prefix = zeroclaw_api::branding::env_prefix();
+    let config_dir_env = format!("{}_CONFIG_DIR", env_prefix);
+
+    if let Ok(custom) = std::env::var(&config_dir_env) {
         let custom = custom.trim();
         if !custom.is_empty() {
             return Ok(expand_tilde_path(custom));
@@ -15307,13 +15324,15 @@ fn default_config_dir() -> Result<PathBuf> {
     if let Ok(home) = std::env::var("HOME")
         && !home.is_empty()
     {
-        return Ok(PathBuf::from(home).join(".zeroclaw"));
+        let data_dir_name = zeroclaw_api::branding::data_dir();
+        return Ok(PathBuf::from(home).join(format!(".{}", data_dir_name)));
     }
 
     let home = UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
-    Ok(home.join(".zeroclaw"))
+    let data_dir_name = zeroclaw_api::branding::data_dir();
+    Ok(home.join(format!(".{}", data_dir_name)))
 }
 
 /// Canonical on-disk directory for a locale's runtime/zerocode FTL catalogues:
@@ -15365,7 +15384,7 @@ pub const FTL_CATALOGS: &[(&str, &str, &str)] = &[
 fn default_path_under_config_dir(relative: &str) -> String {
     match default_config_dir() {
         Ok(dir) => dir.join(relative).to_string_lossy().into_owned(),
-        Err(_) => format!("~/.zeroclaw/{relative}"),
+        Err(_) => format!("~/.{}/{relative}", zeroclaw_api::branding::data_dir()),
     }
 }
 
@@ -15375,7 +15394,11 @@ pub fn resolve_config_dir_for_data(data_dir: &Path) -> (PathBuf, PathBuf) {
         return (data_config_dir.clone(), data_config_dir.join("data"));
     }
 
-    let legacy_config_dir = data_dir.parent().map(|parent| parent.join(".zeroclaw"));
+    // Check for legacy config dir using brand data dir name
+    let legacy_name = zeroclaw_api::branding::data_dir();
+    let legacy_config_dir = data_dir
+        .parent()
+        .map(|parent| parent.join(format!(".{}", legacy_name)));
     if let Some(legacy_dir) = legacy_config_dir {
         if legacy_dir.join("config.toml").exists() {
             return (legacy_dir, data_config_dir);
@@ -15517,13 +15540,13 @@ async fn resolve_runtime_config_dirs(
     default_zeroclaw_dir: &Path,
     default_data_dir: &Path,
 ) -> Result<(PathBuf, PathBuf, ConfigResolutionSource)> {
-    if let Ok(custom_config_dir) = std::env::var("ZEROCLAW_CONFIG_DIR") {
+    if let Ok(custom_config_dir) = std::env::var(env_config_dir()) {
         let custom_config_dir = custom_config_dir.trim();
         if !custom_config_dir.is_empty() {
             // If the operator ALSO set ZEROCLAW_DATA_DIR or
             // ZEROCLAW_WORKSPACE, CONFIG_DIR wins; surface the
             // collision so they know which one took effect.
-            if std::env::var("ZEROCLAW_DATA_DIR")
+            if std::env::var(env_data_dir())
                 .ok()
                 .filter(|v| !v.trim().is_empty())
                 .is_some()
@@ -15537,7 +15560,7 @@ async fn resolve_runtime_config_dirs(
                      directory under it)."
                 );
             }
-            if std::env::var("ZEROCLAW_WORKSPACE")
+            if std::env::var(env_workspace())
                 .ok()
                 .filter(|v| !v.is_empty())
                 .is_some()
@@ -15560,10 +15583,10 @@ async fn resolve_runtime_config_dirs(
         }
     }
 
-    if let Ok(custom_data) = std::env::var("ZEROCLAW_DATA_DIR")
+    if let Ok(custom_data) = std::env::var(env_data_dir())
         && !custom_data.trim().is_empty()
     {
-        if std::env::var("ZEROCLAW_WORKSPACE")
+        if std::env::var(env_workspace())
             .ok()
             .filter(|v| !v.is_empty())
             .is_some()
@@ -15582,7 +15605,7 @@ async fn resolve_runtime_config_dirs(
         return Ok((zeroclaw_dir, data_dir, ConfigResolutionSource::EnvDataDir));
     }
 
-    if let Ok(custom_workspace) = std::env::var("ZEROCLAW_WORKSPACE")
+    if let Ok(custom_workspace) = std::env::var(env_workspace())
         && !custom_workspace.is_empty()
     {
         ::zeroclaw_log::record!(
@@ -22497,7 +22520,7 @@ model = "primary-model"
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var("HOME", &temp_home) };
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+        unsafe { std::env::set_var(env_workspace(), &workspace_dir) };
 
         let mut config = Config {
             data_dir: workspace_dir,
@@ -22534,7 +22557,7 @@ model = "primary-model"
         );
 
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        unsafe { std::env::remove_var(env_workspace()) };
         if let Some(home) = original_home {
             // SAFETY: test-only, single-threaded test runner.
             unsafe { std::env::set_var("HOME", home) };
@@ -22694,7 +22717,7 @@ wire_api = "ws"
         let workspace_dir = default_config_dir.join("profile-a");
 
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+        unsafe { std::env::set_var(env_workspace(), &workspace_dir) };
         let (config_dir, resolved_workspace_dir, source) =
             resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
                 .await
@@ -22708,7 +22731,7 @@ wire_api = "ws"
         assert_eq!(resolved_workspace_dir, workspace_dir.join("data"));
 
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        unsafe { std::env::remove_var(env_workspace()) };
         let _ = fs::remove_dir_all(default_config_dir).await;
     }
 
@@ -22722,9 +22745,9 @@ wire_api = "ws"
         fs::create_dir_all(&default_config_dir).await.unwrap();
 
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", &explicit_config_dir) };
+        unsafe { std::env::set_var(env_config_dir(), &explicit_config_dir) };
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        unsafe { std::env::remove_var(env_workspace()) };
 
         let (config_dir, resolved_workspace_dir, source) =
             resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
@@ -22736,7 +22759,7 @@ wire_api = "ws"
         assert_eq!(resolved_workspace_dir, explicit_config_dir.join("data"));
 
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_CONFIG_DIR") };
+        unsafe { std::env::remove_var(env_config_dir()) };
         let _ = fs::remove_dir_all(default_config_dir).await;
     }
 
@@ -22747,7 +22770,7 @@ wire_api = "ws"
         let default_workspace_dir = default_config_dir.join("workspace");
 
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        unsafe { std::env::remove_var(env_workspace()) };
         let (config_dir, resolved_workspace_dir, source) =
             resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
                 .await
@@ -22828,12 +22851,12 @@ wire_api = "ws"
         let _env_guard = env_override_lock().await;
         let custom_dir = std::env::temp_dir().join("zeroclaw-test-profile");
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", &custom_dir) };
+        unsafe { std::env::set_var(env_config_dir(), &custom_dir) };
 
         let result = default_path_under_config_dir("knowledge.db");
 
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_CONFIG_DIR") };
+        unsafe { std::env::remove_var(env_config_dir()) };
 
         assert_eq!(
             result,
@@ -22853,7 +22876,7 @@ wire_api = "ws"
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var("HOME", &temp_home) };
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+        unsafe { std::env::set_var(env_workspace(), &workspace_dir) };
 
         let config = Box::pin(Config::load_or_init()).await.unwrap();
 
@@ -22871,7 +22894,7 @@ wire_api = "ws"
         );
 
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        unsafe { std::env::remove_var(env_workspace()) };
         if let Some(home) = original_home {
             // SAFETY: test-only, single-threaded test runner.
             unsafe { std::env::set_var("HOME", home) };
@@ -22895,7 +22918,7 @@ wire_api = "ws"
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var("HOME", &temp_home) };
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+        unsafe { std::env::set_var(env_workspace(), &workspace_dir) };
 
         let config = Box::pin(Config::load_or_init()).await.unwrap();
 
@@ -22908,7 +22931,7 @@ wire_api = "ws"
         assert!(config.config_path.exists());
 
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        unsafe { std::env::remove_var(env_workspace()) };
         if let Some(home) = original_home {
             // SAFETY: test-only, single-threaded test runner.
             unsafe { std::env::set_var("HOME", home) };
@@ -22942,7 +22965,7 @@ default_model = "legacy-model"
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var("HOME", &temp_home) };
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+        unsafe { std::env::set_var(env_workspace(), &workspace_dir) };
 
         let config = Box::pin(Config::load_or_init()).await.unwrap();
 
@@ -22962,7 +22985,7 @@ default_model = "legacy-model"
         );
 
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        unsafe { std::env::remove_var(env_workspace()) };
         if let Some(home) = original_home {
             // SAFETY: test-only, single-threaded test runner.
             unsafe { std::env::set_var("HOME", home) };
@@ -22987,7 +23010,7 @@ default_model = "legacy-model"
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var("HOME", &temp_home) };
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        unsafe { std::env::remove_var(env_workspace()) };
 
         let mut config = Config {
             config_path: config_path.clone(),
@@ -23056,7 +23079,7 @@ default_model = "persisted-profile"
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var("HOME", &temp_home) };
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+        unsafe { std::env::set_var(env_workspace(), &workspace_dir) };
 
         let mut rx = capture_log_events();
 
@@ -23084,7 +23107,7 @@ default_model = "persisted-profile"
         assert!(!logs.contains("\"initialized\":false"), "{logs}");
 
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        unsafe { std::env::remove_var(env_workspace()) };
         if let Some(home) = original_home {
             // SAFETY: test-only, single-threaded test runner.
             unsafe { std::env::set_var("HOME", home) };
@@ -23123,7 +23146,7 @@ audit = "should-be-a-table-not-a-string"
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var("HOME", &temp_home) };
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+        unsafe { std::env::set_var(env_workspace(), &workspace_dir) };
 
         let config = Box::pin(Config::load_or_init()).await.unwrap();
 
@@ -23134,7 +23157,7 @@ audit = "should-be-a-table-not-a-string"
         );
 
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        unsafe { std::env::remove_var(env_workspace()) };
         if let Some(home) = original_home {
             // SAFETY: test-only, single-threaded test runner.
             unsafe { std::env::set_var("HOME", home) };
@@ -23166,7 +23189,7 @@ audit = "should-be-a-table-not-a-string"
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var("HOME", &temp_home) };
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+        unsafe { std::env::set_var(env_workspace(), &workspace_dir) };
 
         let config = Box::pin(Config::load_or_init()).await.unwrap();
 
@@ -23177,7 +23200,7 @@ audit = "should-be-a-table-not-a-string"
         );
 
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        unsafe { std::env::remove_var(env_workspace()) };
         if let Some(home) = original_home {
             // SAFETY: test-only, single-threaded test runner.
             unsafe { std::env::set_var("HOME", home) };

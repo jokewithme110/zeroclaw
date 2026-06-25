@@ -226,12 +226,12 @@ impl LogDetail {
     }
 
     fn duration_ms(&self) -> Option<u64> {
-        self.raw.get("zeroclaw")?.get("duration_ms")?.as_u64()
+        self.raw.get("attribution")?.get("duration_ms")?.as_u64()
     }
 
     fn zeroclaw(&self) -> BTreeMap<String, String> {
         let mut out = BTreeMap::new();
-        if let Some(Value::Object(map)) = self.raw.get("zeroclaw") {
+        if let Some(Value::Object(map)) = self.raw.get("attribution") {
             for (k, val) in map {
                 if k == "duration_ms" {
                     continue;

@@ -364,8 +364,10 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     }
 
     if prompt.is_empty() {
-        "You are ZeroClaw, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct."
-            .to_string()
+        format!(
+            "You are {}, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct.",
+            zeroclaw_api::branding::product_name()
+        )
     } else {
         prompt
     }

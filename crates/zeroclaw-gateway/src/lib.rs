@@ -1418,7 +1418,10 @@ pub async fn run_gateway(
     }
 
     let pfx = path_prefix.unwrap_or("");
-    println!("🦀 ZeroClaw Gateway listening on http://{display_addr}{pfx}");
+    println!(
+        "🦀 {} Gateway listening on http://{display_addr}{pfx}",
+        zeroclaw_api::branding::product_name()
+    );
     if let Some(ref url) = tunnel_url {
         println!("  🌐 Public URL: {url}");
     }
@@ -2003,13 +2006,22 @@ pub async fn run_gateway(
                     });
                 }
                 _ = shutdown_signal.changed() => {
-                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ZeroClaw Gateway shutting down");
+                    let msg = format!("{} Gateway shutting down", zeroclaw_api::branding::product_name());
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        msg
+                    );
                     break;
                 }
             }
         }
     } else {
         // Plain TCP — use axum's built-in serve.
+        let shutdown_msg = format!(
+            "{} Gateway shutting down",
+            zeroclaw_api::branding::product_name()
+        );
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -2019,7 +2031,7 @@ pub async fn run_gateway(
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                "ZeroClaw Gateway shutting down"
+                shutdown_msg
             );
         })
         .await?;

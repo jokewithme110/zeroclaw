@@ -1458,7 +1458,7 @@ impl DingTalkChannel {
         let body = serde_json::json!({
             "msgtype": "markdown",
             "markdown": {
-                "title": "ZeroClaw",
+                "title": zeroclaw_api::branding::product_name(),
                 "text": format!("![image]({})", photo_url)
             }
         });
@@ -1596,7 +1596,9 @@ impl DingTalkChannel {
         text_content: &str,
         subject: Option<&str>,
     ) -> anyhow::Result<()> {
-        let title = subject.unwrap_or("ZeroClaw");
+        let title = subject
+            .map(String::from)
+            .unwrap_or_else(zeroclaw_api::branding::product_name);
         let body = serde_json::json!({
             "msgtype": "markdown",
             "markdown": {

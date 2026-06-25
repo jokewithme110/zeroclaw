@@ -23,9 +23,17 @@ use zeroclaw_config::schema::{A2aConfig, Config};
 
 const METHOD_MESSAGE_STREAM: &str = "message/stream";
 const METHOD_TASKS_RESUBSCRIBE: &str = "tasks/resubscribe";
-const DEFAULT_A2A_AGENT_CARD_NAME: &str = "ZeroClaw A2A Agent";
-const DEFAULT_A2A_AGENT_CARD_DESCRIPTION: &str =
-    "ZeroClaw A2A entrypoint powered by ra2a (v0.3.0 integration)";
+
+fn default_a2a_agent_card_name() -> String {
+    format!("{} A2A Agent", zeroclaw_api::branding::product_name())
+}
+
+fn default_a2a_agent_card_description() -> String {
+    format!(
+        "{} A2A entrypoint powered by ra2a (v0.3.0 integration)",
+        zeroclaw_api::branding::product_name()
+    )
+}
 
 static A2A_SERVER_STATE: OnceLock<RwLock<Option<ra2a::server::ServerState>>> = OnceLock::new();
 
@@ -137,7 +145,7 @@ fn join_url(base: &str, path: &str) -> String {
     )
 }
 
-fn configured_or_default(value: Option<&str>, fallback: &'static str) -> String {
+fn configured_or_default(value: Option<&str>, fallback: &str) -> String {
     value
         .map(str::trim)
         .filter(|v| !v.is_empty())
@@ -220,13 +228,13 @@ pub fn init(config: &Config, base_url: &str, _tool_specs: &[ToolSpec]) -> Result
     let mut card = AgentCard::new(
         configured_or_default(
             config.gateway.a2a.agent_card_name.as_deref(),
-            DEFAULT_A2A_AGENT_CARD_NAME,
+            &default_a2a_agent_card_name(),
         ),
         join_url(base_url, "/a2a"),
     );
     card.description = configured_or_default(
         config.gateway.a2a.agent_card_description.as_deref(),
-        DEFAULT_A2A_AGENT_CARD_DESCRIPTION,
+        &default_a2a_agent_card_description(),
     );
     card.version = env!("CARGO_PKG_VERSION").to_string();
     card.capabilities = AgentCapabilities {

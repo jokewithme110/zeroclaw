@@ -137,6 +137,12 @@ where
             })
             .unwrap_or_else(|| "system".to_string());
         write!(writer, "[{label}] ")?;
-        self.inner.format_event(ctx, writer, event)
+        // Format the inner payload into a buffer first so we can run
+        // the brand rewriter on the user-visible message text before it
+        // hits the terminal. The label and the writer itself are not
+        // touched — only the formatted message text from `self.inner`.
+        let mut buf = String::new();
+        self.inner.format_event(ctx, Writer::new(&mut buf), event)?;
+        write!(writer, "{}", zeroclaw_api::branding::rewrite(&buf))
     }
 }

@@ -521,7 +521,10 @@ pub async fn run(
         );
     }
 
-    println!("🧠 ZeroClaw daemon started");
+    println!(
+        "🧠 {} daemon started",
+        zeroclaw_api::branding::product_name()
+    );
     println!("   Gateway:  http://{host}:{port}");
     println!(
         "   Socket:   {}",

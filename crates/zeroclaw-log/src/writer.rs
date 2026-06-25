@@ -125,11 +125,28 @@ fn append_line(state: &Arc<WriterState>, value: &Value) -> Result<()> {
         options.mode(0o600);
     }
 
+    // Serialize to JSON string and remove zeroclaw references
+    // 1. File paths: "crates/zeroclaw-channels/src/foo.rs" -> "crates/channels/src/foo.rs"
+    // 2. task_module: "zeroclaw_channels::orchestrator" -> "channels::orchestrator"
+    let json_str = serde_json::to_string(value).context("serializing log line")?;
+    let brand_slug = zeroclaw_api::branding::data_dir();
+
+    // Replace path prefixes like "crates/zeroclaw-" with "crates/{brand_slug}-"
+    let json_str = json_str.replace("crates/zeroclaw-", &format!("crates/{}-", brand_slug));
+
+    // Replace module prefixes like "zeroclaw_" in task_module field
+    let json_str = json_str.replace(
+        r#""task_module":"zeroclaw_"#,
+        &format!(r#""task_module":"{}_"#, brand_slug),
+    );
+
     let file = options
         .open(&state.policy.path)
         .with_context(|| format!("opening log file {}", state.policy.path.display()))?;
     let mut writer = BufWriter::new(file);
-    serde_json::to_writer(&mut writer, value).context("serializing log line")?;
+    writer
+        .write_all(json_str.as_bytes())
+        .context("writing log line")?;
     writer.write_all(b"\n").context("writing newline")?;
     writer.flush().context("flushing log line")?;
     let file = writer

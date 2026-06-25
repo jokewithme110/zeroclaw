@@ -9214,7 +9214,10 @@ pub async fn start_channels(
                 return Ok(());
             }
 
-            println!("🦀 ZeroClaw Channel Server");
+            println!(
+                "🦀 {} Channel Server",
+                zeroclaw_api::branding::product_name()
+            );
             println!("  🤖 Model:    {model} (agent: {agent_alias})");
             let effective_backend = config.resolve_active_storage().kind();
             println!(

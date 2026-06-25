@@ -653,7 +653,7 @@ mod e2e_tests {
                         .map(|s| s.contains("attribution-span e2e test"))
                         .unwrap_or(false)
                     {
-                        let zc = value.get("zeroclaw").expect("zeroclaw block present");
+                        let zc = value.get("attribution").expect("attribution block present");
                         assert_eq!(
                             zc.get("channel").and_then(|v| v.as_str()),
                             Some("telegram.clamps"),

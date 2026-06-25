@@ -16,6 +16,7 @@
 
 pub mod agent;
 pub mod attribution;
+pub mod branding;
 pub mod channel;
 pub mod hook;
 pub mod jsonrpc;

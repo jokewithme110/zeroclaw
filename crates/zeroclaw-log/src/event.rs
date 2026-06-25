@@ -139,10 +139,15 @@ pub struct ServiceDescriptor {
     pub version: String,
 }
 
+/// 运行时获取品牌产品名称，默认为 "zeroclaw"
+fn get_brand_product_name() -> String {
+    zeroclaw_api::branding::product_name()
+}
+
 impl Default for ServiceDescriptor {
     fn default() -> Self {
         Self {
-            name: "zeroclaw".to_string(),
+            name: get_brand_product_name(),
             version: env!("CARGO_PKG_VERSION").to_string(),
         }
     }
@@ -315,8 +320,10 @@ pub struct LogEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span_id: Option<String>,
 
-    /// All the alias-bound attribution fields live here.
-    #[serde(default)]
+    /// All the alias-bound attribution fields live here. On-disk key is
+    /// `attribution` (kept distinct from OTel/ECS top-level fields; the
+    /// Rust field name stays as `zeroclaw` to match the struct type).
+    #[serde(default, rename = "attribution")]
     pub zeroclaw: ZeroclawAttribution,
 
     /// Human-readable short message. The structured fields above carry the

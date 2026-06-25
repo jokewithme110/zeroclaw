@@ -429,7 +429,7 @@ enum Commands {
         agent: Option<String>,
     },
 
-    /// Deprecated. Use `zeroclaw quickstart`. Any flags error.
+    /// Deprecated. Use `quickstart`. Any flags error.
     Onboard {
         /// Configure a specific section only. Omit to run the full flow.
         #[command(subcommand)]
@@ -3264,7 +3264,7 @@ async fn main() -> Result<()> {
         if any_legacy_flag {
             eprintln!(
                 "error: `zeroclaw onboard` is deprecated and its flags no longer apply. \
-                 Use `zeroclaw quickstart` to create a new agent, or `zeroclaw config set <path>=<value>` \
+                 Use `quickstart` to create a new agent, or `zeroclaw config set <path>=<value>` \
                  for headless updates."
             );
             std::process::exit(2);
@@ -3273,7 +3273,7 @@ async fn main() -> Result<()> {
             "{}",
             t(
                 "cli-onboard-deprecated",
-                "`zeroclaw onboard` is deprecated — use `zeroclaw quickstart`."
+                "`onboard` is deprecated — use `quickstart`."
             )
         );
         return Ok(());
@@ -3838,18 +3838,26 @@ async fn main() -> Result<()> {
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
+                let msg = format!(
+                    "🧠 Starting {} Daemon on (random port)",
+                    zeroclaw_api::branding::product_name()
+                );
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_attrs(::serde_json::json!({"host": host})),
-                    "🧠 Starting ZeroClaw Daemon on (random port)"
+                    msg
                 );
             } else {
+                let msg = format!(
+                    "🧠 Starting {} Daemon on",
+                    zeroclaw_api::branding::product_name()
+                );
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_attrs(::serde_json::json!({"host": host, "port": port})),
-                    "🧠 Starting ZeroClaw Daemon on"
+                    msg
                 );
             }
 

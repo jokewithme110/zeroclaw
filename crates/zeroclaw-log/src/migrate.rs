@@ -209,7 +209,7 @@ fn convert_legacy_to_current(legacy: Value) -> Value {
         },
         "service": { "name": "zeroclaw", "version": env!("CARGO_PKG_VERSION") },
         "trace_id": trace_id,
-        "zeroclaw": Value::Object(zeroclaw),
+        "attribution": Value::Object(zeroclaw),
         "message": message,
         "attributes": attributes,
         "schema_version": LogEvent::SCHEMA_VERSION,
@@ -272,11 +272,11 @@ mod tests {
         assert_eq!(v["event"]["action"], "llm_request");
         assert_eq!(v["event"]["category"], "agent");
         assert_eq!(v["event"]["outcome"], "success");
-        assert_eq!(v["zeroclaw"]["agent_alias"], "clamps");
-        assert_eq!(v["zeroclaw"]["channel"], "discord.clamps");
-        assert_eq!(v["zeroclaw"]["channel_type"], "discord");
-        assert_eq!(v["zeroclaw"]["channel_alias"], "clamps");
-        assert_eq!(v["zeroclaw"]["model_provider"], "anthropic.clamps");
+        assert_eq!(v["attribution"]["agent_alias"], "clamps");
+        assert_eq!(v["attribution"]["channel"], "discord.clamps");
+        assert_eq!(v["attribution"]["channel_type"], "discord");
+        assert_eq!(v["attribution"]["channel_alias"], "clamps");
+        assert_eq!(v["attribution"]["model_provider"], "anthropic.clamps");
         assert_eq!(v["trace_id"], "t1");
         assert_eq!(v["attributes"]["tokens"], 10);
         assert_eq!(v["schema_version"], LogEvent::SCHEMA_VERSION);
@@ -286,7 +286,7 @@ mod tests {
     fn already_current_is_noop() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("trace.jsonl");
-        let line = r#"{"id":"id","@timestamp":"2026-05-15T19:00:00Z","severity_number":9,"severity_text":"INFO","event":{"category":"agent","action":"x","outcome":"success"},"service":{"name":"zeroclaw","version":"0.7.5"},"zeroclaw":{},"schema_version":2}"#;
+        let line = r#"{"id":"id","@timestamp":"2026-05-15T19:00:00Z","severity_number":9,"severity_text":"INFO","event":{"category":"agent","action":"x","outcome":"success"},"service":{"name":"zeroclaw","version":"0.7.5"},"attribution":{},"schema_version":2}"#;
         write_jsonl(&path, &[line]);
         migrate_legacy_jsonl_in_place(&path).unwrap();
         let lines = read_all_lines(&path);

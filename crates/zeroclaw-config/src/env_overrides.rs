@@ -1,6 +1,6 @@
 //! V0.8.0 env-var override mechanism.
 //!
-//! Grammar: `ZEROCLAW_<dotted_path_with_double_underscores>=<value>`.
+//! Grammar: `<BRAND_ENV_PREFIX>_<dotted_path_with_double_underscores>=<value>`.
 //! Each `__` (double underscore) is a path separator (`.` in the TOML); each
 //! single `_` is either a snake-case joiner inside a field name (which the
 //! walker converts to kebab `-` for `set_prop`) or a literal char inside an
@@ -11,7 +11,7 @@
 //! other leaf path. No string-literal pattern matching, no hardcoded family
 //! names.
 //!
-//! Bootstrap exception: `ZEROCLAW_WORKSPACE` and `ZEROCLAW_CONFIG_DIR` keep
+//! Bootstrap exception: `<BRAND_ENV_PREFIX>_WORKSPACE` and `<BRAND_ENV_PREFIX>_CONFIG_DIR` keep
 //! their UPPERCASE form. The case rule (lowercase tail = config-tree,
 //! uppercase tail = bootstrap) does the disambiguation work without an
 //! exemption list.
@@ -29,7 +29,11 @@ use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
-const PREFIX: &str = "ZEROCLAW_";
+/// 运行时获取环境变量前缀（带下划线后缀），用于 strip_prefix
+fn env_prefix_underscore() -> String {
+    format!("{}_", zeroclaw_api::branding::env_prefix())
+}
+
 const SEP: &str = "__";
 
 /// Paths that the schema exposes via `prop_fields()` but that operators must
@@ -52,14 +56,15 @@ pub struct AppliedOverrides {
     pub snapshots: HashMap<String, String>,
 }
 
-/// Apply every `ZEROCLAW_<lowercase>` env var to `config`. Returns the set of
+/// Apply every `<BRAND_ENV_PREFIX>_<lowercase>` env var to `config`. Returns the set of
 /// dotted prop-paths that were overridden plus the pre-override raw values
 /// for each. Hard-errors on any env var that doesn't resolve to a known
 /// schema path or whose alias fails validation.
 pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
+    let prefix_underscore = env_prefix_underscore();
     let mut entries: Vec<(String, String, String)> = std::env::vars()
         .filter_map(|(k, v)| {
-            let tail = k.strip_prefix(PREFIX)?;
+            let tail = k.strip_prefix(&prefix_underscore)?;
             (!tail.is_empty()
                 && tail
                     .chars()
@@ -253,7 +258,7 @@ pub fn mask_env_overrides_for_save(
 }
 
 /// Process-wide lock for env-mutating tests. Both `env_overrides::tests`
-/// and `schema::tests` race on `ZEROCLAW_*` env vars and must serialize on
+/// and `schema::tests` race on `<BRAND_ENV_PREFIX>_*` env vars and must serialize on
 /// the same mutex; defining it once here and re-exporting `pub(crate)`
 /// keeps a single coordinator. `#[cfg(test)]` so it never lands in
 /// production builds.
@@ -268,7 +273,7 @@ mod tests {
     use super::*;
     use crate::schema::Config;
 
-    /// RAII-ish helper: removes the named ZEROCLAW_* var on drop so failed
+    /// RAII-ish helper: removes the named `<BRAND_ENV_PREFIX>_*` var on drop so failed
     /// asserts don't leak state into sibling tests.
     struct EnvVarGuard(&'static str);
     impl EnvVarGuard {

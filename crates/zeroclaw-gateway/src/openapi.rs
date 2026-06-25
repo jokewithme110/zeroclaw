@@ -32,6 +32,11 @@ static CACHED: OnceLock<serde_json::Value> = OnceLock::new();
 /// unauthenticated but the live calls honor the existing pairing/bearer auth.
 pub async fn handle_docs() -> Response {
     let html = include_str!("openapi_docs.html");
+    // Replace brand placeholder with runtime brand name
+    let html = html.replace(
+        "ZeroClaw Gateway API",
+        &format!("{} Gateway API", zeroclaw_api::branding::product_name()),
+    );
     let mut response = (StatusCode::OK, html).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -45,6 +50,13 @@ pub async fn handle_docs() -> Response {
 /// browsers and the eventual Scalar explorer consume this as their data source.
 pub async fn handle_openapi_json() -> Response {
     let body = CACHED.get_or_init(build_spec).clone();
+    // Replace brand placeholder with runtime brand name
+    let body_str = serde_json::to_string(&body).unwrap_or_default();
+    let body_str = body_str.replace(
+        "ZeroClaw Gateway",
+        &format!("{} Gateway", zeroclaw_api::branding::product_name()),
+    );
+    let body: serde_json::Value = serde_json::from_str(&body_str).unwrap_or(body);
     let mut response = (StatusCode::OK, axum::Json(body)).into_response();
     response.headers_mut().insert(
         header::CACHE_CONTROL,

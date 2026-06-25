@@ -92,7 +92,7 @@ impl LangfuseObserver {
             .with_batch_exporter(span_exporter)
             .with_resource(
                 opentelemetry_sdk::Resource::builder()
-                    .with_service_name("zeroclaw".to_string())
+                    .with_service_name(zeroclaw_api::branding::product_name())
                     .build(),
             )
             .build();
