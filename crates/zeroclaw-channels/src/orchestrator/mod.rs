@@ -107,7 +107,7 @@ pub use zeroclaw_infra::session_backend::SessionBackend;
 pub use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 pub use zeroclaw_infra::stall_watchdog::StallWatchdog;
 
-use self::provider_errors::provider_error_user_message;
+use self::provider_errors::{ProviderErrorRenderContext, provider_error_user_message};
 use crate::bot_service::BotServiceChannel;
 use crate::webchat::WebchatChannel;
 use anyhow::{Context, Result};
@@ -2076,22 +2076,6 @@ fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
     }
 
     content.chars().count() > MEMORY_CONTEXT_MAX_CHARS
-}
-
-fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
-    let lower = err.to_string().to_lowercase();
-    [
-        "exceeds the context window",
-        "context window of this model",
-        "maximum context length",
-        "context length exceeded",
-        "too many tokens",
-        "token limit exceeded",
-        "prompt is too long",
-        "input is too long",
-    ]
-    .iter()
-    .any(|hint| lower.contains(hint))
 }
 
 fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<String> {
@@ -5347,12 +5331,19 @@ async fn process_channel_message_body(
                         &format!("Failed to cancel draft on {}", channel.name())
                     );
                 }
-            } else if is_context_window_overflow_error(&e) {
+            } else if zeroclaw_providers::provider_error::is_context_window_exceeded(&e) {
                 let compacted = compact_sender_history(ctx.as_ref(), &history_key);
+                let render_ctx = ProviderErrorRenderContext {
+                    provider: &route.model_provider,
+                    model: &route.model,
+                };
                 let error_text = if compacted {
-                    "⚠️ Context window exceeded for this conversation. I compacted recent history and kept the latest context. Please resend your last message."
+                    zeroclaw_runtime::i18n::get_required_error_string_with_args(
+                        "err-provider-context-window-compacted",
+                        &[("model", route.model.as_str())],
+                    )
                 } else {
-                    "⚠️ Context window exceeded for this conversation. Please resend your last message."
+                    provider_error_user_message(&e, &render_ctx)
                 };
                 eprintln!(
                     "  ⚠️ Context window exceeded after {}ms; sender history compacted={}",
@@ -5378,7 +5369,7 @@ async fn process_channel_message_body(
                 if let Some(channel) = target_channel.as_ref() {
                     if let Some(ref draft_id) = draft_message_id {
                         let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, error_text)
+                            .finalize_draft(&msg.reply_target, draft_id, &error_text)
                             .await;
                     } else {
                         let _ = channel
@@ -5452,8 +5443,11 @@ async fn process_channel_message_body(
                     );
                 }
                 if let Some(channel) = target_channel.as_ref() {
-                    let outbound_error =
-                        provider_error_user_message(&e).unwrap_or_else(|| format!("⚠️ Error: {e}"));
+                    let render_ctx = ProviderErrorRenderContext {
+                        provider: &route.model_provider,
+                        model: &route.model,
+                    };
+                    let outbound_error = provider_error_user_message(&e, &render_ctx);
                     if let Some(ref draft_id) = draft_message_id {
                         let _ = channel
                             .finalize_draft(&msg.reply_target, draft_id, &outbound_error)
@@ -5502,11 +5496,15 @@ async fn process_channel_message_body(
                 ChatMessage::assistant("[Task timed out — not continuing this request]"),
             );
             if let Some(channel) = target_channel.as_ref() {
-                let error_text =
-                    "⚠️ Request timed out while waiting for the model. Please try again.";
+                let timeout_error = anyhow::Error::msg(timeout_msg.clone());
+                let render_ctx = ProviderErrorRenderContext {
+                    provider: &route.model_provider,
+                    model: &route.model,
+                };
+                let error_text = provider_error_user_message(&timeout_error, &render_ctx);
                 if let Some(ref draft_id) = draft_message_id {
                     let _ = channel
-                        .finalize_draft(&msg.reply_target, draft_id, error_text)
+                        .finalize_draft(&msg.reply_target, draft_id, &error_text)
                         .await;
                 } else {
                     let _ = channel
@@ -10943,15 +10941,15 @@ temperature = 0.3
     }
 
     #[test]
-    fn context_window_overflow_error_detector_matches_known_messages() {
+    fn context_window_error_detector_matches_known_messages() {
         let overflow_err = anyhow::Error::msg(
             "OpenAI Codex stream error: Your input exceeds the context window of this model.",
         );
-        assert!(is_context_window_overflow_error(&overflow_err));
+        assert!(zeroclaw_providers::provider_error::is_context_window_exceeded(&overflow_err));
 
         let other_err =
             anyhow::Error::msg("OpenAI Codex API error (502 Bad Gateway): error code: 502");
-        assert!(!is_context_window_overflow_error(&other_err));
+        assert!(!zeroclaw_providers::provider_error::is_context_window_exceeded(&other_err));
     }
 
     #[test]
@@ -12118,6 +12116,53 @@ api_key = "anthropic-key"
         }
     }
 
+    struct ScriptedErrorModelProvider {
+        error: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ScriptedErrorModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!(self.error)
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            anyhow::bail!(self.error)
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for ScriptedErrorModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ScriptedErrorModelProvider"
+        }
+    }
+
     #[derive(Default)]
     struct RecordingChannel {
         sent_messages: tokio::sync::Mutex<Vec<String>>,
@@ -12416,6 +12461,42 @@ api_key = "anthropic-key"
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
         })
+    }
+
+    async fn run_friendly_error_case(error: &'static str) -> String {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let model_provider: Arc<dyn ModelProvider> = Arc::new(ScriptedErrorModelProvider { error });
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            model_provider,
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "mock-provider",
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-friendly-error".to_string(),
+                sender: "zeroclaw_user".to_string(),
+                reply_target: "chat-friendly-error".to_string(),
+                content: "hello".to_string(),
+                channel: "test-channel".to_string(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1, "expected exactly one friendly error reply");
+        sent[0].clone()
     }
 
     struct SlowModelProvider {
@@ -19109,7 +19190,9 @@ This is an example JSON object for profile settings."#;
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 1, "expected exactly one reply message");
         assert!(
-            sent[0].contains("does not support images"),
+            sent[0].contains("cannot read images")
+                || sent[0].contains("does not support image")
+                || sent[0].contains("不支持识别图片"),
             "reply must mention vision capability error, got: {}",
             sent[0]
         );
@@ -19240,7 +19323,9 @@ This is an example JSON object for profile settings."#;
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 2, "expected one error and one successful reply");
         assert!(
-            sent[0].contains("does not support images"),
+            sent[0].contains("cannot read images")
+                || sent[0].contains("does not support image")
+                || sent[0].contains("不支持识别图片"),
             "first reply must mention vision capability error, got: {}",
             sent[0]
         );
@@ -19529,7 +19614,7 @@ This is an example JSON object for profile settings."#;
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 1, "expected exactly one reply message");
         assert!(
-            sent[0].contains("API key is invalid or expired"),
+            sent[0].contains("API key is invalid") || sent[0].contains("API Key 无效"),
             "reply must use localized auth error, got: {}",
             sent[0]
         );
@@ -19538,6 +19623,105 @@ This is an example JSON object for profile settings."#;
             "reply must not leak raw provider error, got: {}",
             sent[0]
         );
+    }
+
+    #[tokio::test]
+    async fn e2e_provider_errors_render_friendly_messages_from_mock_provider() {
+        struct FriendlyErrorCase {
+            error: &'static str,
+            expected_any: &'static [&'static str],
+            forbidden_any: &'static [&'static str],
+        }
+
+        let cases = [
+            FriendlyErrorCase {
+                error: "401 Unauthorized: invalid api key",
+                expected_any: &["API key is invalid", "API Key 无效"],
+                forbidden_any: &["401 Unauthorized"],
+            },
+            FriendlyErrorCase {
+                error: "403 Forbidden: invalid token",
+                expected_any: &["API key is invalid", "API Key 无效"],
+                forbidden_any: &["403 Forbidden", "invalid token"],
+            },
+            FriendlyErrorCase {
+                error: "429: insufficient_quota, please check billing",
+                expected_any: &["quota is not enough", "额度不足"],
+                forbidden_any: &["429", "insufficient_quota"],
+            },
+            FriendlyErrorCase {
+                error: "out of credits",
+                expected_any: &["quota is not enough", "额度不足"],
+                forbidden_any: &["out of credits"],
+            },
+            FriendlyErrorCase {
+                error: "429 Too Many Requests: rate limit reached",
+                expected_any: &["Too many requests", "请求太频繁"],
+                forbidden_any: &["429"],
+            },
+            FriendlyErrorCase {
+                error: "connection refused while connecting to provider",
+                expected_any: &["Network connection failed", "网络连接失败"],
+                forbidden_any: &["connection refused"],
+            },
+            FriendlyErrorCase {
+                error: "failed to resolve host api.example.invalid",
+                expected_any: &["Network connection failed", "网络连接失败"],
+                forbidden_any: &["failed to resolve"],
+            },
+            FriendlyErrorCase {
+                error: "500 Internal Server Error",
+                expected_any: &["temporarily unavailable", "暂时不可用"],
+                forbidden_any: &["500", "Internal Server Error"],
+            },
+            FriendlyErrorCase {
+                error: "503 Service Unavailable",
+                expected_any: &["temporarily unavailable", "暂时不可用"],
+                forbidden_any: &["503", "Service Unavailable"],
+            },
+            FriendlyErrorCase {
+                error: "504 Gateway Timeout",
+                expected_any: &["temporarily unavailable", "暂时不可用"],
+                forbidden_any: &["504", "Gateway Timeout"],
+            },
+            FriendlyErrorCase {
+                error: "request timed out while waiting for upstream response",
+                expected_any: &["response timed out", "响应超时"],
+                forbidden_any: &["upstream response"],
+            },
+            FriendlyErrorCase {
+                error: "Your input exceeds the context window of this model.",
+                expected_any: &["conversation is too long", "对话内容太长"],
+                forbidden_any: &["context window"],
+            },
+            FriendlyErrorCase {
+                error: "The model 'gpt-5' does not exist",
+                expected_any: &["model name is not valid", "模型名称无效"],
+                forbidden_any: &["gpt-5", "does not exist"],
+            },
+            FriendlyErrorCase {
+                error: "raw internal stack trace details should not leak",
+                expected_any: &["Service error", "服务异常"],
+                forbidden_any: &["stack trace"],
+            },
+        ];
+
+        for case in cases {
+            let reply = run_friendly_error_case(case.error).await;
+            assert!(
+                case.expected_any
+                    .iter()
+                    .any(|expected| reply.contains(expected)),
+                "reply should contain one of {:?}, got: {reply}",
+                case.expected_any
+            );
+            for forbidden in case.forbidden_any {
+                assert!(
+                    !reply.contains(forbidden),
+                    "reply must not leak {forbidden:?}, got: {reply}"
+                );
+            }
+        }
     }
 
     #[test]

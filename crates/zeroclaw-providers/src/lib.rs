@@ -2593,7 +2593,8 @@ mod tests {
             },
         );
 
-        let options = provider_runtime_options_from_config(&config);
+        let entry = config.providers.models.find("minimax", "default");
+        let options = model_provider_runtime_options_from_model_provider_entry(&config, entry);
         assert_eq!(options.supports_vision, Some(true));
     }
 

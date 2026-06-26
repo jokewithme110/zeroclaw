@@ -122,9 +122,20 @@ pub fn get_error_string(key: &str) -> Option<String> {
     map.get(key).cloned()
 }
 
+/// Get an error string by key and format it with Fluent external arguments.
+pub fn get_error_string_with_args(key: &str, args: &[(&str, &str)]) -> Option<String> {
+    crate::i18n_errors::format_error_string(active_locale(), key, args, load_ftl_from_disk)
+}
+
 /// Get a required error string by key, reporting missing Fluent strings centrally.
 pub fn get_required_error_string(key: &str) -> String {
     get_error_string(key).unwrap_or_else(|| crate::i18n_errors::missing_error_string(key))
+}
+
+/// Get a required error string by key and format it with Fluent external arguments.
+pub fn get_required_error_string_with_args(key: &str, args: &[(&str, &str)]) -> String {
+    get_error_string_with_args(key, args)
+        .unwrap_or_else(|| crate::i18n_errors::missing_error_string(key))
 }
 
 fn active_locale() -> &'static str {
@@ -626,10 +637,11 @@ mod tests {
     #[test]
     fn error_strings_loaded_in_english() {
         let map = format_ftl_messages(include_str!("../locales/en/errors.ftl"), "en");
-        assert_eq!(
-            map.get("err-provider-auth-failed").map(String::as_str),
-            Some("⚠️ API key is invalid or expired. Please check your model configuration.")
-        );
+        let value = map
+            .get("err-provider-auth-failed")
+            .expect("en error key should exist");
+        assert!(value.contains("API key is invalid"));
+        assert!(value.contains("could not be verified"));
     }
 
     #[test]
@@ -639,6 +651,19 @@ mod tests {
             .get("err-provider-network-error")
             .expect("zh-CN error key should exist");
         assert!(value.contains("网络连接失败"));
+    }
+
+    #[test]
+    fn error_strings_support_fluent_args() {
+        let value = crate::i18n_loader::format_ftl_message(
+            include_str!("../locales/en/errors.ftl"),
+            "en",
+            "err-provider-model-not-found",
+            &[("provider", "OpenAI"), ("model", "gpt-5-mini")],
+        )
+        .expect("error string should format with args");
+        assert!(value.contains("OpenAI"));
+        assert!(value.contains("gpt-5-mini"));
     }
 
     #[test]

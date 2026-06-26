@@ -14,6 +14,8 @@ pub enum ProviderErrorKind {
     QuotaExceeded,
     ModelNotFound,
     VisionNotSupported,
+    ContextWindowExceeded,
+    Timeout,
     NetworkError,
     ServerError,
     Unknown,
@@ -27,6 +29,8 @@ impl ProviderErrorKind {
             Self::QuotaExceeded => "err-provider-quota-exceeded",
             Self::ModelNotFound => "err-provider-model-not-found",
             Self::VisionNotSupported => "err-provider-vision-not-supported",
+            Self::ContextWindowExceeded => "err-provider-context-window-exceeded",
+            Self::Timeout => "err-provider-timeout",
             Self::NetworkError => "err-provider-network-error",
             Self::ServerError => "err-provider-server-error",
             Self::Unknown => "err-provider-unknown",
@@ -53,16 +57,24 @@ pub fn classify_provider_error(err: &Error) -> ProviderErrorKind {
         return ProviderErrorKind::RateLimited;
     }
 
+    if is_context_window_exceeded(err) {
+        return ProviderErrorKind::ContextWindowExceeded;
+    }
+
     if is_model_not_found(err) {
         return ProviderErrorKind::ModelNotFound;
     }
 
-    if is_network_error(err) {
-        return ProviderErrorKind::NetworkError;
-    }
-
     if is_server_error(err) {
         return ProviderErrorKind::ServerError;
+    }
+
+    if is_timeout_error(err) {
+        return ProviderErrorKind::Timeout;
+    }
+
+    if is_network_error(err) {
+        return ProviderErrorKind::NetworkError;
     }
 
     ProviderErrorKind::Unknown
@@ -155,7 +167,7 @@ pub fn is_non_retryable_rate_limit(err: &Error) -> bool {
 
 pub fn is_network_error(err: &Error) -> bool {
     if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>()
-        && (reqwest_err.is_connect() || reqwest_err.is_timeout() || reqwest_err.is_request())
+        && (reqwest_err.is_connect() || reqwest_err.is_request())
     {
         return true;
     }
@@ -170,6 +182,24 @@ pub fn is_network_error(err: &Error) -> bool {
         "connection closed",
         "broken pipe",
         "error sending request",
+    ];
+    hints.iter().any(|hint| lower.contains(hint))
+}
+
+pub fn is_timeout_error(err: &Error) -> bool {
+    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>()
+        && reqwest_err.is_timeout()
+    {
+        return true;
+    }
+
+    let lower = err.to_string().to_lowercase();
+    let hints = [
+        "timed out",
+        "timeout",
+        "deadline exceeded",
+        "request timeout",
+        "operation timeout",
     ];
     hints.iter().any(|hint| lower.contains(hint))
 }
@@ -208,6 +238,24 @@ pub fn is_model_not_found(err: &Error) -> bool {
             || lower.contains("unknown")
             || lower.contains("unsupported")
             || lower.contains("invalid"))
+}
+
+pub fn is_context_window_exceeded(err: &Error) -> bool {
+    let lower = err.to_string().to_lowercase();
+    let hints = [
+        "exceeds the context window",
+        "exceeds the available context size",
+        "context window of this model",
+        "maximum context length",
+        "context length exceeded",
+        "too many tokens",
+        "token limit exceeded",
+        "prompt is too long",
+        "input is too long",
+        "prompt exceeds max length",
+    ];
+
+    hints.iter().any(|hint| lower.contains(hint))
 }
 
 fn has_quota_business_hint(err: &Error) -> bool {
@@ -293,8 +341,41 @@ mod tests {
     }
 
     #[test]
+    fn classify_timeout_error() {
+        let err = anyhow::anyhow!("LLM inference step timed out after 30s");
+        assert_eq!(classify_provider_error(&err), ProviderErrorKind::Timeout);
+    }
+
+    #[test]
+    fn classify_context_window_exceeded() {
+        let err = anyhow::anyhow!(
+            "OpenAI Codex stream error: Your input exceeds the context window of this model."
+        );
+        assert_eq!(
+            classify_provider_error(&err),
+            ProviderErrorKind::ContextWindowExceeded
+        );
+    }
+
+    #[test]
+    fn timeout_is_not_classified_as_network_error() {
+        let err = anyhow::anyhow!("request timed out while waiting for upstream response");
+        assert!(is_timeout_error(&err));
+        assert!(!is_network_error(&err));
+    }
+
+    #[test]
     fn classify_server_error_500() {
         let err = anyhow::anyhow!("Anthropic API error (500 Internal Server Error)");
+        assert_eq!(
+            classify_provider_error(&err),
+            ProviderErrorKind::ServerError
+        );
+    }
+
+    #[test]
+    fn classify_gateway_timeout_as_server_error() {
+        let err = anyhow::anyhow!("504 Gateway Timeout");
         assert_eq!(
             classify_provider_error(&err),
             ProviderErrorKind::ServerError

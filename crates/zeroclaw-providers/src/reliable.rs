@@ -12,8 +12,8 @@ use std::time::Duration;
 
 pub use super::provider_error::{
     ProviderErrorKind, classify_provider_error, classify_provider_error_message, is_auth_error,
-    is_model_not_found, is_network_error, is_non_retryable_rate_limit, is_rate_limited,
-    is_server_error,
+    is_context_window_exceeded, is_model_not_found, is_network_error, is_non_retryable_rate_limit,
+    is_rate_limited, is_server_error,
 };
 
 // ── ModelProvider Fallback Notification ──────────────────────────────────────
@@ -158,24 +158,6 @@ pub fn is_tool_schema_error(err: &anyhow::Error) -> bool {
         "not found in tool list",
         "invalid_tool_call",
     ];
-    hints.iter().any(|hint| lower.contains(hint))
-}
-
-pub fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
-    let lower = err.to_string().to_lowercase();
-    let hints = [
-        "exceeds the context window",
-        "exceeds the available context size",
-        "context window of this model",
-        "maximum context length",
-        "context length exceeded",
-        "too many tokens",
-        "token limit exceeded",
-        "prompt is too long",
-        "input is too long",
-        "prompt exceeds max length",
-    ];
-
     hints.iter().any(|hint| lower.contains(hint))
 }
 

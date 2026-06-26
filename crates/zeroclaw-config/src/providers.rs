@@ -155,6 +155,24 @@ define_provider_ref!(TtsProviderRef, "providers.tts");
 define_provider_ref!(TranscriptionProviderRef, "providers.transcription");
 define_provider_ref!(ChannelRef, "channels");
 
+/// Split a typed provider reference written as `<type>.<alias>`.
+///
+/// Provider references point at entries under paths such as
+/// `[providers.models.<type>.<alias>]`, `[providers.tts.<type>.<alias>]`, or
+/// `[channels.<type>.<alias>]`. Empty values are opt-out signals and return
+/// `None`; existence of the referenced entry is validated separately by
+/// `Config::validate()`.
+pub fn split_provider_ref(value: &str) -> Option<(&str, &str)> {
+    let trimmed = value.trim();
+    let (provider_type, alias) = trimmed.split_once('.')?;
+    let provider_type = provider_type.trim();
+    let alias = alias.trim();
+    if provider_type.is_empty() || alias.is_empty() {
+        return None;
+    }
+    Some((provider_type, alias))
+}
+
 /// Hard ceiling on `providers.models.<alias>.fallback` chain depth. The cycle
 /// guard only bounds chains that loop; a long acyclic chain would otherwise
 /// recurse one stack frame per alias at config-load and build time, turning a
@@ -922,3 +940,32 @@ for_each_transcription_provider_slot!(
     emit_transcription_cost_rates_struct,
     super::schema::TranscriptionCostRates
 );
+
+#[cfg(test)]
+mod tests {
+    use super::split_provider_ref;
+
+    #[test]
+    fn split_provider_ref_accepts_typed_alias_ref() {
+        assert_eq!(
+            split_provider_ref("deepseek.default"),
+            Some(("deepseek", "default"))
+        );
+    }
+
+    #[test]
+    fn split_provider_ref_trims_parts() {
+        assert_eq!(
+            split_provider_ref("  custom.mock  "),
+            Some(("custom", "mock"))
+        );
+    }
+
+    #[test]
+    fn split_provider_ref_rejects_empty_or_unqualified_values() {
+        assert_eq!(split_provider_ref(""), None);
+        assert_eq!(split_provider_ref("deepseek"), None);
+        assert_eq!(split_provider_ref(".default"), None);
+        assert_eq!(split_provider_ref("deepseek."), None);
+    }
+}

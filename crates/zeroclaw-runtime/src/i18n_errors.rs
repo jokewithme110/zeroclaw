@@ -35,6 +35,35 @@ pub fn missing_error_string(key: &str) -> String {
     format!("{{{key}}}")
 }
 
+pub fn format_error_string(
+    locale: &str,
+    key: &str,
+    args: &[(&str, &str)],
+    load_from_disk: impl Fn(&str, &str) -> Option<String>,
+) -> Option<String> {
+    if locale != "en" {
+        if let Some(locale_ftl) = builtin_error_ftl_source(locale)
+            && let Some(value) =
+                crate::i18n_loader::format_ftl_message(locale_ftl, locale, key, args)
+        {
+            return Some(value);
+        }
+        if let Some(locale_ftl) = load_from_disk(locale, "errors.ftl")
+            && let Some(value) =
+                crate::i18n_loader::format_ftl_message(&locale_ftl, locale, key, args)
+        {
+            return Some(value);
+        }
+    }
+
+    crate::i18n_loader::format_ftl_message(
+        include_str!("../locales/en/errors.ftl"),
+        "en",
+        key,
+        args,
+    )
+}
+
 fn builtin_error_ftl_source(locale: &str) -> Option<&'static str> {
     match locale {
         "zh-CN" => Some(include_str!("../locales/zh-CN/errors.ftl")),
