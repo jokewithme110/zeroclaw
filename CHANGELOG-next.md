@@ -117,6 +117,14 @@ For those tracking the beta line, the 184 commits since beta-2 concentrate on st
 - **Cron**: disabling startup catch-up actually skips overdue jobs (#7348), one-shot reminders can be scheduled relative to now (#7188), schedules set in the past get a clear diagnostic (#7165), and DingTalk is available as a delivery channel (#7091).
 - **Runtime**: history trimming can no longer empty the conversation entirely (#7403), parallel SubAgents and delegates return reliably (#7442), writing files into a container with no mounted workspace fails loudly instead of silently (#7129), and the gateway survives transient connection-accept errors instead of crashing (#7402).
 
+## Skills
+
+### SkillHub integration (PR1 + PR2 + PR3)
+
+- **PR1 — Self-hosted SkillHub resolution**: new `[skills] skillhub_base_url` config key. Defaults to `https://clawhub.ai`. The ICT self-hosted production set lives at `https://skillhubictst.mec189.cn/enhance` (8 curated skills); the full registry (35 skills) at `https://skillhubictst.mec189.cn`. The CLI `skill install <source>` command now accepts `skillhub://<slug>[@<version>]` URIs and auto-resolves the latest version when omitted.
+- **PR2 — Agent-driven skill lifecycle**: new `skill_search` / `skill_install` / `skill_remove` agent-callable tools. The model can now discover, install, and uninstall skills autonomously at runtime, with hot-reload of the installed skill's tools into the live `ToolRegistry` (no agent restart required). Gated behind a new `[skills] enable_agent_skill_management` config key (default `false`); set to `true` to enable agent-driven skill management.
+- **PR3 — Operator docs**: new "Self-hosted SkillHub integration" section in `docs/book/src/tools/skills.md` covering the `skillhub_base_url` resolution rules (whitespace-trim, trailing-slash-strip, default `https://clawhub.ai`), the `skillhub://<slug>[@<version>]` URI form, and the `enable_agent_skill_management` opt-in. A new "Recommended per-tool settings" subsection in `docs/book/src/security/autonomy.md` recommends `auto_approve` for `skill_search` and `skill_remove`, and `always_ask` for `skill_install` under `supervised` autonomy. `dev/config.template.toml` now includes commented `[skills]` blocks for the ICT curated and full registry URLs.
+
 ## Breaking changes
 
 - **[Schema V3](https://docs.zeroclawlabs.ai/master/en/reference/config.html)** (#6398): configs migrate automatically on first load. Profile settings are split between runtime behavior and risk policy, cost rates are reorganized per provider, and scheduled jobs must name the agent they run as.

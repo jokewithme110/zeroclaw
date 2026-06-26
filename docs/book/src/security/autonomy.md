@@ -77,6 +77,33 @@ WARN autonomy:blocked            tool=shell command="rm -rf /tmp" reason="forbid
 
 Receipts for blocked calls are written to the [tool-receipts log](./tool-receipts.md) the same as successful calls; a denial is an event worth auditing.
 
+## Recommended per-tool settings
+
+The risk classification tables above are coarse on purpose. A few specific tools benefit from explicit `auto_approve` / `always_ask` guidance, because their default risk level depends on the agent's surface.
+
+### `skill_search`, `skill_install`, `skill_remove`
+
+These three tools land in the agent's tool list when `[skills] enable_agent_skill_management = true`. They are disabled by default (opt-in for security). Operators who do not want agents installing code at all should leave the default (`false`). See [Skills → Self-hosted SkillHub integration](../tools/skills.md#self-hosted-skillhub-integration) for the full flow.
+
+| Tool | Default risk | Recommended setting | Why |
+|---|---|---|---|
+| `skill_search` | Low | `auto_approve` | Read-only call to the hub's search/list endpoint. No filesystem change, no network write, no process spawn. Safe to run on every turn. |
+| `skill_install` | Medium-High | `always_ask` (supervised) or `auto_approve` (full) | Downloads a skill archive to the workspace, extracts it, and **hot-loads** its tools into the live `ToolRegistry`. The installed skill's tools become callable without an agent restart. Treat the install itself like `file_write` — review the slug + version before approval. |
+| `skill_remove` | Medium | `auto_approve` (after the first install) or `always_ask` | Deletes a local directory that the operator (or a prior `skill_install`) chose to create. Hot-unloads the same tools. Reversible: re-running `skill_install` re-creates the directory. |
+
+A typical supervised-profile configuration:
+
+```toml
+[risk_profiles.supervised]
+level = "supervised"
+auto_approve = ["skill_search", "skill_remove"]
+always_ask    = ["skill_install"]
+```
+
+For a `full` autonomy profile that already runs everything unattended, the three tools collapse into the default gate-less path. For `readonly`, none of the three are useful — the install / remove pair would block anyway, and `skill_search` is a redundant no-op next to `web_search` / `http` against the same hub URL.
+
+If the operator does not want agents installing code at all, set `[skills] enable_agent_skill_management = false`. The three tools are then not registered.
+
 ## Why not just a binary "safe mode"?
 
 Because the useful middle ground is big. A user who wants agents to run scripts automatically but not push to master needs something between "everything's allowed" and "nothing's allowed". Three-level autonomy + per-tool overrides + command allowlists gives that knob without fragmenting the config.

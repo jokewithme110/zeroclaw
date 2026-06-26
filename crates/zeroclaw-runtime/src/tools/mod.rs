@@ -36,8 +36,12 @@ pub mod security_ops;
 pub mod send_message_to_peer;
 pub mod shell;
 pub mod skill_http;
+pub mod skill_install;
+pub mod skill_remove;
 pub mod skill_scan_report;
+pub mod skill_search;
 pub mod skill_tool;
+pub mod skillhub_client;
 pub mod sop_advance;
 pub mod sop_approve;
 pub mod sop_execute;
@@ -145,7 +149,14 @@ pub use security_ops::SecurityOpsTool;
 pub use send_message_to_peer::SendMessageToPeerTool;
 pub use shell::ShellTool;
 pub use skill_http::SkillHttpTool;
+pub use skill_install::SkillInstallTool;
+pub use skill_remove::SkillRemoveTool;
+pub use skill_search::SkillSearchTool;
 pub use skill_tool::{SkillBuiltinTool, SkillShellTool};
+pub use skillhub_client::{
+    SkillListItem, SkillListResponse, SkillSearchItem, SkillSearchResponse, SkillStats,
+    SkillVersion,
+};
 pub use sop_advance::SopAdvanceTool;
 pub use sop_approve::SopApproveTool;
 pub use sop_execute::SopExecuteTool;
@@ -178,6 +189,34 @@ use zeroclaw_memory::Memory;
 /// underlying type formerly known as `ChannelMapHandle`.
 pub type PerToolChannelHandle =
     Arc<RwLock<HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>>>;
+
+/// Shared tool registry. Wrapped in `tokio::sync::RwLock` so PR2's
+/// skill-management tools (`skill_install` / `skill_remove`) can hot-load
+/// new tools at runtime without restarting the agent.
+///
+/// **Why `tokio::sync::RwLock` instead of `parking_lot` / `std::sync`?**
+/// `parking_lot::RwLockReadGuard` is `!Send` (intended for sync code).
+/// `std::sync::RwLockReadGuard<'_, T>` is `Send` only if `T: Sync`, but
+/// `Box<dyn Tool>` is NOT auto-`Sync` (Rust doesn't auto-derive Sync for
+/// `dyn Trait` even when the trait requires Sync for implementers).
+/// `tokio::sync::RwLock` provides `Send` guards unconditionally.
+///
+/// Lock contention is low: read locks are held only for the duration of
+/// a single tool dispatch, write locks only for hot-reload (milliseconds).
+/// The async-acquire overhead is negligible compared to LLM round-trip latency.
+pub type ToolRegistry = Arc<tokio::sync::RwLock<Vec<Box<dyn Tool>>>>;
+
+/// Construct an empty [`ToolRegistry`]. Convenience for tests and for
+/// the orchestrator's "no skills installed yet" fallback path.
+pub fn empty_tool_registry() -> ToolRegistry {
+    Arc::new(tokio::sync::RwLock::new(Vec::new()))
+}
+
+/// Wrap a pre-built tool list in a [`ToolRegistry`]. The caller transfers
+/// ownership of `tools` into the registry.
+pub fn tool_registry_from(tools: Vec<Box<dyn Tool>>) -> ToolRegistry {
+    Arc::new(tokio::sync::RwLock::new(tools))
+}
 
 /// Shared handle to the delegate tool's parent-tools list.
 /// Callers can push additional tools (e.g. MCP wrappers) after construction.
@@ -1417,6 +1456,21 @@ pub fn all_tools_with_runtime(
             root_config.pipeline.clone(),
             pipeline_tools,
         )));
+    }
+
+    // ── Skill management tools ──
+    // Registered when `[skills].enable_agent_skill_management` is true.
+    // Skills are installed to disk; tools become available after agent restart.
+    if config.skills.enable_agent_skill_management {
+        tool_arcs.push(Arc::new(SkillSearchTool::new(
+            config.clone(),
+            workspace_dir.to_path_buf(),
+        )));
+        tool_arcs.push(Arc::new(SkillInstallTool::new(
+            config.clone(),
+            workspace_dir.to_path_buf(),
+        )));
+        tool_arcs.push(Arc::new(SkillRemoveTool::new(workspace_dir.to_path_buf())));
     }
 
     AllToolsResult {

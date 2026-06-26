@@ -1,6 +1,13 @@
 #[allow(unused_imports)]
 pub use zeroclaw_runtime::skills::*;
 
+use std::time::Duration;
+use zeroclaw_config::skillhub::resolve_skillhub_base_url;
+use zeroclaw_runtime::skills::{
+    install_skillhub_skill, is_skillhub_source, parse_skillhub_source,
+    resolve_skillhub_latest_version,
+};
+
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
@@ -30,10 +37,11 @@ pub async fn handle_command(
     command: crate::SkillCommands,
     config: &crate::config::Config,
 ) -> Result<()> {
-    let workspace_dir = &config.data_dir;
+    let workspace_dir =
+        config.agent_workspace_dir(config.resolved_runtime_agent_alias().unwrap_or("default"));
     match command {
         crate::SkillCommands::List => {
-            let skills = load_skills_with_config(workspace_dir, config);
+            let skills = load_skills_with_config(&workspace_dir, config);
             if skills.is_empty() {
                 println!("{}", get_required_cli_string("cli-skills-none-installed"));
                 println!();
@@ -89,7 +97,7 @@ pub async fn handle_command(
             let target = if source_path.exists() {
                 source_path
             } else {
-                skills_dir(workspace_dir).join(&source)
+                skills_dir(&workspace_dir).join(zeroclaw_runtime::skills::skill_dir_name(&source))
             };
 
             if !target.exists() {
@@ -134,13 +142,45 @@ pub async fn handle_command(
                 )
             );
 
-            let skills_path = skills_dir(workspace_dir);
+            let skills_path = skills_dir(&workspace_dir);
             std::fs::create_dir_all(&skills_path)?;
 
-            let (installed_dir, files_scanned) = if is_clawhub_source(&source) {
-                install_clawhub_skill_source(&source, &skills_path, config.skills.allow_scripts)
-                    .await
-                    .with_context(|| format!("failed to install skill from ClawHub: {source}"))?
+            // Reuse one reqwest::Client across the auto-fetch + install so we
+            // do not pay DNS/TLS handshake twice per CLI invocation.
+            let http_client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .user_agent("zeroclaw-skillhub/0.8")
+                .build()
+                .context("failed to build reqwest::Client for skill install")?;
+
+            let (installed_dir, files_scanned) = if is_skillhub_source(&source) {
+                let (slug, version) = parse_skillhub_source(&source)
+                    .with_context(|| format!("invalid SkillHub source: {source}"))?;
+                let base_url = resolve_skillhub_base_url(config);
+                let version = match version {
+                    Some(v) => v,
+                    None => {
+                        // No @version -> auto-resolve latest from the configured SkillHub.
+                        resolve_skillhub_latest_version(&base_url, &slug, &http_client)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "failed to resolve latest version for '{slug}' from {base_url}"
+                                )
+                            })?
+                    }
+                };
+                install_skillhub_skill(
+                    &base_url,
+                    &slug,
+                    &version,
+                    &skills_path,
+                    config.skills.allow_scripts,
+                    &http_client,
+                    false, // force: CLI uses explicit remove+install
+                )
+                .await
+                .with_context(|| format!("failed to install skill from SkillHub: {source}"))?
             } else if is_git_source(&source) {
                 install_git_skill_source(&source, &skills_path, config.skills.allow_scripts)
                     .with_context(|| format!("failed to install git skill source: {source}"))?
@@ -156,7 +196,7 @@ pub async fn handle_command(
                     &source,
                     &skills_path,
                     config.skills.allow_scripts,
-                    workspace_dir,
+                    &workspace_dir,
                     config.skills.registry_url.as_deref(),
                     no_tier_banner,
                 )
@@ -224,29 +264,44 @@ pub async fn handle_command(
                 anyhow::bail!("Invalid skill name: {name}");
             }
 
-            let skill_path = skills_dir(workspace_dir).join(&name);
-
-            // Verify the resolved path is actually inside the skills directory
-            let canonical_skills = skills_dir(workspace_dir)
-                .canonicalize()
-                .unwrap_or_else(|_| skills_dir(workspace_dir));
-            if let Ok(canonical_skill) = skill_path.canonicalize() {
-                if !canonical_skill.starts_with(&canonical_skills) {
-                    anyhow::bail!("Skill path escapes skills directory: {name}");
-                }
-            }
-
-            if !skill_path.exists() {
+            // Scan installed skills to find the matching directory.
+            // Match by manifest name first, then by normalized slug
+            // (the on-disk directory name). The two can differ: slug
+            // "taiwan-property-valuation" → dir "taiwan_property_valuation"
+            // while the SKILL.toml declares name = "property-valuation".
+            let skills = load_skills_with_config(&workspace_dir, config);
+            let found = skills.iter().find(|s| s.name == name).or_else(|| {
+                let dir_name = zeroclaw_runtime::skills::skill_dir_name(&name);
+                skills.iter().find(|s| {
+                    s.location
+                        .as_ref()
+                        .and_then(|loc| loc.parent())
+                        .and_then(|p| p.file_name())
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|dn| dn == dir_name)
+                })
+            });
+            if let Some(skill) = found {
+                let dir = skill
+                    .location
+                    .as_ref()
+                    .and_then(|loc| loc.parent())
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| {
+                        skills_dir(&workspace_dir)
+                            .join(zeroclaw_runtime::skills::skill_dir_name(&name))
+                    });
+                let removed_name = &skill.name;
+                std::fs::remove_dir_all(&dir)?;
+                println!(
+                    "  {} Skill '{}' removed.",
+                    console::style("✓").green().bold(),
+                    removed_name
+                );
+                Ok(())
+            } else {
                 anyhow::bail!("Skill not found: {name}");
             }
-
-            std::fs::remove_dir_all(&skill_path)?;
-            println!(
-                "  {} Skill '{}' removed.",
-                console::style("✓").green().bold(),
-                name
-            );
-            Ok(())
         }
         crate::SkillCommands::Add {
             name,
@@ -288,7 +343,7 @@ pub async fn handle_command(
                 let target = if source_path.exists() {
                     source_path
                 } else {
-                    skills_dir(workspace_dir).join(skill_name)
+                    skills_dir(&workspace_dir).join(skill_name)
                 };
 
                 if !target.exists() {
@@ -307,7 +362,7 @@ pub async fn handle_command(
                 vec![r]
             } else {
                 // Test all skills
-                let dirs = vec![skills_dir(workspace_dir)];
+                let dirs = vec![skills_dir(&workspace_dir)];
                 testing::test_all_skills(&dirs, verbose)?
             };
 

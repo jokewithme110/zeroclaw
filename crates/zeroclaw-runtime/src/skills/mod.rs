@@ -43,11 +43,9 @@ const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
 const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
 
-// ─── ClawhHub / OpenClaw registry installers ───────────────────────────────
-const CLAWHUB_DOMAIN: &str = "clawhub.ai";
-const CLAWHUB_WWW_DOMAIN: &str = "www.clawhub.ai";
-const CLAWHUB_DOWNLOAD_API: &str = "https://clawhub.ai/api/v1/download";
-const MAX_CLAWHUB_ZIP_BYTES: u64 = 50 * 1024 * 1024; // 50 MiB
+// ─── SkillHub / OpenClaw registry installers ──────────────────────────────
+pub use ::zeroclaw_config::skillhub::DEFAULT_SKILLHUB_BASE_URL;
+const MAX_SKILLHUB_ZIP_BYTES: u64 = 50 * 1024 * 1024; // 50 MiB
 
 // ─── Skills registry (zeroclaw-skills) ────────────────────────────────────────
 const SKILLS_REGISTRY_REPO_URL: &str = "https://github.com/zeroclaw-labs/zeroclaw-skills";
@@ -567,6 +565,35 @@ fn load_workspace_skills(workspace_dir: &Path, allow_scripts: bool) -> Vec<Skill
     load_skills_from_directory(&skills_dir, allow_scripts)
 }
 
+/// Load a single skill from a directory by attempting `SKILL.toml`,
+/// then `manifest.toml`, then `SKILL.md`. Mirrors the discovery order used
+/// by [`load_skills_from_directory`] so a skill hot-loaded mid-session
+/// resolves the same way as a skill loaded at start-up.
+///
+/// **Skips the security audit**: the install path (`install_skillhub_skill`
+/// and friends) already enforces `enforce_skill_security_audit` on the
+/// just-extracted directory before returning. Re-auditing on every hot-reload
+/// would add I/O and (worse) cause spurious failures if a user-edited file
+/// later triggers an audit finding that did not exist at install time.
+pub fn load_skill_from_dir(dir: &Path) -> Result<Skill> {
+    let skill_toml = dir.join("SKILL.toml");
+    if skill_toml.exists() {
+        return load_skill_toml(&skill_toml);
+    }
+    let manifest_toml = dir.join("manifest.toml");
+    if manifest_toml.exists() {
+        return load_skill_toml(&manifest_toml);
+    }
+    let md = dir.join("SKILL.md");
+    if md.exists() {
+        return load_skill_md(&md, dir);
+    }
+    anyhow::bail!(
+        "skill directory {} has no SKILL.toml, manifest.toml, or SKILL.md",
+        dir.display()
+    )
+}
+
 pub fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
     if !skills_dir.exists() {
         return Vec::new();
@@ -1076,7 +1103,22 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
             .description
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| extract_description(&parsed.body)),
-        version: parsed.meta.version.unwrap_or_else(default_version),
+        version: parsed
+            .meta
+            .version
+            .or_else(|| {
+                // SkillHub ZIPs include an _meta.json with the published
+                // version string (e.g. "4.99.0+e83694e"). Read it so
+                // skill_search(local=true) can show the actual installed
+                // version for update comparison.
+                let meta_path = dir.join("_meta.json");
+                std::fs::read_to_string(&meta_path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .and_then(|v| v.get("version")?.as_str().map(String::from))
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or_else(default_version),
         author: parsed.meta.author,
         tags: parsed.meta.tags,
         tools: Vec::new(),
@@ -1336,6 +1378,7 @@ pub fn skills_to_prompt_with_mode(
         let _ = writeln!(prompt, "  <skill>");
         write_xml_text_element(&mut prompt, 4, "name", &skill.name);
         write_xml_text_element(&mut prompt, 4, "description", &skill.description);
+        write_xml_text_element(&mut prompt, 4, "version", &skill.version);
         let location = render_skill_location(
             skill,
             workspace_dir,
@@ -1548,6 +1591,38 @@ pub fn skills_dir(workspace_dir: &Path) -> PathBuf {
     workspace_dir.join("skills")
 }
 
+/// Remove a locally-installed skill by deleting its directory.
+///
+/// Returns `Ok(true)` if the skill was found and removed, `Ok(false)` if
+/// the directory did not exist (no-op). The `slug` is validated to prevent
+/// path traversal: it must be a single path segment, contain no `..` or
+/// separators, and the resulting path must resolve inside `skills_path`.
+pub fn uninstall_local_skill(skills_path: &Path, slug: &str) -> Result<bool> {
+    validate_skill_slug(slug)?;
+
+    // Use the same on-disk naming as `install_skillhub_skill` so a
+    // `skill_remove foo-bar` after `skill_install foo-bar` actually
+    // finds the directory (which is written as `foo_bar/`).
+    let dir = skills_path.join(skill_dir_name(slug));
+    if !dir.exists() {
+        return Ok(false);
+    }
+
+    // Defense in depth: ensure the resolved path stays inside skills_path.
+    let canonical_skills = skills_path
+        .canonicalize()
+        .unwrap_or_else(|_| skills_path.to_path_buf());
+    if let Ok(canonical_dir) = dir.canonicalize()
+        && !canonical_dir.starts_with(&canonical_skills)
+    {
+        anyhow::bail!("refusing to remove '{slug}': path escapes skills directory");
+    }
+
+    std::fs::remove_dir_all(&dir)
+        .with_context(|| format!("failed to remove skill directory: {}", dir.display()))?;
+    Ok(true)
+}
+
 /// Initialize the skills directory with a README
 pub fn init_skills_dir(workspace_dir: &Path) -> Result<()> {
     let dir = skills_dir(workspace_dir);
@@ -1588,112 +1663,179 @@ pub fn init_skills_dir(workspace_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn is_clawhub_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case(CLAWHUB_DOMAIN) || host.eq_ignore_ascii_case(CLAWHUB_WWW_DOMAIN)
-}
-
-fn parse_clawhub_url(source: &str) -> Option<Url> {
+/// Parse an HTTP(S) URL without any host allowlist. This intentionally
+/// accepts any host so the ICT self-hosted SkillHub (`*.mec189.cn`) works
+/// alongside the legacy `clawhub.ai`. Only the URL scheme is validated.
+#[doc(hidden)]
+pub fn parse_http_skill_url(source: &str) -> Option<Url> {
     let parsed = Url::parse(source).ok()?;
     match parsed.scheme() {
-        "https" | "http" => {}
-        _ => return None,
+        "https" | "http" => Some(parsed),
+        _ => None,
     }
-
-    if !parsed.host_str().is_some_and(is_clawhub_host) {
-        return None;
-    }
-
-    Some(parsed)
 }
 
-pub fn is_clawhub_source(source: &str) -> bool {
+/// Return true if `source` looks like a SkillHub install source:
+/// - the `clawhub:<slug>[@<version>]` short form, or
+/// - a valid `http(s)://` URL (host-independent).
+pub fn is_skillhub_source(source: &str) -> bool {
     if source.starts_with("clawhub:") {
         return true;
     }
-    parse_clawhub_url(source).is_some()
+    parse_http_skill_url(source).is_some()
 }
 
-fn clawhub_download_url(source: &str) -> Result<String> {
-    // Short prefix: clawhub:<slug>
-    if let Some(slug) = source.strip_prefix("clawhub:") {
-        let slug = slug.trim().trim_end_matches('/');
-        if slug.is_empty() || slug.contains('/') {
+/// Parse a SkillHub source string into `(slug, optional_version)`.
+///
+/// Accepted forms:
+/// - `clawhub:foo` -> `("foo", None)`
+/// - `clawhub:foo@1.0.0` -> `("foo", Some("1.0.0"))`
+/// - `clawhub:foo@20260528.071446` -> `("foo", Some("20260528.071446"))`
+/// - `https://.../foo` -> `("foo", None)` (the @ is not split in URL form)
+///
+/// Returns an error for empty sources, missing slug, or empty version.
+pub fn parse_skillhub_source(source: &str) -> Result<(String, Option<String>)> {
+    if let Some(rest) = source.strip_prefix("clawhub:") {
+        let rest = rest.trim().trim_end_matches('/');
+        if rest.is_empty() || rest.contains('/') {
             anyhow::bail!(
-                "invalid clawhub source '{}': expected 'clawhub:<slug>' (no slashes in slug)",
+                "invalid clawhub source '{}': expected 'clawhub:<slug>[@<version>]'",
                 source
             );
         }
-        return Ok(format!("{CLAWHUB_DOWNLOAD_API}?slug={slug}"));
-    }
-
-    // Profile URL: https://clawhub.ai/<owner>/<slug> or https://www.clawhub.ai/<slug>
-    if let Some(parsed) = parse_clawhub_url(source) {
-        let path = parsed
-            .path_segments()
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join("/");
-
-        if path.is_empty() {
-            anyhow::bail!("could not extract slug from ClawhHub URL: {source}");
+        let (slug, ver) = match rest.split_once('@') {
+            Some((s, v)) => (s, Some(v)),
+            None => (rest, None),
+        };
+        validate_skill_slug(slug).with_context(|| format!("invalid clawhub source '{source}'"))?;
+        if let Some(v) = ver
+            && v.is_empty()
+        {
+            anyhow::bail!("invalid clawhub source '{source}': empty version");
         }
-
-        return Ok(format!("{CLAWHUB_DOWNLOAD_API}?slug={path}"));
+        return Ok((slug.to_string(), ver.map(str::to_string)));
     }
 
-    anyhow::bail!("unrecognised ClawhHub source format: {source}")
+    if let Some(parsed) = parse_http_skill_url(source) {
+        let last_segment = parsed
+            .path_segments()
+            .and_then(|mut s| s.next_back())
+            .unwrap_or("");
+        if last_segment.is_empty() {
+            anyhow::bail!("could not extract slug from URL: {source}");
+        }
+        // URL form takes the last path segment as slug; run it through
+        // the same validator used by the short form so a hostile URL
+        // (e.g. `https://hub/..%2Fetc`) cannot sneak through.
+        validate_skill_slug(last_segment)
+            .with_context(|| format!("could not extract slug from URL: {source}'"))?;
+        return Ok((last_segment.to_string(), None));
+    }
+
+    anyhow::bail!("unrecognised source format: {source}")
 }
 
-fn normalize_skill_name(s: &str) -> String {
-    s.to_lowercase()
+/// Validate that `slug` is safe to use as a single on-disk path segment.
+///
+/// This is the single source of truth for the slug character set; the
+/// `skill_install` / `skill_remove` agent tools, the CLI installer, and
+/// [`parse_skillhub_source`] all funnel through here.
+///
+/// Rules (intentionally strict to mirror the existing
+/// `uninstall_local_skill` defense):
+/// - non-empty
+/// - single path segment: no `/`, no `\`
+/// - no `..` traversal
+/// - no `:` (drive-letter / alternate-data-stream on Windows)
+/// - characters must be ASCII alphanumeric, `_`, `-`, or `.`
+///   (the `.` is allowed so versioned slugs like `foo.v2` work)
+///
+/// Note: `..` is rejected both by the explicit check (above) and by the
+/// per-character whitelist (which filters out the dots); the explicit
+/// check is kept for a clearer error message.
+pub fn validate_skill_slug(slug: &str) -> Result<()> {
+    if slug.is_empty() {
+        anyhow::bail!("invalid skill slug: must be non-empty");
+    }
+    if slug.contains('/') || slug.contains('\\') {
+        anyhow::bail!("invalid skill slug '{slug}': must be a single path segment");
+    }
+    if slug.contains("..") {
+        anyhow::bail!("invalid skill slug '{slug}': contains '..' traversal");
+    }
+    if slug.contains(':') {
+        anyhow::bail!("invalid skill slug '{slug}': contains ':'");
+    }
+    if !slug
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        anyhow::bail!(
+            "invalid skill slug '{slug}': only ASCII alphanumerics, '_', '-', '.' allowed"
+        );
+    }
+    Ok(())
+}
+
+/// Derive the on-disk skill directory name from a raw slug.
+///
+/// This is the single source of truth for the on-disk naming convention
+/// used by both `install_skillhub_skill` (writer) and
+/// `uninstall_local_skill` (reader). The two must agree byte-for-byte,
+/// or `skill_remove <slug>` after `skill_install <slug>` will silently
+/// miss the directory.
+///
+/// Rules:
+/// - lowercase
+/// - `-` -> `_`
+/// - keep ASCII alphanumerics + `_`
+/// - drop everything else
+/// - if the result is empty, return the literal `"skill"` (matches the
+///   install-side fallback for a slug like `@1.0.0` with no name part)
+///
+/// Callers are expected to have already run the slug through
+/// [`validate_skill_slug`] before reaching here.
+pub fn skill_dir_name(slug: &str) -> String {
+    let normalized: String = slug
+        .to_lowercase()
         .chars()
         .map(|c| if c == '-' { '_' } else { c })
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect()
-}
-
-fn clawhub_skill_dir_name(source: &str) -> Result<String> {
-    if let Some(slug) = source.strip_prefix("clawhub:") {
-        let slug = slug.trim().trim_end_matches('/');
-        let base = slug.rsplit('/').next().unwrap_or(slug);
-        let name = normalize_skill_name(base);
-        return Ok(if name.is_empty() {
-            "skill".to_string()
-        } else {
-            name
-        });
-    }
-
-    let parsed = parse_clawhub_url(source).ok_or_else(|| {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({"source": source})),
-            "skill install rejected: invalid clawhub URL"
-        );
-        anyhow::Error::msg(format!("invalid clawhub URL: {source}"))
-    })?;
-
-    let path = parsed
-        .path_segments()
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-
-    let base = path.last().copied().unwrap_or("skill");
-    let name = normalize_skill_name(base);
-    Ok(if name.is_empty() {
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+        .collect();
+    if normalized.is_empty() {
         "skill".to_string()
     } else {
-        name
-    })
+        normalized
+    }
+}
+
+/// Build a download URL for a given slug+version on a SkillHub base URL.
+///
+/// `base_url` should be a normalized SkillHub base URL with no trailing
+/// slash (e.g. `https://skillhubictst.mec189.cn/enhance`).
+pub fn skillhub_download_url(base_url: &str, slug: &str, version: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    // Encode slug and version as query values to prevent URL injection
+    // (e.g. an agent passing slug="foo&evil=bar" would otherwise
+    // append a second query parameter to the request).
+    format!(
+        "{base}/api/v1/download?slug={slug}&version={version}",
+        slug = urlencoding::encode(slug),
+        version = urlencoding::encode(version),
+    )
+}
+
+/// Derive the on-disk skill directory name from a SkillHub source string.
+/// For URL sources only the final path segment is used (consistent with
+/// `parse_skillhub_source`).
+pub fn skillhub_skill_dir_name(source: &str) -> Result<String> {
+    let (slug, _version) = parse_skillhub_source(source)?;
+    Ok(skill_dir_name(&slug))
 }
 
 pub fn is_git_source(source: &str) -> bool {
-    // ClawHub URLs look like https:// but are not git repos
-    if is_clawhub_source(source) {
+    // SkillHub URLs look like https:// but are not git repos
+    if is_skillhub_source(source) {
         return false;
     }
     is_git_scheme_source(source, "https://")
@@ -1918,25 +2060,100 @@ pub fn install_git_skill_source(
     }
 }
 
-pub async fn install_clawhub_skill_source(
-    source: &str,
-    skills_path: &Path,
-    allow_scripts: bool,
-) -> Result<(PathBuf, usize)> {
-    let download_url = clawhub_download_url(source)
-        .with_context(|| format!("invalid ClawhHub source: {source}"))?;
-    let skill_dir_name = clawhub_skill_dir_name(source)?;
-    let installed_dir = skills_path.join(&skill_dir_name);
-    if installed_dir.exists() {
+/// Fetch the latest version string for a SkillHub skill by hitting the
+/// detail endpoint and reading the top-level `latestVersion.version` field.
+///
+/// Returns an error if the slug does not exist (HTTP 404), the response
+/// cannot be parsed, or the `latestVersion` field is missing.
+pub async fn resolve_skillhub_latest_version(
+    base_url: &str,
+    slug: &str,
+    client: &reqwest::Client,
+) -> Result<String> {
+    let base = base_url.trim_end_matches('/');
+    // Encode slug as a path segment. parse_skillhub_source already rejects
+    // slashes in the short form, but URL encoding defends against any
+    // future source that allows richer slug characters.
+    let url = format!("{base}/api/v1/skills/{}", urlencoding::encode(slug));
+
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("failed to fetch skill detail from {url}"))?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        anyhow::bail!("SkillHub detail 404: slug '{slug}' not found ({url})");
+    }
+    if !resp.status().is_success() {
         anyhow::bail!(
-            "Destination skill already exists: {}",
-            installed_dir.display()
+            "SkillHub detail failed (HTTP {}) for slug '{slug}' ({url})",
+            resp.status()
         );
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()?;
+    #[derive(serde::Deserialize)]
+    struct MinimalDetail {
+        #[serde(default, alias = "latestVersion")]
+        latest_version: Option<MinimalVersion>,
+    }
+    #[derive(serde::Deserialize)]
+    struct MinimalVersion {
+        #[serde(default)]
+        version: Option<String>,
+    }
+
+    let parsed: MinimalDetail = resp
+        .json()
+        .await
+        .context("failed to parse SkillHub detail response as JSON")?;
+
+    parsed
+        .latest_version
+        .and_then(|v| v.version)
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "SkillHub detail for '{slug}' has no latestVersion field"
+            ))
+        })
+}
+
+/// Download, extract, and audit a skill archive from a SkillHub instance.
+///
+/// `base_url` is the SkillHub base (e.g. `https://skillhubictst.mec189.cn/enhance`).
+/// `slug` and `version` identify the skill; `version` is opaque to this function
+/// (the ICT platform uses `yyyyMMdd.HHmmss`, imported skills use semver).
+///
+/// `client` should be a `reqwest::Client` constructed by the caller so that
+/// DNS/TLS can be reused across `resolve_skillhub_latest_version` and this call.
+pub async fn install_skillhub_skill(
+    base_url: &str,
+    slug: &str,
+    version: &str,
+    skills_path: &Path,
+    allow_scripts: bool,
+    client: &reqwest::Client,
+    force: bool,
+) -> Result<(PathBuf, usize)> {
+    let download_url = skillhub_download_url(base_url, slug, version);
+    let installed_dir = skills_path.join(skill_dir_name(slug));
+    if installed_dir.exists() {
+        if force {
+            // Force reinstall: remove the existing directory first.
+            // The security audit below will re-validate the new archive.
+            std::fs::remove_dir_all(&installed_dir).with_context(|| {
+                format!(
+                    "failed to remove existing skill directory for force reinstall: {}",
+                    installed_dir.display()
+                )
+            })?;
+        } else {
+            anyhow::bail!(
+                "Destination skill already exists: {}. Use force=true to overwrite.",
+                installed_dir.display()
+            );
+        }
+    }
 
     let resp = client
         .get(&download_url)
@@ -1945,18 +2162,21 @@ pub async fn install_clawhub_skill_source(
         .with_context(|| format!("failed to fetch zip from {download_url}"))?;
 
     if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        anyhow::bail!("ClawhHub rate limit reached (HTTP 429). Wait a moment and retry.");
+        anyhow::bail!("SkillHub rate limit reached (HTTP 429). Wait a moment and retry.");
     }
     if !resp.status().is_success() {
-        anyhow::bail!("ClawhHub download failed (HTTP {})", resp.status());
+        anyhow::bail!(
+            "SkillHub download failed (HTTP {}). WAF may be blocking the request,              or slug/version do not exist.",
+            resp.status()
+        );
     }
 
     let bytes = resp.bytes().await?.to_vec();
-    if bytes.len() as u64 > MAX_CLAWHUB_ZIP_BYTES {
+    if bytes.len() as u64 > MAX_SKILLHUB_ZIP_BYTES {
         anyhow::bail!(
-            "ClawhHub zip rejected: too large ({} bytes > {})",
+            "SkillHub zip rejected: too large ({} bytes > {})",
             bytes.len(),
-            MAX_CLAWHUB_ZIP_BYTES
+            MAX_SKILLHUB_ZIP_BYTES
         );
     }
 
@@ -2005,8 +2225,12 @@ pub async fn install_clawhub_skill_source(
         std::fs::write(
             installed_dir.join("SKILL.toml"),
             format!(
-                "[skill]\nname = \"{}\"\ndescription = \"ClawhHub installed skill\"\nversion = \"0.1.0\"\n",
-                skill_dir_name
+                "[skill]\nname = \"{name}\"\ndescription = \"SkillHub installed skill\"\nversion = \"{version}\"\n",
+                name = installed_dir
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(slug),
+                version = version,
             ),
         )?;
     }

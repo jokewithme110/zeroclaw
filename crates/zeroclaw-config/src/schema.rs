@@ -5166,6 +5166,24 @@ pub struct SkillsConfig {
     #[serde(default)]
     #[nested]
     pub scan: SkillsScanConfig,
+    /// Base URL for the SkillHub (skill search/list/download APIs).
+    /// - Default `None` -> resolved to `https://clawhub.ai`.
+    /// - For the ICT self-hosted production curated set:
+    ///   `https://skillhubictst.mec189.cn/enhance` (8 skills).
+    /// - For the ICT self-hosted full registry (dev/admin):
+    ///   `https://skillhubictst.mec189.cn` (35 skills).
+    #[serde(default)]
+    pub skillhub_base_url: Option<String>,
+    /// Register the agent-side `skill_search` / `skill_install` / `skill_remove`
+    /// tools so the model can autonomously discover, install, and uninstall
+    /// skills from the configured SkillHub. Default: `false`.
+    ///
+    /// This flag is read by `zeroclaw_runtime::tools::all_tools_with_runtime`
+    /// when assembling the per-agent tool list. Set to `true` to allow the
+    /// agent to manage skills at runtime; leave `false` to lock
+    /// SkillHub access to CLI-only operation.
+    #[serde(default = "default_false")]
+    pub enable_agent_skill_management: bool,
 }
 
 /// Autonomous skill creation configuration (`[skills.skill_creation]` section).

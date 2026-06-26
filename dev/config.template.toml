@@ -31,3 +31,24 @@ allow_override = false
 # [cost.prices."openai/gpt-4o"]
 # input = 5.0
 # output = 15.0
+
+# ----------------------------------------------------------------------------
+# Skills (PR1 + PR2: SkillHub integration)
+# ----------------------------------------------------------------------------
+# `skillhub_base_url` points the CLI's `skills install clawhub:...` (and
+# PR2's `skill_search` / `skill_install` / `skill_remove` agent tools) at
+# a self-hosted SkillHub. Default when omitted: https://clawhub.ai
+#
+# ICT production curated set (8 skills, default for ICT deployments):
+# [skills]
+# skillhub_base_url = "https://skillhubictst.mec189.cn/enhance"
+#
+# ICT full self-hosted registry (35 skills, dev/admin only):
+# [skills]
+# skillhub_base_url = "https://skillhubictst.mec189.cn"
+#
+# `enable_agent_skill_management` controls whether the running agent
+# registers the 3 SkillHub management tools. Default: false.
+# Set to true to let the agent discover/install/remove skills at runtime.
+# [skills]
+# enable_agent_skill_management = true
