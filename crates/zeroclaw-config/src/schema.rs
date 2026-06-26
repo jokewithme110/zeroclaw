@@ -11381,6 +11381,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub line: HashMap<String, LineConfig>,
+    /// ICT WebSocket channel instances (`[channels.ict.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub ict: HashMap<String, IctConfig>,
     /// DingTalk channel instances (`[channels.dingtalk.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -11721,6 +11725,12 @@ impl ChannelsConfig {
                 configured: !self.lark.is_empty(),
             },
             ChannelInfo {
+                kind: "ict",
+                name: "ICT",
+                desc: "ICT WebSocket channel",
+                configured: !self.ict.is_empty(),
+            },
+            ChannelInfo {
                 kind: "dingtalk",
                 name: "DingTalk",
                 desc: "DingTalk Stream Mode",
@@ -11852,6 +11862,7 @@ impl ChannelsConfig {
             || self.twitch.values().any(|c| c.enabled)
             || self.lark.values().any(|c| c.enabled)
             || self.line.values().any(|c| c.enabled)
+            || self.ict.values().any(|c| c.enabled)
             || self.dingtalk.values().any(|c| c.enabled)
             || self.wecom.values().any(|c| c.enabled)
             || self.wecom_ws.values().any(|c| c.enabled)
@@ -11908,6 +11919,7 @@ impl Default for ChannelsConfig {
             twitch: HashMap::new(),
             lark: HashMap::new(),
             line: HashMap::new(),
+            ict: HashMap::new(),
             dingtalk: HashMap::new(),
             wecom: HashMap::new(),
             wecom_ws: HashMap::new(),
@@ -14235,6 +14247,72 @@ impl Default for AuditConfig {
             max_size_mb: default_audit_max_size_mb(),
             sign_events: false,
         }
+    }
+}
+
+fn default_ict_heartbeat_interval_secs() -> u64 {
+    30
+}
+
+fn default_ict_expiration_time_secs() -> u64 {
+    600
+}
+
+/// ICT WebSocket channel configuration.
+///
+/// WSS connection credentials (`wss_url` / `username` / `password`) are **not**
+/// stored in config. They are obtained at runtime by the channel itself via a
+/// HMAC-SHA256 signed HTTP `POST` to `url`, using `app_id` and `app_secret` as
+/// signing material. The lifetime of those runtime credentials is bounded
+/// locally by `expiration_time_secs` (the source of truth is the upstream
+/// platform; this is a conservative local fallback used to decide whether the
+/// next reconnect should re-register before reconnecting).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.ict"]
+pub struct IctConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false` so an operator who pastes a partial
+    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
+    /// live before the rest of its config is filled in.
+    #[serde(default)]
+    pub enabled: bool,
+    /// HTTP registration endpoint. The channel issues an HMAC-SHA256 signed
+    /// `POST` to this URL on startup (and on demand before reconnecting when
+    /// the cached WSS credential is about to expire) to obtain the
+    /// `wss_url` / `username` / `password` used to authenticate the
+    /// downstream WebSocket connection.
+    pub url: String,
+    /// Application ID used in the registration request's `appId` header and
+    /// HMAC signing material.
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub app_id: String,
+    /// Application secret used as the HMAC-SHA256 signing key for the
+    /// registration request.
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub app_secret: String,
+    /// Heartbeat interval in seconds.
+    #[serde(default = "default_ict_heartbeat_interval_secs")]
+    pub heartbeat_interval_secs: u64,
+    /// Local fallback lifetime (seconds) for the WSS credential returned by
+    /// the registration endpoint. If the gap between a disconnect and the
+    /// next reconnect would cross this window, the channel re-registers
+    /// before reconnecting; otherwise it reuses the cached credential.
+    /// While the WebSocket is connected the runtime does not proactively
+    /// re-register, even if this window elapses — that only happens on the
+    /// next reconnect.
+    #[serde(default = "default_ict_expiration_time_secs")]
+    pub expiration_time_secs: u64,
+}
+
+impl ChannelConfig for IctConfig {
+    fn name() -> &'static str {
+        "ICT"
+    }
+    fn desc() -> &'static str {
+        "ICT platform WebSocket channel"
     }
 }
 

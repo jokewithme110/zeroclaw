@@ -82,6 +82,7 @@ pub enum ChannelKind {
     Discord,
     Email,
     GmailPush,
+    Ict,
     #[strum(serialize = "imessage")]
     IMessage,
     Irc,

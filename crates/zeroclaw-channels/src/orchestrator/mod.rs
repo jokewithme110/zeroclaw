@@ -40,6 +40,8 @@ pub use crate::discord::DiscordChannel;
 pub use crate::email_channel::EmailChannel;
 #[cfg(feature = "channel-email")]
 pub use crate::gmail_push::GmailPushChannel;
+#[cfg(feature = "channel-ict")]
+pub use crate::ict::{IctChannel, IctConfigSnapshot};
 #[cfg(feature = "channel-imessage")]
 pub use crate::imessage::IMessageChannel;
 #[cfg(feature = "channel-irc")]
@@ -147,6 +149,19 @@ type CronChannelRegistry = Arc<HashMap<String, Arc<dyn Channel>>>;
 /// authenticated channel instance (Matrix E2EE can't tolerate per-send session restore).
 /// Replaced wholesale by each `start_channels` call.
 static CRON_CHANNEL_REGISTRY: std::sync::RwLock<Option<CronChannelRegistry>> =
+    std::sync::RwLock::new(None);
+
+/// Typed mirror of the live `IctChannel` instances, populated by
+/// `start_channels` next to the corresponding `CRON_CHANNEL_REGISTRY` write.
+/// Used by `deliver_announcement`'s ict arm to call
+/// [`IctChannel::send_proactive`], a method that lives outside the
+/// `Channel` trait (it emits a `type=2` notification frame, not a reply
+/// through `Channel::send`). The mirror holds the **same `Arc<IctChannel>`**
+/// that the registry already holds under `Arc<dyn Channel>` — it is a
+/// typed handle, not a duplicate of any channel state (AGENTS.md single
+/// source of truth). Replaced wholesale by each `start_channels` call.
+#[cfg(feature = "channel-ict")]
+static ICT_LIVE_CHANNELS: std::sync::RwLock<Option<Arc<HashMap<String, Arc<IctChannel>>>>> =
     std::sync::RwLock::new(None);
 
 /// Observer wrapper that forwards tool-call events to a channel sender
@@ -1175,6 +1190,7 @@ fn supports_runtime_model_switch(channel_name: &str) -> bool {
 fn is_explicitly_addressed_channel_message(channel_name: &str, content: &str) -> bool {
     channel_name == "qq"
         || channel_name == "webchat"
+        || channel_name == "ict"
         || (channel_name == "wecom_ws"
             && content.contains("[WeCom group message addressed to this bot via @"))
 }
@@ -6093,6 +6109,37 @@ fn build_channel_by_id(
         "discord" => {
             anyhow::bail!("Discord channel requires the `channel-discord` feature");
         }
+        #[cfg(feature = "channel-ict")]
+        "ict" => {
+            config
+                .channels
+                .ict
+                .get("default")
+                .context("ICT channel is not configured")?;
+            let alias = "default".to_string();
+            let config_resolver: Arc<dyn Fn() -> Result<IctConfigSnapshot> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || {
+                    let config = cfg_arc.read();
+                    let ict = config.channels.ict.get(&alias).with_context(|| {
+                        format!("ICT channel alias '{alias}' is not configured")
+                    })?;
+                    Ok(IctConfigSnapshot {
+                        url: ict.url.clone(),
+                        app_id: ict.app_id.clone(),
+                        app_secret: ict.app_secret.clone(),
+                        heartbeat_interval_secs: ict.heartbeat_interval_secs,
+                        expiration_time_secs: ict.expiration_time_secs,
+                    })
+                })
+            };
+            Ok(Arc::new(IctChannel::new(alias, config_resolver)))
+        }
+        #[cfg(not(feature = "channel-ict"))]
+        "ict" => {
+            anyhow::bail!("ICT channel requires the `channel-ict` feature");
+        }
         #[cfg(feature = "channel-slack")]
         "slack" => {
             let sl = config
@@ -7886,6 +7933,69 @@ fn collect_configured_channels(
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
             "LINE channel is configured but this build was compiled without `channel-line`; skipping LINE health check."
+        );
+    }
+
+    #[cfg(feature = "channel-ict")]
+    let mut ict_live_for_mirror: Vec<(String, Arc<IctChannel>)> = Vec::new();
+    #[cfg(feature = "channel-ict")]
+    for (alias, ict) in &config.channels.ict {
+        if !active_channel_aliases.contains(&format!("ict.{alias}")) {
+            continue;
+        }
+        if !ict.enabled {
+            continue;
+        }
+        let config_resolver: Arc<dyn Fn() -> Result<IctConfigSnapshot> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || {
+                let config = cfg_arc.read();
+                let ict =
+                    config.channels.ict.get(&alias).with_context(|| {
+                        format!("ICT channel alias '{alias}' is not configured")
+                    })?;
+                Ok(IctConfigSnapshot {
+                    url: ict.url.clone(),
+                    app_id: ict.app_id.clone(),
+                    app_secret: ict.app_secret.clone(),
+                    heartbeat_interval_secs: ict.heartbeat_interval_secs,
+                    expiration_time_secs: ict.expiration_time_secs,
+                })
+            })
+        };
+        let ict_channel = Arc::new(IctChannel::new(alias.clone(), config_resolver));
+        // Stash a typed handle for `ICT_LIVE_CHANNELS` so cron proactive
+        // delivery (see `deliver_announcement` -> "ict" arm) can call
+        // `IctChannel::send_proactive` directly. The same `Arc` is also
+        // pushed into the channel list below as `Arc<dyn Channel>` —
+        // these are two views of the **same** allocation, not a copy.
+        ict_live_for_mirror.push((format!("ict.{alias}"), Arc::clone(&ict_channel)));
+        channels.push(ConfiguredChannel {
+            display_name: "ICT",
+            alias: Some(alias.clone()),
+            channel: ict_channel,
+        });
+    }
+    // Drop the typed mirror into `ICT_LIVE_CHANNELS` *before* returning
+    // so the registry is ready by the time `start_channels` consults it.
+    // We replace the previous value (if any) wholesale — same lifecycle as
+    // `CRON_CHANNEL_REGISTRY`.
+    #[cfg(feature = "channel-ict")]
+    {
+        let mirror: Arc<HashMap<String, Arc<IctChannel>>> =
+            Arc::new(ict_live_for_mirror.into_iter().collect());
+        *ICT_LIVE_CHANNELS.write().unwrap_or_else(|e| e.into_inner()) = Some(mirror);
+    }
+
+    #[cfg(not(feature = "channel-ict"))]
+    if !config.channels.ict.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "ICT channel is configured but this build was compiled without \
+             `channel-ict`; skipping ICT."
         );
     }
 
@@ -9747,6 +9857,53 @@ pub async fn deliver_announcement(
         #[cfg(not(feature = "channel-wechat"))]
         "wechat" => {
             anyhow::bail!("WeChat channel requires the `channel-wechat` feature");
+        }
+        #[cfg(feature = "channel-ict")]
+        "ict" => {
+            // Validate the alias is configured; the live registry lookup
+            // below does the rest (no duplicate state, AGENTS.md).
+            config.channels.ict.get(alias).ok_or_else(not_configured)?;
+            // Cron / scheduled deliveries on ICT are *proactive*: the
+            // original inbound request that would have produced a `requestId`
+            // closed on the upstream platform long ago (a cron job fires
+            // minutes/hours after the user's last message), so the reply
+            // path (`Channel::send` -> `type=1` + stale `requestId`) is
+            // silently dropped by the platform. We must reuse the live
+            // `IctChannel` instance from `ICT_LIVE_CHANNELS` (it is the
+            // only thing that holds a live `ws_tx`) and route through
+            // `send_proactive`, which emits a `type=2` notification frame
+            // carrying `data` + `sessionId` with no `requestId`. See
+            // `docs/ict-websocket-channel-design-zh.md` -> "主动通知出站
+            // (type=2)" and `IctChannel::send_proactive` for the wire
+            // shape and the rationale.
+            let ict_snapshot = ICT_LIVE_CHANNELS
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let live_map = ict_snapshot.as_ref().ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    &format!(
+                        "ICT cron delivery requires a running channel instance for                          {channel:?}; ensure the channel was started before the cron                          job fires (no offline fallback for proactive delivery because                          the live `IctChannel` is the only thing holding `ws_tx`)"
+                    ),
+                );
+                anyhow::Error::msg(format!(
+                    "ICT channel {channel:?} is not running; cannot deliver proactive                      notification"
+                ))
+            })?;
+            let registry_key = channel.to_ascii_lowercase();
+            let live_ict = live_map.get(&registry_key).ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "ICT live channel registry has no entry for {channel:?}; cannot                      deliver proactive notification"
+                ))
+            })?;
+            live_ict.send_proactive(alias, &safe_output).await?;
+        }
+        #[cfg(not(feature = "channel-ict"))]
+        "ict" => {
+            anyhow::bail!("ICT channel requires the `channel-ict` feature");
         }
         #[cfg(feature = "channel-lark")]
         "lark" | "feishu" => {

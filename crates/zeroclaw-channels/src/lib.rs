@@ -38,6 +38,8 @@ pub mod discord;
 pub mod email_channel;
 #[cfg(feature = "channel-email")]
 pub mod gmail_push;
+#[cfg(feature = "channel-ict")]
+pub mod ict;
 #[cfg(feature = "channel-imessage")]
 pub mod imessage;
 #[cfg(feature = "channel-irc")]
