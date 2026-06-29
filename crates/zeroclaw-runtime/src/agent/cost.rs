@@ -107,6 +107,15 @@ pub struct TurnUsage {
     pub cost_usd: f64,
 }
 
+impl TurnUsage {
+    /// True when no tokens were billed and no cost was recorded. Used to
+    /// skip emitting empty `AgentEnd` annotations when the turn produced
+    /// no observable usage (e.g. a turn that returned early on error).
+    pub fn is_zero(self) -> bool {
+        self.input_tokens == 0 && self.output_tokens == 0 && self.cost_usd == 0.0
+    }
+}
+
 /// Context for cost tracking within the tool call loop.
 /// Scoped via `tokio::task_local!` at call sites (channels, gateway).
 #[derive(Clone)]

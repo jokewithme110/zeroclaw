@@ -144,7 +144,7 @@ use zeroclaw_providers::{
 // Cost tracking moved to `super::cost`.
 pub use super::cost::{
     TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, TurnUsage,
-    check_tool_loop_budget, record_tool_loop_cost_usage, snapshot_scoped_turn_usage,
+    check_tool_loop_budget, record_tool_loop_cost_usage,
 };
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
@@ -4785,7 +4785,10 @@ pub async fn run(
         }
 
         let duration = start.elapsed();
-        let session_usage = snapshot_scoped_turn_usage();
+        let session_usage = cost_tracking_context
+            .as_ref()
+            .map(|ctx| ctx.snapshot_turn_usage())
+            .filter(|usage| !usage.is_zero());
         observer.record_event(&ObserverEvent::AgentEnd {
             model_provider: provider_name.to_string(),
             model: model_name.to_string(),

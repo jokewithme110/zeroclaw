@@ -2277,7 +2277,7 @@ impl Agent {
             turn_id: Some(turn_id.clone()),
         });
 
-        let _guard = TurnGuard {
+        let mut guard = TurnGuard {
             observer: Arc::clone(&self.observer),
             model_provider: self.model_provider_name.clone(),
             model: effective_model.clone(),
@@ -2370,6 +2370,15 @@ impl Agent {
                         .as_ref()
                         .map(|u| (u.input_tokens, u.cached_input_tokens, u.output_tokens))
                         .unwrap_or((None, None, None));
+                    if let Some(input) = resp_input_tokens {
+                        guard.total_input_tokens = guard.total_input_tokens.saturating_add(input);
+                        guard.saw_usage = true;
+                    }
+                    if let Some(output) = resp_output_tokens {
+                        guard.total_output_tokens =
+                            guard.total_output_tokens.saturating_add(output);
+                        guard.saw_usage = true;
+                    }
                     self.observer.record_event(&ObserverEvent::LlmResponse {
                         model_provider: self.model_provider_name.clone(),
                         model: effective_model.clone(),
@@ -2566,7 +2575,7 @@ impl Agent {
             turn_id: Some(turn_id.clone()),
         });
 
-        let _guard = TurnGuard {
+        let mut guard = TurnGuard {
             observer: Arc::clone(&self.observer),
             model_provider: self.model_provider_name.clone(),
             model: effective_model.clone(),
@@ -3067,6 +3076,14 @@ impl Agent {
                 .as_ref()
                 .map(|u| (u.input_tokens, u.cached_input_tokens, u.output_tokens))
                 .unwrap_or((None, None, None));
+            if let Some(input) = resp_input_tokens {
+                guard.total_input_tokens = guard.total_input_tokens.saturating_add(input);
+                guard.saw_usage = true;
+            }
+            if let Some(output) = resp_output_tokens {
+                guard.total_output_tokens = guard.total_output_tokens.saturating_add(output);
+                guard.saw_usage = true;
+            }
             self.observer.record_event(&ObserverEvent::LlmResponse {
                 model_provider: self.model_provider_name.clone(),
                 model: effective_model.clone(),
@@ -3406,7 +3423,7 @@ pub async fn run(
     model_override: Option<String>,
     temperature: Option<f64>,
 ) -> Result<()> {
-    let start = Instant::now();
+    let _start = Instant::now();
 
     let mut effective_config = config;
     if let Some(ref p) = provider_override {
@@ -3463,42 +3480,12 @@ pub async fn run(
         turn_id: None,
     });
 
-    let _run_guard = TurnGuard {
-        observer: Arc::clone(&agent.observer),
-        model_provider: provider_name.clone(),
-        model: model_name.clone(),
-        turn_id: None,
-        turn_started_at: start,
-        agent_alias: None,
-        total_input_tokens: 0,
-        total_output_tokens: 0,
-        saw_usage: false,
-        done: false,
-    };
-
     if let Some(msg) = message {
         let response = agent.run_single(&msg).await?;
         println!("{response}");
     } else {
         agent.run_interactive().await?;
     }
-
-    let session_usage = crate::agent::cost::snapshot_scoped_turn_usage();
-    agent.observer.record_event(&ObserverEvent::AgentEnd {
-        model_provider: provider_name,
-        model: model_name,
-        duration: start.elapsed(),
-        tokens_used: session_usage.map(|usage| {
-            zeroclaw_api::observability_traits::TurnTokenUsage {
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-            }
-        }),
-        cost_usd: session_usage.map(|usage| usage.cost_usd),
-        channel: None,
-        agent_alias: None,
-        turn_id: None,
-    });
 
     Ok(())
 }

@@ -4943,12 +4943,19 @@ async fn process_channel_message_body(
         let _ = handle.await;
     }
 
+    let session_usage = cost_tracking_context
+        .as_ref()
+        .map(|c| c.snapshot_turn_usage())
+        .filter(|u| !u.is_zero());
     session_observer.record_event(&ObserverEvent::AgentEnd {
         model_provider: route.model_provider.clone(),
         model: route.model.clone(),
         duration: started_at.elapsed(),
-        tokens_used: None,
-        cost_usd: None,
+        tokens_used: session_usage.map(|u| zeroclaw_api::observability_traits::TurnTokenUsage {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+        }),
+        cost_usd: session_usage.map(|u| u.cost_usd),
         channel: Some(msg.channel.clone()),
         agent_alias: Some(ctx.agent_alias.as_ref().clone()),
         turn_id: Some(msg.id.clone()),
