@@ -450,6 +450,31 @@ impl IctChannel {
                     }
                 }
                 Some(outbound) = out_rx.recv() => {
+                    let (kind, session_id_for_log, request_id_for_log, bytes_for_log) =
+                        match &outbound {
+                            IctOutbound::Reply {
+                                session_id,
+                                request_id,
+                                data,
+                            } => (
+                                "reply",
+                                session_id.clone(),
+                                Some(request_id.clone()),
+                                data.len(),
+                            ),
+                            IctOutbound::Done {
+                                session_id,
+                                request_id,
+                            } => (
+                                "done",
+                                session_id.clone(),
+                                Some(request_id.clone()),
+                                0usize,
+                            ),
+                            IctOutbound::Notification { session_id, data } => {
+                                ("notification", session_id.clone(), None, data.len())
+                            }
+                        };
                     let payload = match outbound {
                         IctOutbound::Reply {
                             session_id,
@@ -471,6 +496,20 @@ impl IctChannel {
                         ict_log_warn!("ICT outbound send failed: {err:#}");
                         return Ok(SessionOutcome::Reconnect);
                     }
+                    // Boundary log: confirms the bytes were actually handed
+                    // to the tungstenite writer. Pair this with the
+                    // `send_proactive` enqueue log line — if you see the
+                    // enqueue line but not this one, the WSS write loop is
+                    // stuck or the channel has been silently disconnected.
+                    let wire_type = payload.msg_type;
+                    ict_log_debug!(
+                        "ICT outbound frame written kind={} wire_type={} sessionId={} requestId={:?} bytes={}",
+                        kind,
+                        wire_type,
+                        session_id_for_log,
+                        request_id_for_log,
+                        bytes_for_log
+                    );
                 }
                 _ = heartbeat.tick(), if heartbeat_enabled => {
                     let json = serde_json::to_string(&IctWireMessage::heartbeat())
@@ -626,16 +665,29 @@ impl IctChannel {
             session_id: recipient.to_string(),
             data: content.to_string(),
         };
+        // Render the same `IctWireMessage::notification(...)` shape the WSS
+        // write loop will serialize a few lines below. We log it here, at
+        // the queue-enqueue boundary, so a packet capture on the upstream
+        // socket can be diffed against this exact string when diagnosing
+        // "cron delivery did not reach the user". `data` is truncated to
+        // 256 chars to keep the JSONL line bounded.
+        let frame_for_log =
+            IctWireMessage::notification(content.to_string(), recipient.to_string());
+        let frame_json_for_log = serde_json::to_string(&frame_for_log)
+            .unwrap_or_else(|_| "<serialize-failed>".to_string());
+        let data_preview: String = content.chars().take(256).collect();
         ws_tx
             .send(notification)
             .await
             .context("failed to enqueue ICT proactive notification")?;
 
         ict_log_info!(
-            "ICT proactive notification enqueued alias={} sessionId={} bytes={}",
+            "ICT proactive notification enqueued alias={} sessionId={} bytes={} wire_type=2 frame={} data_preview={:?}",
             self.alias,
             recipient,
-            content.len()
+            content.len(),
+            frame_json_for_log,
+            data_preview
         );
         Ok(())
     }

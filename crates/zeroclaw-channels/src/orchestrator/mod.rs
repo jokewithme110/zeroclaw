@@ -9720,6 +9720,162 @@ pub async fn deliver_announcement(
 
     let make_msg = |s: &str| SendMessage::new(s, target).in_thread(thread_id.clone());
 
+    // Cron / scheduled ICT deliveries MUST go through the type=2
+    // proactive path, not the type=1 reply path. The reason is documented
+    // in `docs/ict-websocket-channel-design-zh.md` -> "主动通知出站
+    // (type=2)": a cron job fires minutes/hours after the user's last
+    // message, so the original inbound request's `requestId` window on
+    // the upstream platform is already closed — routing a reply through
+    // `Channel::send` (type=1) is silently dropped by the platform.
+    //
+    // We short-circuit the lookup *before* the `CRON_CHANNEL_REGISTRY`
+    // fast path because that registry inserts a bare-name fallback
+    // (`"ict"`) when there is exactly one ict alias, which would
+    // otherwise hand the request to `IctChannel::send` and dead-end at
+    // `resolve_request_id`'s `session_routes[recipient]` lookup (cron
+    // delivery's `target` is the platform `sessionId`; `session_routes`
+    // is only populated for recipients that have *received* an inbound
+    // — see `IctChannel::listen` -> `run_session`).
+    //
+    // `send_proactive(target, output)` accepts the `target` directly as
+    // the `sessionId` (per its docstring) and emits a single `type=2`
+    // frame via the live `ws_tx` that only a running `IctChannel`
+    // instance holds.
+    #[cfg(feature = "channel-ict")]
+    if channel
+        .split_once('.')
+        .map_or(channel, |(t, _)| t)
+        .eq_ignore_ascii_case("ict")
+    {
+        let ict_snapshot = ICT_LIVE_CHANNELS
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match ict_snapshot.as_ref() {
+            Some(live_map) => {
+                // Resolve the live handle. The cron job's `delivery.channel`
+                // may be either a bare "ict" (legacy schema form) or a
+                // fully-qualified "ict.<alias>"; both must map to the
+                // same handle when only one ict alias is configured.
+                let candidate = channel.to_ascii_lowercase();
+                let live_ict = live_map.get(&candidate).or_else(|| {
+                    // Bare-name fallback: when the cron job passes
+                    // "ict" without an alias but the registry holds
+                    // "ict.<alias>", pick the only entry .
+                    if live_map.len() == 1 {
+                        live_map.values().next()
+                    } else {
+                        None
+                    }
+                });
+                match live_ict {
+                    Some(handle) => match handle.send_proactive(target, &safe_output).await {
+                        Ok(()) => {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Send
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                                .with_attrs(::serde_json::json!({
+                                    "channel": channel,
+                                    "target": target,
+                                    "kind": "proactive",
+                                    "wire_type": 2,
+                                    "bytes": safe_output.len(),
+                                })),
+                                "Cron delivery routed via ICT send_proactive (type=2)"
+                            );
+                            return Ok(());
+                        }
+                        Err(err) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Fail
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "channel": channel,
+                                    "target": target,
+                                    "kind": "proactive",
+                                    "error": err.to_string(),
+                                })),
+                                "Cron delivery to ICT failed at proactive dispatch"
+                            );
+                            return Err(err);
+                        }
+                    },
+                    None => {
+                        // No live handle matches the cron job's
+                        // `delivery.channel`. Two scenarios reach this
+                        // arm:
+                        //
+                        // 1. The registry has at least one ICT handle,
+                        //    but its key set does not match `channel`
+                        //    (e.g. cron says `ict.work` but only
+                        //    `ict.default` is live). Fall through to
+                        //    the legacy reply path so the operator
+                        //    sees the standard "not configured" error
+                        //    from the match arm below.
+                        //
+                        // 2. The registry is non-empty but
+                        //    `live_map.len() != 1`, so the
+                        //    single-entry fallback does not apply.
+                        //
+                        // In both cases the cron job's
+                        // `delivery.channel` does not name a live
+                        // ICT instance, which is a configuration
+                        // error. Bail loudly so the operator sees
+                        // the precondition violation in the run
+                        // log; do NOT silently fall through to the
+                        // type=1 reply path (that is the regression
+                        // we are fixing — a successful-looking log
+                        // followed by a platform-side drop).
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "channel": channel,
+                                "target": target,
+                                "live_keys": live_map
+                                    .keys()
+                                    .cloned()
+                                    .collect::<Vec<_>>(),
+                            })),
+                            "Cron delivery to ICT: delivery.channel does not match any live ICT handle"
+                        );
+                        anyhow::bail!(
+                            "ICT channel {channel:?} has no live handle for cron delivery; live keys: {:?}",
+                            live_map.keys().collect::<Vec<_>>()
+                        );
+                    }
+                }
+            }
+            None => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "channel": channel,
+                            "target": target,
+                        })),
+                    "Cron delivery to ICT: no live IctChannel registered (channel was not started before the cron job fired)"
+                );
+                anyhow::bail!(
+                    "ICT channel {channel:?} is not running; cannot deliver proactive notification"
+                );
+            }
+        }
+    }
+
     // Snapshot out of the sync RwLock before awaiting. Use the live
     // channel instance when available — critical for Matrix E2EE which
     // must reuse the authenticated client rather than re-running session
@@ -9731,6 +9887,18 @@ pub async fn deliver_announcement(
     if let Some(registry) = registry_snapshot
         && let Some(ch) = registry.get(channel.to_ascii_lowercase().as_str())
     {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({
+                    "channel": channel,
+                    "target": target,
+                    "kind": "reply",
+                    "wire_type": 1,
+                })),
+            "Cron delivery routed via CRON_CHANNEL_REGISTRY (type=1 reply path)"
+        );
         return ch.send(&make_msg(&safe_output)).await;
     }
 
@@ -9930,7 +10098,13 @@ pub async fn deliver_announcement(
                     "ICT live channel registry has no entry for {channel:?}; cannot                      deliver proactive notification"
                 ))
             })?;
-            live_ict.send_proactive(alias, &safe_output).await?;
+            // `target` is the cron job's `delivery.to` — the platform
+            // `sessionId` the upstream platform knows the user by. It is
+            // the recipient argument `send_proactive` expects; the
+            // channel alias from `split_once('.')` would be a config
+            // label (e.g. "default"), not a sessionId, so we must not
+            // pass it here. See `IctChannel::send_proactive` docstring.
+            live_ict.send_proactive(target, &safe_output).await?;
         }
         #[cfg(not(feature = "channel-ict"))]
         "ict" => {
@@ -21591,6 +21765,95 @@ Done."#;
         assert!(
             msg.contains("[channels.lark.work]"),
             "bail must point at the real config table; got: {msg}"
+        );
+    }
+
+    /// Regression for: cron jobs whose `delivery.channel` is the bare
+    /// `"ict"` (the historical cron_add schema form) used to silently fall
+    /// into the `CRON_CHANNEL_REGISTRY` fast path and get dispatched to
+    /// `IctChannel::send` (type=1 reply path). That path is dead-ended for
+    /// cron scenarios because the platform has already closed the
+    /// `requestId` window, and the orchestrator's `IctChannel` instance
+    /// has no `session_routes[delivery.to]` entry to fall back on — the
+    /// result is a delivery that the runtime reports as "ok" but the
+    /// upstream platform silently drops.
+    ///
+    /// The fix: `deliver_announcement` must short-circuit on `ict`
+    /// *before* the registry lookup, and resolve the live `IctChannel`
+    /// from `ICT_LIVE_CHANNELS` so it can call `send_proactive` (the
+    /// type=2 proactive path) with `target` (the cron job's
+    /// `delivery.to`, i.e. the platform `sessionId`) as the recipient.
+    ///
+    /// This test exercises the *negative* path: when no live ICT
+    /// handle is registered, `deliver_announcement` must bail loudly
+    /// with the "not running" message — it must NOT silently fall
+    /// through to the registry path or the dotted-format `Err`. Both
+    /// regressions would be silent at runtime; the explicit bail here
+    /// is the operator-visible signal that the ICT channel was not
+    /// started before the cron job fired.
+    #[tokio::test]
+    #[cfg(feature = "channel-ict")]
+    async fn deliver_announcement_bails_when_ict_has_no_live_handle() {
+        // ICT_LIVE_CHANNELS is process-global; we don't reach into it
+        // here. By construction, if no test or production code has
+        // populated it for this run, the short-circuit must hit the
+        // `ict_snapshot.as_ref() == None` branch and bail. To make the
+        // assertion deterministic we additionally assert that the bail
+        // message *does not* mention the registry / type=1 / dotted
+        // format — all three of those are the regressions we are
+        // guarding against.
+        let config = zeroclaw_config::schema::Config::default();
+        let err = deliver_announcement(
+            &config,
+            "ict",
+            "1782529588743355043",
+            None,
+            "query device list",
+        )
+        .await
+        .expect_err("expected bail when no live ICT handle is registered");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ICT channel \"ict\" is not running")
+                || msg.contains("has no live handle for cron delivery"),
+            "bail must explain the live-handle precondition; got: {msg}"
+        );
+        assert!(
+            !msg.contains("must be a dotted"),
+            "must not fall through to the dotted-format parser when channel is bare 'ict'; got: {msg}"
+        );
+        assert!(
+            !msg.contains("CRON_CHANNEL_REGISTRY"),
+            "must not silently route through the reply path; got: {msg}"
+        );
+    }
+
+    /// Companion regression: when the cron job supplies a fully-qualified
+    /// `ict.<alias>` form (the recommended form once the schema is
+    /// updated to expose both bare and dotted), the short-circuit must
+    /// still take precedence over the registry fast path so the
+    /// `requestId`-less `send_proactive` path is used. This test pins
+    /// the same bail-without-live-handle behavior for the dotted form.
+    #[tokio::test]
+    #[cfg(feature = "channel-ict")]
+    async fn deliver_announcement_bails_when_ict_dotted_has_no_live_handle() {
+        let config = zeroclaw_config::schema::Config::default();
+        let err = deliver_announcement(
+            &config,
+            "ict.default",
+            "1782529588743355043",
+            None,
+            "query device list",
+        )
+        .await
+        .expect_err("expected bail when no live ICT handle is registered");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ICT channel \"ict.default\" is not running")
+                || msg.contains("ICT channel \"ict.default\" has no live handle"),
+            "bail must reference the full channel ref; got: {msg}"
         );
     }
 
