@@ -46,7 +46,8 @@ impl OtelObserver {
         let base_endpoint = endpoint.unwrap_or("http://localhost:4318");
         let traces_endpoint = format!("{}/v1/traces", base_endpoint.trim_end_matches('/'));
         let metrics_endpoint = format!("{}/v1/metrics", base_endpoint.trim_end_matches('/'));
-        let service_name = service_name.unwrap_or(&zeroclaw_api::branding::product_name());
+        let default_service_name = zeroclaw_api::branding::product_name();
+        let service_name = service_name.unwrap_or(&default_service_name);
 
         // ── Trace exporter ──────────────────────────────────────
         let mut span_builder = opentelemetry_otlp::SpanExporter::builder()
