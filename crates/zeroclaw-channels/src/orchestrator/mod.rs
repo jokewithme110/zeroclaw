@@ -989,13 +989,17 @@ fn build_channel_system_prompt(
                  \"to\":\"{reply_target}\"}}"
             )
         };
+        // Keep the `message_id` parameter in the signature for now so the
+        // call shape and surrounding history remain obvious during future
+        // cache-work revisits, but intentionally stop rendering it into the
+        // system prompt. Per-turn message IDs create unnecessary prompt churn
+        // and degrade cross-turn cache hit rates in the common case.
+        let _ = message_id;
         let context = format!(
             "\n\nChannel context: You are currently responding on channel={channel_name}, \
-             reply_target={reply_target}, sender={sender}, message_id={message_id}. \
+             reply_target={reply_target}, sender={sender}. \
              The sender field is the platform-specific user ID of the person who sent \
              this message. Use it to distinguish between different users. \
-             The message_id field identifies this incoming message; pass it as the \
-             `message_id` argument when calling the `reaction` tool. \
              When scheduling delayed messages or reminders \
              via cron_add for this conversation, use {delivery_hint} so the message \
              reaches the user.\n\nCalibration note: agents in this system currently err \
@@ -21598,9 +21602,13 @@ Done."#;
         assert!(
             prompt.contains(
                 "channel=mattermost, reply_target=channel123:root456, \
-                 sender=user_abc123, message_id=msg-xyz789"
+                 sender=user_abc123."
             ),
             "prompt missing the joint channel-context tuple: {prompt}"
+        );
+        assert!(
+            !prompt.contains("message_id="),
+            "message_id should no longer be rendered into the system prompt: {prompt}"
         );
     }
 
@@ -21704,13 +21712,40 @@ Done."#;
         // The wrapper unpacks ChannelMessage into build_channel_system_prompt
         // args. Pin the rendered prompt against every msg.* field the LLM
         // is expected to see so a future refactor adding more fields can't
-        // silently drop existing ones.
+        // silently drop existing ones. `msg.id` is still threaded through the
+        // wrapper, but it is intentionally no longer rendered into prompt text.
         let msg = channel_message("discord", None);
         let prompt = build_channel_system_prompt_for_message("Base.", &msg, None);
         assert!(
-            prompt.contains("channel=discord, reply_target=r1, sender=u1, message_id=m1"),
-            "wrapper did not propagate channel/reply_target/sender/message_id \
-             from ChannelMessage: {prompt}"
+            prompt.contains("channel=discord, reply_target=r1, sender=u1."),
+            "wrapper did not propagate channel/reply_target/sender from ChannelMessage: {prompt}"
+        );
+        assert!(
+            !prompt.contains("message_id="),
+            "ChannelMessage.id should no longer be rendered into the prompt: {prompt}"
+        );
+    }
+
+    #[test]
+    fn build_channel_system_prompt_keeps_message_id_parameter_but_does_not_render_it() {
+        let prompt = build_channel_system_prompt(
+            "Base.",
+            "mattermost",
+            "channel123:root456",
+            "user_abc123",
+            "msg-xyz789",
+            None,
+        );
+
+        assert!(
+            prompt.contains(
+                "channel=mattermost, reply_target=channel123:root456, sender=user_abc123."
+            ),
+            "prompt should still render the remaining channel context tuple: {prompt}"
+        );
+        assert!(
+            !prompt.contains("msg-xyz789"),
+            "message_id parameter is intentionally retained in the function signature but must not leak into prompt text: {prompt}"
         );
     }
 
