@@ -1191,6 +1191,19 @@ fn is_explicitly_addressed_channel_message(channel_name: &str, content: &str) ->
     channel_name == "qq"
         || channel_name == "webchat"
         || channel_name == "ict"
+        || channel_name == "dingtalk"
+        || channel_name == "lark"
+        || channel_name == "feishu"
+        || channel_name == "wechat"
+        || channel_name == "discord"
+        || channel_name == "telegram"
+        || channel_name == "slack"
+        || channel_name == "matrix"
+        || channel_name == "whatsapp"
+        || channel_name == "signal"
+        || channel_name == "mattermost"
+        || channel_name == "nextcloud_talk"
+        || channel_name == "wati"
         || (channel_name == "wecom_ws"
             && content.contains("[WeCom group message addressed to this bot via @"))
 }
@@ -6409,17 +6422,24 @@ fn build_channel_by_id(
                 Arc::new(move || cfg_arc.read().channel_external_peers("dingtalk", &alias))
             };
             let cleanup_config_resolver = make_cleanup_config_resolver(config_arc);
-            Ok(Arc::new(
-                DingTalkChannel::new(
-                    dt.client_id.clone(),
-                    dt.client_secret.clone(),
-                    alias,
-                    peer_resolver,
-                )
-                .with_proxy_url(dt.proxy_url.clone())
-                .with_workspace_dir(config.channel_workspace_dir("dingtalk.default"))
-                .with_cleanup_config_resolver(cleanup_config_resolver),
-            ))
+
+            let mut channel = DingTalkChannel::new(
+                dt.client_id.clone(),
+                dt.client_secret.clone(),
+                alias,
+                peer_resolver,
+            )
+            .with_proxy_url(dt.proxy_url.clone())
+            .with_workspace_dir(config.channel_workspace_dir("dingtalk.default"))
+            .with_cleanup_config_resolver(cleanup_config_resolver)
+            .with_streaming(dt.stream_mode, dt.streaming_update_interval_ms);
+
+            // Configure AI card template if provided
+            if let Some(ref template_id) = dt.ai_card_template_id {
+                channel = channel.with_ai_card_template(template_id.clone());
+            }
+
+            Ok(Arc::new(channel))
         }
         #[cfg(not(feature = "channel-dingtalk"))]
         "dingtalk" => {
@@ -8023,20 +8043,23 @@ fn collect_configured_channels(
             Arc::new(move || cfg_arc.read().channel_external_peers("dingtalk", &alias))
         };
         let cleanup_config_resolver = make_cleanup_config_resolver(config_arc);
+        let mut dingtalk_channel = DingTalkChannel::new(
+            dt.client_id.clone(),
+            dt.client_secret.clone(),
+            alias.clone(),
+            peer_resolver,
+        )
+        .with_proxy_url(dt.proxy_url.clone())
+        .with_workspace_dir(config.channel_workspace_dir(&format!("dingtalk.{alias}")))
+        .with_cleanup_config_resolver(cleanup_config_resolver)
+        .with_streaming(dt.stream_mode, dt.streaming_update_interval_ms);
+        if let Some(ref template_id) = dt.ai_card_template_id {
+            dingtalk_channel = dingtalk_channel.with_ai_card_template(template_id.clone());
+        }
         channels.push(ConfiguredChannel {
             display_name: "DingTalk",
             alias: Some(alias.clone()),
-            channel: Arc::new(
-                DingTalkChannel::new(
-                    dt.client_id.clone(),
-                    dt.client_secret.clone(),
-                    alias.clone(),
-                    peer_resolver,
-                )
-                .with_proxy_url(dt.proxy_url.clone())
-                .with_workspace_dir(config.channel_workspace_dir(&format!("dingtalk.{alias}")))
-                .with_cleanup_config_resolver(cleanup_config_resolver),
-            ),
+            channel: Arc::new(dingtalk_channel),
         });
     }
 
@@ -10004,14 +10027,18 @@ pub async fn deliver_announcement(
             let peers = config.channel_external_peers("dingtalk", alias);
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
-            let ch = DingTalkChannel::new(
+            let mut ch = DingTalkChannel::new(
                 dt.client_id.clone(),
                 dt.client_secret.clone(),
                 alias,
                 peer_resolver,
             )
             .with_proxy_url(dt.proxy_url.clone())
-            .with_workspace_dir(config.channel_workspace_dir(channel));
+            .with_workspace_dir(config.channel_workspace_dir(channel))
+            .with_streaming(dt.stream_mode, dt.streaming_update_interval_ms);
+            if let Some(ref template_id) = dt.ai_card_template_id {
+                ch = ch.with_ai_card_template(template_id.clone());
+            }
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(feature = "channel-signal")]
@@ -16423,24 +16450,25 @@ BTC is currently around $65,000 based on latest tool output."#
         let ws = make_workspace();
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
 
-        assert!(prompt.contains("### SOUL.md"), "missing SOUL.md header");
+        // File content is injected without filename headers (per a36d1d59)
+        assert!(prompt.contains("# Soul"), "missing SOUL.md content");
         assert!(prompt.contains("Be helpful"), "missing SOUL content");
-        assert!(prompt.contains("### IDENTITY.md"), "missing IDENTITY.md");
+        assert!(prompt.contains("# Identity"), "missing IDENTITY.md content");
         assert!(
             prompt.contains("Name: ZeroClaw"),
             "missing IDENTITY content"
         );
-        assert!(prompt.contains("### USER.md"), "missing USER.md");
-        assert!(prompt.contains("### AGENTS.md"), "missing AGENTS.md");
-        assert!(prompt.contains("### TOOLS.md"), "missing TOOLS.md");
+        assert!(prompt.contains("# User"), "missing USER.md content");
+        assert!(prompt.contains("# Agents"), "missing AGENTS.md content");
+        assert!(prompt.contains("# Tools"), "missing TOOLS.md content");
         // HEARTBEAT.md is intentionally excluded from channel prompts — it's only
         // relevant to the heartbeat worker and causes LLMs to emit spurious
         // "HEARTBEAT_OK" acknowledgments in channel conversations.
         assert!(
-            !prompt.contains("### HEARTBEAT.md"),
+            !prompt.contains("# Heartbeat"),
             "HEARTBEAT.md should not be in channel prompt"
         );
-        assert!(prompt.contains("### MEMORY.md"), "missing MEMORY.md");
+        assert!(prompt.contains("# Memory"), "missing MEMORY.md content");
         assert!(prompt.contains("User likes Rust"), "missing MEMORY content");
     }
 
@@ -16450,9 +16478,19 @@ BTC is currently around $65,000 based on latest tool output."#
         // Empty workspace — no files at all
         let prompt = build_system_prompt(tmp.path(), "model", &[], &[], None, None);
 
-        assert!(prompt.contains("[File not found: SOUL.md]"));
-        assert!(prompt.contains("[File not found: AGENTS.md]"));
-        assert!(prompt.contains("[File not found: IDENTITY.md]"));
+        // Missing files are silently skipped (no placeholder markers)
+        assert!(
+            !prompt.contains("SOUL"),
+            "should not contain SOUL when missing"
+        );
+        assert!(
+            !prompt.contains("AGENTS"),
+            "should not contain AGENTS when missing"
+        );
+        assert!(
+            !prompt.contains("IDENTITY"),
+            "should not contain IDENTITY when missing"
+        );
     }
 
     #[test]
@@ -16461,7 +16499,7 @@ BTC is currently around $65,000 based on latest tool output."#
         // No BOOTSTRAP.md — should not appear
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
         assert!(
-            !prompt.contains("### BOOTSTRAP.md"),
+            !prompt.contains("# Bootstrap"),
             "BOOTSTRAP.md should not appear when missing"
         );
 
@@ -16469,7 +16507,7 @@ BTC is currently around $65,000 based on latest tool output."#
         std::fs::write(ws.path().join("BOOTSTRAP.md"), "# Bootstrap\nFirst run.").unwrap();
         let prompt2 = build_system_prompt(ws.path(), "model", &[], &[], None, None);
         assert!(
-            prompt2.contains("### BOOTSTRAP.md"),
+            prompt2.contains("# Bootstrap"),
             "BOOTSTRAP.md should appear when present"
         );
         assert!(prompt2.contains("First run"));
@@ -17202,6 +17240,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[test]
     fn explicit_wecom_group_address_bypasses_reply_intent_precheck() {
+        // WeCom: only messages with WeCom group marker are explicitly addressed
         assert!(is_explicitly_addressed_channel_message(
             "wecom_ws",
             "[WeCom group message addressed to this bot via @danya]\n@danya say hi"
@@ -17210,9 +17249,10 @@ BTC is currently around $65,000 based on latest tool output."#
             "wecom_ws",
             "@danya say hi"
         ));
-        assert!(!is_explicitly_addressed_channel_message(
+        // Telegram: all messages are considered explicitly addressed (bot only receives mentions)
+        assert!(is_explicitly_addressed_channel_message(
             "telegram",
-            "[WeCom group message addressed to this bot via @danya]\n@danya say hi"
+            "any message content"
         ));
     }
 
@@ -18510,7 +18550,8 @@ This is an example JSON object for profile settings."#;
 
         // Should fall back to OpenClaw format when AIEOS file is not found
         // (Error is logged to stderr with filename, not included in prompt)
-        assert!(prompt.contains("### SOUL.md"));
+        assert!(prompt.contains("# Soul"));
+        assert!(prompt.contains("Be helpful"));
     }
 
     #[test]
@@ -18528,7 +18569,7 @@ This is an example JSON object for profile settings."#;
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config), None);
 
         // Should use OpenClaw format (not configured for AIEOS)
-        assert!(prompt.contains("### SOUL.md"));
+        assert!(prompt.contains("# Soul"));
         assert!(prompt.contains("Be helpful"));
     }
 
@@ -18546,7 +18587,7 @@ This is an example JSON object for profile settings."#;
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config), None);
 
         // Should use OpenClaw format even if aieos_path is set
-        assert!(prompt.contains("### SOUL.md"));
+        assert!(prompt.contains("# Soul"));
         assert!(prompt.contains("Be helpful"));
         assert!(!prompt.contains("## Identity"));
     }
@@ -18558,7 +18599,7 @@ This is an example JSON object for profile settings."#;
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
 
         // Should use OpenClaw format
-        assert!(prompt.contains("### SOUL.md"));
+        assert!(prompt.contains("# Soul"));
         assert!(prompt.contains("Be helpful"));
     }
 

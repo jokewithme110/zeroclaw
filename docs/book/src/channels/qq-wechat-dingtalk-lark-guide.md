@@ -11,6 +11,8 @@
 - [飞书/Lark](#飞书lark)
 - [常见问题](#常见问题)
 
+> **关于 AI 卡片流式响应**：钉钉和飞书的 `stream_mode` / `streaming_update_interval_ms` / `draft_update_interval_ms` / `ai_card_template_id` 等流式相关配置、机制和故障排查已统一在《[钉钉与飞书 AI 卡片流式响应使用指导](./dingtalk-lark-streaming-guide.md)》里维护，请跳转阅读。
+
 ---
 
 ## v0.8 版本说明
@@ -439,6 +441,7 @@ ZeroClaw 通过钉钉 Stream Mode WebSocket 实现企业级集成，支持：
 - 群组聊天
 - 富媒体消息
 - 高可靠性（断线重连、消息确认）
+- **AI 卡片流式响应**（v0.8 新增）
 
 ### 前置条件
 
@@ -458,7 +461,7 @@ ZeroClaw 通过钉钉 Stream Mode WebSocket 实现企业级集成，支持：
 
 ### 配置方法（v0.8）
 
-在 `config.toml` 中添加：
+#### 基础配置
 
 ```toml
 # v0.8 Schema Version 3 格式
@@ -474,11 +477,31 @@ proxy_url = "http://proxy.example.com:8080"
 excluded_tools = ["shell", "http_request"]
 ```
 
+#### 流式响应配置
+
+钉钉使用 **AI 卡片流式更新 API** 实现 LLM 渐进式输出。详细配置、模板 ID 获取、调优建议与故障排查统一在《[钉钉与飞书 AI 卡片流式响应使用指导](./dingtalk-lark-streaming-guide.md)》维护。
+
+最小示例（需要在钉钉开放平台先创建 AI 卡片模板）：
+
+```toml
+[channels.dingtalk.default]
+enabled = true
+client_id = "你的 AppKey"
+client_secret = "你的 AppSecret"
+stream_mode = "partial"
+streaming_update_interval_ms = 1000
+ai_card_template_id = "<你的 AI 卡片模板 ID>.schema"
+```
+
 **v0.8 变更说明**：
 - `proxy_url`：支持每渠道独立代理配置
 - `excluded_tools`：渠道级工具可见性控制
+- `stream_mode`：新增流式响应模式
+- `streaming_update_interval_ms`：精细控制流式更新频率
 
 ### 配置项说明
+
+#### 基础配置
 
 | 字段 | 必填 | 说明 |
 |------|------|------|
@@ -487,6 +510,10 @@ excluded_tools = ["shell", "http_request"]
 | `client_secret` | 是 | 钉钉 ClientSecret（敏感信息） |
 | `proxy_url` | 否 | 代理服务器 URL |
 | `excluded_tools` | 否 | 排除的工具列表 |
+
+#### 流式响应配置
+
+> 字段说明、调优推荐值与故障排查见《[钉钉与飞书 AI 卡片流式响应使用指导](./dingtalk-lark-streaming-guide.md)》。
 
 ### 功能特性
 
@@ -498,14 +525,59 @@ excluded_tools = ["shell", "http_request"]
 - **双向通信**：同一连接收发双向消息
 - **会话管理**：自动维护会话状态
 
-#### 2. 消息路由
+#### 2. AI 卡片流式响应（v0.8 新增）
+
+当启用 `stream_mode = "partial"` 时，ZeroClaw 会自动使用钉钉的 AI 卡片流式更新 API：
+
+**工作流程**：
+1. **创建 AI 卡片**：发送初始消息（显示"正在思考中..."）
+2. **流式更新**：按自然边界（换行、句号等）分块更新卡片内容
+3. **完成固化**：最后一次更新设置 `finish: true`，卡片内容固化
+
+**触发条件**：
+- `stream_mode == "partial"`
+- 消息不包含图片
+- 内容长度 > 100 字符
+
+**API 调用**：
+```
+POST /v1.0/robot/sendAICard      # 创建卡片实例
+POST /v1.0/card/streamingUpdate  # 流式更新（多次）
+```
+
+**示例效果**：
+```
+用户：请分析一下这个数据报告...
+
+机器人：[AI 卡片]
+  正在思考中...
+  
+  → 正在检索相关数据...
+  
+  → 已找到 3 条相关信息...
+  
+  → 分析如下：
+     1. 销售趋势：同比增长 15%
+     2. 用户活跃度：环比提升 8%
+     3. 市场占比：稳定在 23%
+     
+  → 建议采取以下措施...
+  
+  [完成]
+```
+
+**错误处理**：
+- 流式更新失败时自动降级为普通文本消息
+- 日志记录完整流程便于排查
+
+#### 3. 消息路由
 
 ZeroClaw 自动处理消息路由：
 - **单聊**：直接回复到发送者
 - **群聊**：回复到原群组
 - @机器人：群聊中可@机器人触发
 
-#### 3. 富媒体支持
+#### 4. 富媒体支持
 
 使用标准标记语法：
 
@@ -516,7 +588,9 @@ ZeroClaw 自动处理消息路由：
 [VOICE:/path/to/audio.wav]
 ```
 
-#### 4. 会话 Webhook
+**注意**：流式响应不支持图片消息。如果消息包含 `[IMAGE:...]` 标记，自动降级为传统发送模式。
+
+#### 5. 会话 Webhook
 
 钉钉为每个会话提供临时 webhook：
 - ZeroClaw 自动提取和缓存
@@ -666,6 +740,10 @@ draft_update_interval_ms = 1000  # 卡片更新间隔（毫秒）
 - `approval_timeout_secs`：审批卡片超时控制
 - `excluded_tools` / `proxy_url`：标准化渠道配置项
 
+**流式模式说明**：
+
+飞书的 `stream_mode` / `draft_update_interval_ms` 配置、节流机制、与钉钉的差异对比、故障排查统一在《[钉钉与飞书 AI 卡片流式响应使用指导](./dingtalk-lark-streaming-guide.md)》维护。
+
 ### 配置项详解
 
 #### 基础配置
@@ -700,8 +778,9 @@ draft_update_interval_ms = 1000  # 卡片更新间隔（毫秒）
 | `port` | - | Webhook 模式监听端口 |
 | `proxy_url` | - | 代理服务器 |
 | `excluded_tools` | [] | 排除的工具 |
-| `stream_mode` | "off" | 流式响应模式 |
-| `draft_update_interval_ms` | 1000 | 卡片更新间隔（毫秒） |
+| `stream_mode` / `draft_update_interval_ms` | "off" / 1000 | 流式响应配置；详见《[钉钉与飞书 AI 卡片流式响应使用指导](./dingtalk-lark-streaming-guide.md)》 |
+
+**流式响应工作原理**与**推荐配置**见《[钉钉与飞书 AI 卡片流式响应使用指导](./dingtalk-lark-streaming-guide.md)》。
 
 ### 接收模式对比
 

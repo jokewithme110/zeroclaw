@@ -6,10 +6,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_config::schema::StreamMode;
 const DINGTALK_BOT_CALLBACK_TOPIC: &str = "/v1.0/im/bot/messages/get";
 const DINGTALK_OUTBOUND_MAX_ATTEMPTS: u32 = 4;
 const DINGTALK_OUTBOUND_RETRY_DELAY: Duration = Duration::from_millis(500);
@@ -106,6 +107,38 @@ pub struct DingTalkChannel {
     cleanup_config_resolver: Option<CleanupConfigResolver>,
     /// Upload cache: avoids re-uploading the same image within TTL.
     upload_cache: Arc<RwLock<HashMap<String, UploadCacheEntry>>>,
+    /// Streaming mode for AI card responses (off/partial).
+    stream_mode: StreamMode,
+    /// Minimum interval between streamingUpdate calls in milliseconds.
+    streaming_update_interval_ms: u64,
+    /// Per-card timestamp of the last streamingUpdate PUT. Paired with
+    /// `pending_streaming_text` to implement a "cache-and-flush" throttle
+    /// identical to Lark's behavior: text deltas inside the throttle
+    /// window overwrite the cached buffer; the next call outside the
+    /// window sends the latest accumulated buffer in one PUT.
+    last_streaming_edit: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Per-card buffer of the latest accumulated text waiting to be
+    /// flushed by the next throttle window. Overwritten (not appended)
+    /// on every drop — we only ever care about the freshest full text
+    /// because `isFull: true` means the receiver replaces the body
+    /// wholesale. Cleared on flush and on `finalize_draft` /
+    /// `cancel_draft` to avoid stale data leaking into the next card.
+    pending_streaming_text: Arc<Mutex<HashMap<String, String>>>,
+    /// Cache of active AI card instances (cardInstanceId -> recipient).
+    /// Used to track which cards are being streamed to which users.
+    card_instances: Arc<RwLock<HashMap<String, DingTalkCardInstance>>>,
+    /// AI Card Template ID for streaming responses.
+    /// Must be created in DingTalk developer console first.
+    ai_card_template_id: Option<String>,
+}
+
+/// AI card instance information for tracking active streaming sessions.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct DingTalkCardInstance {
+    card_instance_id: String,
+    created_at: Instant,
+    recipient: String,
 }
 
 /// Cached upload entry to avoid re-uploading the same image.
@@ -152,7 +185,20 @@ impl DingTalkChannel {
             workspace_dir: None,
             cleanup_config_resolver: None,
             upload_cache: Arc::new(RwLock::new(HashMap::new())),
+            stream_mode: StreamMode::Off,
+            streaming_update_interval_ms: 1000,
+            last_streaming_edit: Arc::new(Mutex::new(HashMap::new())),
+            pending_streaming_text: Arc::new(Mutex::new(HashMap::new())),
+            card_instances: Arc::new(RwLock::new(HashMap::new())),
+            ai_card_template_id: None,
         }
+    }
+
+    /// Set the AI card template ID for streaming responses.
+    /// The template must be created in DingTalk developer console first.
+    pub fn with_ai_card_template(mut self, template_id: String) -> Self {
+        self.ai_card_template_id = Some(template_id);
+        self
     }
 
     /// Return the alias under `[channels.dingtalk.<alias>]` that this
@@ -171,6 +217,354 @@ impl DingTalkChannel {
     pub fn with_cleanup_config_resolver(mut self, resolver: CleanupConfigResolver) -> Self {
         self.cleanup_config_resolver = Some(resolver);
         self
+    }
+
+    /// Configure progressive AI card streaming. `stream_mode = Off`
+    /// (default) routes every response through `send()`; `partial` creates
+    /// an AI card and updates it incrementally via `streamingUpdate` API.
+    /// `multi_message` is rejected for DingTalk (falls back to `off` with
+    /// a warning).
+    ///
+    /// `update_interval_ms` controls the minimum delay between consecutive
+    /// `streamingUpdate` calls. Default: 500ms (tuned to DingTalk's rate limits).
+    pub fn with_streaming(mut self, stream_mode: StreamMode, update_interval_ms: u64) -> Self {
+        let effective_stream_mode = match stream_mode {
+            StreamMode::MultiMessage => {
+                dingtalk_warn!(
+                    ::serde_json::json!({
+                        "requested_mode": "multi_message",
+                    }),
+                    "DingTalk: stream_mode=multi_message is not supported; falling back to off (no AI card streaming)"
+                );
+                StreamMode::Off
+            }
+            mode => mode,
+        };
+        self.stream_mode = effective_stream_mode;
+        // No hard floor: orchestrator-side coalescing + DingTalk streamingUpdate
+        // quota (~30 PUT/s/card) are the real guardrails. A user-configured
+        // 50ms still leaves 6x headroom.
+        self.streaming_update_interval_ms = update_interval_ms;
+        self
+    }
+
+    /// Check if streaming mode is enabled.
+    fn supports_streaming(&self) -> bool {
+        // Streaming requires both Partial mode AND a configured AI card template ID
+        matches!(self.stream_mode, StreamMode::Partial) && self.ai_card_template_id.is_some()
+    }
+
+    /// Clean up expired card instances from the cache.
+    /// Cards are considered expired after 30 minutes (typical conversation timeout).
+    /// This method is intended to be called periodically by a background cleanup task.
+    #[allow(dead_code)]
+    async fn cleanup_expired_card_instances(&self) {
+        let now = Instant::now();
+        let expiry_duration = Duration::from_secs(1800); // 30 minutes
+
+        let mut instances = self.card_instances.write().await;
+        instances.retain(|_, instance| now.duration_since(instance.created_at) < expiry_duration);
+
+        if !instances.is_empty() {
+            dingtalk_debug!(
+                ::serde_json::json!({
+                    "active_instances": instances.len(),
+                }),
+                "DingTalk: cleaned up expired card instances"
+            );
+        }
+    }
+
+    /// Create an AI card instance for streaming responses and return its
+    /// `outTrackId`. Subsequent `streamingUpdate` calls reference this same
+    /// id.
+    ///
+    /// Aligned with the official `dingtalk-stream` Python SDK
+    /// (`CardReplier.create_and_send_card`) — the card body uses
+    /// `cardData.cardParamMap` and the space model is selected by whether
+    /// the recipient is a single chat or a group.
+    /// Docs: https://open.dingtalk.com/document/orgapp/interface-for-creating-a-card-instance
+    async fn send_ai_card(&self, recipient: &str, initial_content: &str) -> anyhow::Result<String> {
+        let template_id = self.ai_card_template_id.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "AI card template ID not configured. Use with_ai_card_template() to set it."
+            )
+        })?;
+
+        let token = self.get_access_token().await?;
+
+        // Per Python SDK: outTrackId is the caller's tracking identifier and is
+        // echoed back as the card's primary reference. Use a UUID to avoid
+        // collisions when the same recipient re-sends within the same second.
+        let out_track_id = Uuid::new_v4().to_string();
+
+        // Pick the correct open-space model by looking up the cached reply
+        // target learned from the inbound event. Fall back to the single-chat
+        // model when the target has not been recorded yet — the official SDK
+        // only sends one of the two, never both.
+        let is_group = matches!(
+            self.reply_target_for_recipient(recipient).await,
+            Some(DingTalkReplyTarget::Group(_))
+        );
+
+        let mut create_body = serde_json::json!({
+            "cardTemplateId": template_id,
+            "outTrackId": out_track_id,
+            "callbackType": "STREAM",
+            "cardData": {
+                "cardParamMap": {
+                    "content": initial_content,
+                    "status": "thinking",
+                },
+            },
+        });
+        let obj = create_body
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("DingTalk: create_body must be a JSON object"))?;
+        if is_group {
+            obj.insert(
+                "imGroupOpenSpaceModel".into(),
+                serde_json::json!({
+                    "supportForward": true,
+                    "openSpaceId": recipient,
+                    "robotCode": self.client_id,
+                }),
+            );
+        } else {
+            obj.insert(
+                "imRobotOpenSpaceModel".into(),
+                serde_json::json!({
+                    "supportForward": true,
+                    "robotCode": self.client_id,
+                }),
+            );
+        }
+
+        dingtalk_info!(
+            ::serde_json::json!({
+                "template_id": template_id,
+                "out_track_id": out_track_id,
+                "is_group": is_group,
+                "callback_type": "STREAM",
+            }),
+            "DingTalk: Creating AI card with STREAM callback"
+        );
+
+        let resp = self
+            .http_client()
+            .post("https://api.dingtalk.com/v1.0/card/instances")
+            .header("x-acs-dingtalk-access-token", &token)
+            .header("Content-Type", "application/json")
+            .json(&create_body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("DingTalk card instance create failed ({status}): {err}");
+        }
+
+        // The official SDK treats the caller-supplied outTrackId as the
+        // card's identifier; we do the same rather than re-parsing the
+        // response body for a server-side id.
+        let card_id = out_track_id;
+
+        // Cache the card instance for tracking
+        {
+            let mut instances = self.card_instances.write().await;
+            instances.insert(
+                card_id.clone(),
+                DingTalkCardInstance {
+                    card_instance_id: card_id.clone(),
+                    created_at: Instant::now(),
+                    recipient: recipient.to_string(),
+                },
+            );
+        }
+
+        dingtalk_info!(
+            ::serde_json::json!({
+                "card_id": card_id,
+            }),
+            "DingTalk: AI card created successfully"
+        );
+
+        // Two-step flow per the official `dingtalk-stream` Python SDK:
+        //   1) create instance   (POST /v1.0/card/instances)
+        //   2) deliver to user   (POST /v1.0/card/instances/deliver)
+        // Without the second call, the card exists server-side but is
+        // never pushed to the recipient's DingTalk client, so the user
+        // sees nothing in the chat. This is why every "successful"
+        // finalize PUT in the logs was a no-op on the user side.
+        if let Err(error) = self.deliver_ai_card(&card_id, recipient).await {
+            dingtalk_warn!(
+                ::serde_json::json!({
+                    "out_track_id": card_id,
+                    "recipient": recipient,
+                    "error": error.to_string(),
+                }),
+                "DingTalk: AI card deliver failed (card created but not delivered)"
+            );
+            return Err(error);
+        }
+
+        Ok(card_id)
+    }
+
+    /// Deliver an AI card to the recipient's chat.
+    ///
+    /// Second half of the official `CardReplier.create_and_send_card`
+    /// flow. Without this call, the created card instance is never
+    /// surfaced to the DingTalk client and the recipient receives
+    /// nothing — every streamingUpdate afterwards is silently dropped.
+    ///
+    /// Aligned with the official Python SDK:
+    /// `POST https://api.dingtalk.com/v1.0/card/instances/deliver`
+    /// Docs: https://open.dingtalk.com/document/orgapp/delivery-card-interface
+    async fn deliver_ai_card(&self, out_track_id: &str, recipient: &str) -> anyhow::Result<()> {
+        let token = self.get_access_token().await?;
+
+        let is_group = matches!(
+            self.reply_target_for_recipient(recipient).await,
+            Some(DingTalkReplyTarget::Group(_))
+        );
+
+        // `openSpaceId` is a magic string the DingTalk card platform
+        // recognizes for routing the deliver to a 1:1 IM chat (IM_ROBOT)
+        // or a group (IM_GROUP). The spaceId is the sender_staff_id for
+        // single chat and the conversation_id for group chat. We resolve
+        // both from the cached reply target learned from the inbound
+        // event, falling back to the raw `recipient` for the 1:1 case
+        // (most inbound staffId-only sessions store it there).
+        let (open_space_id, deliver_model) = if is_group {
+            let open_space_id = format!("dtv1.card//IM_GROUP.{recipient}");
+            let model = serde_json::json!({
+                "robotCode": self.client_id,
+            });
+            (open_space_id, model)
+        } else {
+            let open_space_id = format!("dtv1.card//IM_ROBOT.{recipient}");
+            let model = serde_json::json!({
+                "spaceType": "IM_ROBOT",
+            });
+            (open_space_id, model)
+        };
+
+        let body = serde_json::json!({
+            "outTrackId": out_track_id,
+            "userIdType": 1,
+            "openSpaceId": open_space_id,
+            "imGroupOpenDeliverModel": deliver_model,
+            "imRobotOpenDeliverModel": deliver_model,
+        });
+
+        dingtalk_info!(
+            ::serde_json::json!({
+                "out_track_id": out_track_id,
+                "is_group": is_group,
+                "open_space_id": open_space_id,
+            }),
+            "DingTalk: Delivering AI card"
+        );
+
+        let resp = self
+            .http_client()
+            .post("https://api.dingtalk.com/v1.0/card/instances/deliver")
+            .header("x-acs-dingtalk-access-token", &token)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("DingTalk card deliver failed ({status}): {err}");
+        }
+
+        dingtalk_info!(
+            ::serde_json::json!({
+                "out_track_id": out_track_id,
+            }),
+            "DingTalk: AI card delivered"
+        );
+
+        Ok(())
+    }
+
+    /// Push a streaming update to a previously created AI card.
+    ///
+    /// Aligned with the official `dingtalk-stream` Python SDK
+    /// (`AICardReplier.async_streaming`):
+    /// - `PUT https://api.dingtalk.com/v1.0/card/streaming`
+    /// - `content` is a plain string, not a nested params object
+    /// - `isFull=true` means the body is the full accumulated text (not a
+    ///   delta). The orchestrator always sends the full accumulated
+    ///   buffer; we never use incremental updates because LLM tokens
+    ///   can interleave with tool calls in non-monotonic ways.
+    /// - `isFinalize=true` closes the card (triggers the "Done" reaction).
+    /// Docs: https://open.dingtalk.com/document/development/api-streamingupdate
+    async fn streaming_update_card(
+        &self,
+        card_instance_id: &str,
+        content: &str,
+        is_final: bool,
+    ) -> anyhow::Result<()> {
+        let token = self.get_access_token().await?;
+
+        // Each update carries a unique GUID per the official SDK.
+        let guid = Uuid::new_v4().to_string();
+
+        let body = serde_json::json!({
+            "outTrackId": card_instance_id,
+            "guid": guid,
+            "key": "content",
+            "content": content,
+            "isFull": true,
+            "isFinalize": is_final,
+            "isError": false,
+        });
+
+        dingtalk_debug!(
+            ::serde_json::json!({
+                "out_track_id": card_instance_id,
+                "guid": guid,
+                "is_finalize": is_final,
+                "content_bytes": content.len(),
+            }),
+            "DingTalk: Streaming card update"
+        );
+
+        let resp = self
+            .http_client()
+            .put("https://api.dingtalk.com/v1.0/card/streaming")
+            .header("x-acs-dingtalk-access-token", &token)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("DingTalk streaming update failed ({status}): {err}");
+        }
+
+        dingtalk_debug!(
+            ::serde_json::json!({
+                "out_track_id": card_instance_id,
+                "is_finalize": is_final,
+            }),
+            "DingTalk: Card update successful"
+        );
+
+        if is_final {
+            let mut instances = self.card_instances.write().await;
+            instances.remove(card_instance_id);
+        }
+
+        Ok(())
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -583,6 +977,194 @@ impl ::zeroclaw_api::attribution::Attributable for DingTalkChannel {
 impl Channel for DingTalkChannel {
     fn name(&self) -> &str {
         "dingtalk"
+    }
+
+    /// True when both Partial mode is enabled and a template id is set.
+    /// When false, the orchestrator falls back to the non-streaming
+    /// `send()` path automatically.
+    fn supports_draft_updates(&self) -> bool {
+        self.supports_streaming()
+    }
+
+    /// Open a streaming AI card for the recipient and return its
+    /// `outTrackId` as the platform-specific message id used by
+    /// subsequent `update_draft` / `finalize_draft` calls.
+    /// Returns `Ok(None)` when streaming is unsupported or the card
+    /// create call fails — the orchestrator will then route through
+    /// the non-streaming `send()` path.
+    async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        if !self.supports_streaming() {
+            return Ok(None);
+        }
+        match self.send_ai_card(&message.recipient, "正在思考中…").await {
+            Ok(card_id) => {
+                dingtalk_info!(
+                    ::serde_json::json!({
+                        "recipient": message.recipient,
+                        "card_id": card_id,
+                    }),
+                    "DingTalk: send_draft opened streaming card"
+                );
+                Ok(Some(card_id))
+            }
+            Err(error) => {
+                dingtalk_warn!(
+                    ::serde_json::json!({
+                        "recipient": message.recipient,
+                        "error": error.to_string(),
+                    }),
+                    "DingTalk: send_draft failed, falling back to non-streaming send()"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Push an incremental AI card update with the latest accumulated
+    /// text. The orchestrator emits a `text` argument that is the full
+    /// accumulated buffer (see the `accumulated.push_str` site in the
+    /// orchestrator), so we never need to stitch deltas here — we just
+    /// honor the throttle window.
+    ///
+    /// **Throttle model: cache-and-flush** (matches Lark).
+    /// - Inside the throttle window: overwrite the cached buffer for
+    ///   this card with the freshest text and return without sending.
+    /// - At or past the window: flush the cached buffer (which is the
+    ///   freshest accumulated text the orchestrator has produced) in
+    ///   one streamingUpdate PUT, reset the timer, and clear the cache.
+    ///
+    /// Because DingTalk's `isFull: true` PUT replaces the card body
+    /// wholesale, the receiver always sees the freshest full content.
+    /// We never lose data: every incoming delta overwrites the cache,
+    /// and the next flush sends it. The only data we drop is
+    /// intermediate `text_bytes` from a burst, which is exactly what
+    /// Feishu's 5-QPS PATCH coalescing drops.
+    async fn update_draft(
+        &self,
+        _recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        if message_id.is_empty() || !self.supports_streaming() {
+            return Ok(());
+        }
+        let interval_ms = self.streaming_update_interval_ms;
+
+        // Determine whether we are inside the throttle window.
+        let now = Instant::now();
+        let elapsed_ms = {
+            let last_guard = self.last_streaming_edit.lock().await;
+            last_guard.get(message_id).map(|last| {
+                u64::try_from(now.duration_since(*last).as_millis()).unwrap_or(u64::MAX)
+            })
+        };
+        let inside_window = elapsed_ms.is_some_and(|e| e < interval_ms);
+
+        if inside_window {
+            // Cache the freshest buffer; flush on the next call outside
+            // the window. Overwrite (not append) — the orchestrator
+            // already passes the full accumulated text.
+            let mut cache = self.pending_streaming_text.lock().await;
+            cache.insert(message_id.to_string(), text.to_string());
+            return Ok(());
+        }
+
+        // Outside the window: build the payload from the cached buffer
+        // (or the just-arrived `text` if no cache exists) and flush.
+        let to_send = {
+            let mut cache = self.pending_streaming_text.lock().await;
+            cache.remove(message_id).unwrap_or_else(|| text.to_string())
+        };
+        {
+            let mut last_guard = self.last_streaming_edit.lock().await;
+            last_guard.insert(message_id.to_string(), Instant::now());
+        }
+        dingtalk_debug!(
+            ::serde_json::json!({
+                "card_id": message_id,
+                "text_bytes": to_send.len(),
+            }),
+            "DingTalk: update_draft flush"
+        );
+        if let Err(error) = self
+            .streaming_update_card(message_id, &to_send, false)
+            .await
+        {
+            dingtalk_warn!(
+                ::serde_json::json!({
+                    "out_track_id": message_id,
+                    "error": error.to_string(),
+                }),
+                "DingTalk: update_draft streaming call failed"
+            );
+        }
+        Ok(())
+    }
+
+    /// Close the AI card with the final accumulated text. Triggers
+    /// the "Done" reaction on the DingTalk client.
+    async fn finalize_draft(
+        &self,
+        _recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        if message_id.is_empty() || !self.supports_streaming() {
+            return Ok(());
+        }
+        // Drop the per-card throttle slot AND the pending buffer so the
+        // next message on this handle starts from a clean state. The
+        // final text is supplied by the orchestrator (`text` arg) and
+        // already supersedes anything still in the cache, so we discard
+        // the cache rather than flush-then-PUT, which would be two round
+        // trips.
+        self.last_streaming_edit.lock().await.remove(message_id);
+        self.pending_streaming_text.lock().await.remove(message_id);
+        dingtalk_info!(
+            ::serde_json::json!({
+                "card_id": message_id,
+                "text_bytes": text.len(),
+            }),
+            "DingTalk: finalize_draft streaming card"
+        );
+        if let Err(error) = self.streaming_update_card(message_id, text, true).await {
+            dingtalk_warn!(
+                ::serde_json::json!({
+                    "out_track_id": message_id,
+                    "error": error.to_string(),
+                }),
+                "DingTalk: finalize_draft streaming call failed"
+            );
+        }
+        Ok(())
+    }
+
+    /// Best-effort cancel: send a final update with a short notice so
+    /// the card doesn't stay in "thinking" state. We do not have a
+    /// dedicated delete API; DingTalk clients will replace the body
+    /// with the notice.
+    async fn cancel_draft(&self, _recipient: &str, message_id: &str) -> anyhow::Result<()> {
+        if message_id.is_empty() || !self.supports_streaming() {
+            return Ok(());
+        }
+        let result = self
+            .streaming_update_card(message_id, "[回答已取消]", true)
+            .await;
+        // Evict the throttle slot AND the pending buffer so a future
+        // card reuses the same id without inheriting stale rate-limit
+        // or cache state.
+        self.last_streaming_edit.lock().await.remove(message_id);
+        self.pending_streaming_text.lock().await.remove(message_id);
+        if let Err(error) = result {
+            dingtalk_warn!(
+                ::serde_json::json!({
+                    "out_track_id": message_id,
+                    "error": error.to_string(),
+                }),
+                "DingTalk: cancel_draft streaming call failed"
+            );
+        }
+        Ok(())
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
@@ -2156,5 +2738,204 @@ client_secret = "secret"
             ch.extract_incoming_message_content("picture", &data).await,
             Some(DingTalkChannel::image_download_failure_marker())
         );
+    }
+
+    #[test]
+    fn test_streaming_support_detection() {
+        // Partial mode + template ID enables streaming
+        let ch_partial = DingTalkChannel::new(
+            "id".into(),
+            "secret".into(),
+            "dingtalk_test_alias",
+            Arc::new(Vec::new),
+        )
+        .with_streaming(StreamMode::Partial, 500)
+        .with_ai_card_template("tpl-001".into());
+        assert!(ch_partial.supports_streaming());
+
+        // Partial mode without template ID -> no streaming
+        let ch_no_tpl = DingTalkChannel::new(
+            "id".into(),
+            "secret".into(),
+            "dingtalk_test_alias",
+            Arc::new(Vec::new),
+        )
+        .with_streaming(StreamMode::Partial, 500);
+        assert!(!ch_no_tpl.supports_streaming());
+
+        // MultiMessage mode falls back to Off
+        let ch_multi = DingTalkChannel::new(
+            "id".into(),
+            "secret".into(),
+            "dingtalk_test_alias",
+            Arc::new(Vec::new),
+        )
+        .with_streaming(StreamMode::MultiMessage, 500);
+        assert!(!ch_multi.supports_streaming());
+    }
+
+    #[test]
+    fn test_with_streaming_configuration() {
+        // Test Partial mode with custom interval
+        let ch_streaming = DingTalkChannel::new(
+            "id".into(),
+            "secret".into(),
+            "dingtalk_test_alias",
+            Arc::new(Vec::new),
+        )
+        .with_streaming(StreamMode::Partial, 1000);
+        assert_eq!(ch_streaming.streaming_update_interval_ms, 1000);
+
+        // Test that small intervals are accepted (no hard floor)
+        let ch_fast = DingTalkChannel::new(
+            "id".into(),
+            "secret".into(),
+            "dingtalk_test_alias",
+            Arc::new(Vec::new),
+        )
+        .with_streaming(StreamMode::Partial, 50);
+        assert_eq!(ch_fast.streaming_update_interval_ms, 50);
+    }
+
+    #[tokio::test]
+    async fn test_card_instance_cleanup() {
+        let ch = DingTalkChannel::new(
+            "id".into(),
+            "secret".into(),
+            "dingtalk_test_alias",
+            Arc::new(Vec::new),
+        );
+
+        // Manually insert a card instance for testing
+        {
+            let mut instances = ch.card_instances.write().await;
+            instances.insert(
+                "test_card_1".to_string(),
+                DingTalkCardInstance {
+                    card_instance_id: "test_card_1".to_string(),
+                    created_at: Instant::now(),
+                    recipient: "user1".to_string(),
+                },
+            );
+        }
+
+        // Cleanup should not remove recent instances
+        ch.cleanup_expired_card_instances().await;
+        {
+            let instances = ch.card_instances.read().await;
+            assert_eq!(instances.len(), 1);
+        }
+
+        // Manually insert an old instance (simulate by modifying created_at)
+        {
+            let mut instances = ch.card_instances.write().await;
+            if let Some(instance) = instances.get_mut("test_card_1") {
+                // Set created_at to 31 minutes ago
+                instance.created_at = Instant::now() - Duration::from_secs(1860);
+            }
+        }
+
+        // Cleanup should remove expired instances
+        ch.cleanup_expired_card_instances().await;
+        {
+            let instances = ch.card_instances.read().await;
+            assert_eq!(instances.len(), 0);
+        }
+    }
+
+    #[test]
+    fn test_stream_mode_multi_message_fallback() {
+        let ch = DingTalkChannel::new(
+            "id".into(),
+            "secret".into(),
+            "dingtalk_test_alias",
+            Arc::new(Vec::new),
+        );
+
+        // MultiMessage should fall back to Off with a warning
+        let ch_multi = ch.with_streaming(StreamMode::MultiMessage, 500);
+        assert_eq!(ch_multi.stream_mode, StreamMode::Off);
+    }
+
+    // --- Draft streaming trait method tests ----------------------------------
+
+    #[test]
+    fn test_draft_support_reflects_streaming() {
+        // Off mode + no template -> no draft streaming
+        let ch = DingTalkChannel::new(
+            "id".into(),
+            "secret".into(),
+            "dingtalk_test_alias",
+            Arc::new(Vec::new),
+        );
+        assert!(!ch.supports_draft_updates());
+
+        // Partial mode but no template id -> still no draft streaming
+        let ch_partial_no_tpl = DingTalkChannel::new(
+            "id".into(),
+            "secret".into(),
+            "dingtalk_test_alias",
+            Arc::new(Vec::new),
+        )
+        .with_streaming(StreamMode::Partial, 500);
+        assert!(!ch_partial_no_tpl.supports_draft_updates());
+
+        // Partial mode + template id -> draft streaming enabled
+        let ch_full = ch_partial_no_tpl.with_ai_card_template("tpl-001".into());
+        assert!(ch_full.supports_draft_updates());
+    }
+
+    #[tokio::test]
+    async fn test_send_draft_returns_none_when_streaming_disabled() {
+        // No template id -> send_draft must return Ok(None) so the
+        // orchestrator falls back to non-streaming send().
+        let ch = DingTalkChannel::new(
+            "id".into(),
+            "secret".into(),
+            "dingtalk_test_alias",
+            Arc::new(Vec::new),
+        )
+        .with_streaming(StreamMode::Partial, 500);
+        let msg = SendMessage::new("...", "user1");
+        let result = ch.send_draft(&msg).await.expect("send_draft ok");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_update_draft_is_noop_when_disabled() {
+        let ch = DingTalkChannel::new(
+            "id".into(),
+            "secret".into(),
+            "dingtalk_test_alias",
+            Arc::new(Vec::new),
+        );
+        // Even with a card id, the call must not panic and must not
+        // attempt to issue an HTTP request (no token cache, would
+        // fail loudly). supports_streaming() is false, so we short-
+        // circuit before any HTTP work.
+        ch.update_draft("user1", "card-1", "hello")
+            .await
+            .expect("ok");
+        ch.finalize_draft("user1", "card-1", "hello")
+            .await
+            .expect("ok");
+        ch.cancel_draft("user1", "card-1").await.expect("ok");
+    }
+
+    #[tokio::test]
+    async fn test_update_draft_ignores_empty_message_id() {
+        // With streaming enabled but empty card id, the call must
+        // silently succeed without any HTTP traffic.
+        let ch = DingTalkChannel::new(
+            "id".into(),
+            "secret".into(),
+            "dingtalk_test_alias",
+            Arc::new(Vec::new),
+        )
+        .with_streaming(StreamMode::Partial, 500)
+        .with_ai_card_template("tpl-001".into());
+        ch.update_draft("user1", "", "hello").await.expect("ok");
+        ch.finalize_draft("user1", "", "hello").await.expect("ok");
+        ch.cancel_draft("user1", "").await.expect("ok");
     }
 }
