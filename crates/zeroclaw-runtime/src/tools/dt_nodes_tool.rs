@@ -911,6 +911,7 @@ impl Tool for NodesTool {
                             &self.workspace_dir,
                             &path,
                             &cleanup_config,
+                            false, // tool-write path: skip user `files_cleanup.rules`
                         ) {
                             ::zeroclaw_log::record!(
                                 WARN,

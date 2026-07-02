@@ -1,5 +1,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::media::MediaAttachment;
@@ -196,6 +198,16 @@ impl SendMessage {
 /// Every `Channel` is `Attributable`: the orchestrator's spawn site opens
 /// `attribution_span!(&*ch)` so log emissions from within `listen()` / `send()`
 /// inherit `channel = <type>.<alias>` from the trait object's role + alias.
+/// Channel-side hook for "I just persisted a media file" notifications.
+///
+/// The orchestrator wires a `FilePersistedHook` into each channel at
+/// construction time. The hook closure is resolved at call time, so it
+/// always reads the current `files_cleanup` configuration from the
+/// canonical `Config` Arc. The default `Channel::on_file_persisted`
+/// implementation is a no-op so outbound-only and file-less channels
+/// do not need to override it.
+pub type FilePersistedHook = Arc<dyn Fn(&Path) + Send + Sync>;
+
 #[async_trait]
 pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Human-readable channel name
@@ -440,6 +452,16 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     fn supports_free_form_ask(&self) -> bool {
         true
     }
+
+    /// Notify the runtime that a media file was just persisted to
+    /// disk at `path`. Orchestrator-built channels wire this to a
+    /// `FilePersistedHook` at construction time; the default
+    /// implementation is a no-op so outbound-only and file-less
+    /// channels do not need to override it. Channel implementations
+    /// that save inbound media should call this immediately after
+    /// `tokio::fs::write` so the runtime can register / clean up
+    /// the file based on the current `files_cleanup` config.
+    fn on_file_persisted(&self, _path: &Path) {}
 }
 
 #[cfg(test)]

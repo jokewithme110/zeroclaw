@@ -33,7 +33,9 @@ pub fn is_protected_path(_workspace_root: &Path, rel_path: &str) -> bool {
     // 即路径中不包含任何斜杠
     if !normalized.contains('/') && !normalized.is_empty() {
         // 这是 workspace 根目录下的直接文件，需要保护
-        // 但要排除已知的临时目录
+        // 但要排除已知的临时目录。历史白名单（`qq_files` 等）保留
+        // 以兼容旧 channel；新 channel 只需落盘到 `<id>_files/` 即可
+        // 自动放行——这是 cleanup_rule 模块的对外契约的一部分。
         let allowed_root_dirs = [
             "qq_files",
             "wechat_files",
@@ -44,7 +46,7 @@ pub fn is_protected_path(_workspace_root: &Path, rel_path: &str) -> bool {
             "cache",
             "downloads",
         ];
-        if !allowed_root_dirs.contains(&normalized) {
+        if !allowed_root_dirs.contains(&normalized) && !normalized.ends_with("_files") {
             return true;
         }
     }

@@ -63,9 +63,6 @@ const LARK_SEND_MAX_ATTEMPTS: u32 = 4;
 const LARK_SEND_RETRY_DELAY: Duration = Duration::from_millis(500);
 const LARK_STREAM_CONNECT_MAX_ATTEMPTS: u32 = 3;
 const LARK_STREAM_CONNECT_RETRY_DELAY: Duration = Duration::from_secs(1);
-type CleanupConfigResolver =
-    Arc<dyn Fn() -> zeroclaw_infra::temp_file_manager::TempFileConfig + Send + Sync>;
-
 macro_rules! lark_info {
     ($message:expr) => {
         ::zeroclaw_log::record!(
@@ -772,8 +769,9 @@ pub struct LarkChannel {
     last_draft_edit: Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
     /// Workspace directory for saving downloaded images.
     workspace_dir: Option<PathBuf>,
-    /// Resolves cleanup config from canonical state at write-time.
-    cleanup_config_resolver: Option<CleanupConfigResolver>,
+    /// Runtime hook invoked after the channel persists a media
+    /// file. Wired by the orchestrator at construction time.
+    file_persisted_hook: Option<zeroclaw_api::channel::FilePersistedHook>,
     /// Upload cache: avoids re-uploading the same image within TTL.
     upload_cache: Arc<RwLock<HashMap<String, UploadCacheEntry>>>,
     #[cfg(test)]
@@ -842,7 +840,7 @@ impl LarkChannel {
             draft_update_interval_ms: 1000,
             last_draft_edit: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             workspace_dir: None,
-            cleanup_config_resolver: None,
+            file_persisted_hook: None,
             upload_cache: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(test)]
             api_base_override: None,
@@ -2500,6 +2498,12 @@ impl ::zeroclaw_api::attribution::Attributable for LarkChannel {
 
 #[async_trait]
 impl Channel for LarkChannel {
+    fn on_file_persisted(&self, path: &std::path::Path) {
+        if let Some(hook) = &self.file_persisted_hook {
+            hook(path);
+        }
+    }
+
     fn name(&self) -> &str {
         self.channel_name()
     }
@@ -3174,30 +3178,14 @@ impl LarkChannel {
             return None;
         }
 
+        self.on_file_persisted(&path);
+
         lark_info!(
             ::serde_json::json!({
                 "path": path.display().to_string(),
             }),
             "Lark: image saved"
         );
-        if let Some(resolve_cleanup_config) = self.cleanup_config_resolver.as_ref() {
-            let cleanup_config = resolve_cleanup_config();
-            if let Err(error) =
-                zeroclaw_infra::temp_file_manager::TempFileManager::trigger_cleanup_by_path(
-                    workspace,
-                    &path,
-                    &cleanup_config,
-                )
-            {
-                lark_warn!(
-                    ::serde_json::json!({
-                        "path": path.display().to_string(),
-                        "error": error.to_string(),
-                    }),
-                    "Lark: cleanup trigger failed after saving image"
-                );
-            }
-        }
         Some(format!("[IMAGE:{}]", path.display()))
     }
 
@@ -3550,12 +3538,17 @@ impl LarkChannel {
         self
     }
 
-    /// Resolve cleanup config from canonical state whenever a file is saved.
-    pub fn with_cleanup_config_resolver(mut self, resolver: CleanupConfigResolver) -> Self {
-        self.cleanup_config_resolver = Some(resolver);
+    /// Install the runtime hook that the channel will invoke after
+    /// persisting a media file. Wired by the orchestrator.
+    pub fn with_file_persisted_hook(
+        mut self,
+        hook: zeroclaw_api::channel::FilePersistedHook,
+    ) -> Self {
+        self.file_persisted_hook = Some(hook);
         self
     }
 
+    /// Resolve cleanup config from canonical state whenever a file is saved.
     /// Send text message with automatic chunking and token refresh.
     async fn send_text_message(&self, recipient: &str, text_content: &str) -> anyhow::Result<()> {
         let url = self.send_message_url();

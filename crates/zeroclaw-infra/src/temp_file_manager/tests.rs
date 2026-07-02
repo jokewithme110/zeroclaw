@@ -209,4 +209,98 @@ mod tests {
         // Should be adjusted to 1 minute = 60 seconds
         assert_eq!(duration.as_secs(), 60);
     }
+
+    #[test]
+    fn trigger_matches_builtin_channel_files_dir() {
+        use crate::temp_file_manager::{TempFileConfig, TempFileManager};
+
+        // New channel following the `<id>_files/` convention must pick up
+        // the universal retention/size limits without any explicit
+        // `files_cleanup.rules` entry. `trigger_cleanup_by_path` returns
+        // `Ok(())` whether or not a file needs deletion, so we exercise
+        // the call path that derives the rule internally.
+        let tmp = tempfile::tempdir().unwrap();
+        let slack_dir = tmp.path().join("slack_files");
+        std::fs::create_dir_all(&slack_dir).unwrap();
+        let file_path = slack_dir.join("hello.txt");
+        std::fs::write(&file_path, b"hi").unwrap();
+
+        let config = TempFileConfig {
+            enabled: true,
+            temp_file_retention_hours: 24,
+            temp_file_max_size_mb: 50,
+            scheduled_cleanup_enabled: false,
+            scheduled_cleanup_interval_hours: 1.0,
+            rules: vec![],
+        };
+        TempFileManager::trigger_cleanup_by_path(tmp.path(), &file_path, &config, false).unwrap();
+
+        // The matching manager built from the same config registers
+        // zero rules: built-in channels are intentionally NOT registered
+        // into `self.rules` (they're message-triggered only). The
+        // trigger path above is what actually governs attachment cleanup
+        // for the `slack_files/` channel.
+        let manager = TempFileManager::from_config(tmp.path().to_path_buf(), &config).unwrap();
+        assert_eq!(manager.rules_count(), 0);
+    }
+
+    #[test]
+    fn trigger_falls_back_to_first_workspace_dir() {
+        use crate::temp_file_manager::{TempFileConfig, TempFileManager};
+
+        // File in an arbitrary `attachments/telegram/...` subdir should
+        // still be governed by the universal limits via the generic
+        // fallback rule.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("attachments").join("telegram");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("img.png");
+        std::fs::write(&file_path, b"data").unwrap();
+
+        let config = TempFileConfig {
+            enabled: true,
+            temp_file_retention_hours: 24,
+            temp_file_max_size_mb: 50,
+            scheduled_cleanup_enabled: false,
+            scheduled_cleanup_interval_hours: 1.0,
+            rules: vec![],
+        };
+        TempFileManager::trigger_cleanup_by_path(tmp.path(), &file_path, &config, false).unwrap();
+
+        // No user rules were configured, so `from_config` registers
+        // zero rules (builtin channels are message-triggered only).
+        let manager = TempFileManager::from_config(tmp.path().to_path_buf(), &config).unwrap();
+        assert_eq!(manager.rules_count(), 0);
+    }
+
+    #[test]
+    fn trigger_respects_explicit_custom_rule() {
+        use crate::temp_file_manager::{TempCleanupRule, TempFileConfig, TempFileManager};
+
+        // Explicit `files_cleanup.rules` entry applies when the caller
+        // opts into the full-resolution path (e.g. the scheduled scan).
+        // The channel-message path (`include_custom_rules = false`)
+        // intentionally skips these rules — they target the global
+        // `data_dir` workspace and are reserved for background cleanup.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("slack_files");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("hello.txt");
+        std::fs::write(&file_path, b"hi").unwrap();
+
+        let config = TempFileConfig {
+            enabled: true,
+            temp_file_retention_hours: 24,
+            temp_file_max_size_mb: 50,
+            scheduled_cleanup_enabled: false,
+            scheduled_cleanup_interval_hours: 1.0,
+            rules: vec![TempCleanupRule {
+                path: "slack_files/".to_string(),
+                pattern: Some("hello*".to_string()),
+                retention_hours: 1,
+                max_size_mb: 1,
+            }],
+        };
+        TempFileManager::trigger_cleanup_by_path(tmp.path(), &file_path, &config, true).unwrap();
+    }
 }

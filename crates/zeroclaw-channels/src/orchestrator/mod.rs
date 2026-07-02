@@ -5676,7 +5676,6 @@ impl AgentRouter {
         None
     }
 }
-
 async fn run_message_dispatch_loop(
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
     router: AgentRouter,
@@ -6055,6 +6054,47 @@ fn make_cleanup_config_resolver(
     })
 }
 
+/// Build a `FilePersistedHook` for one channel handle. The hook
+/// resolves the channel's workspace + live `files_cleanup` config on
+/// every call (so config edits take effect without a restart), then
+/// delegates to `TempFileManager::trigger_cleanup_by_path`. Path
+/// must live under the channel's workspace; mismatches are silently
+/// skipped to avoid cross-channel pollution.
+#[allow(dead_code)] // only referenced from cfg-gated channel constructors
+fn make_file_persisted_hook(
+    config_arc: &Arc<RwLock<Config>>,
+    channel_workspace: std::path::PathBuf,
+) -> zeroclaw_api::channel::FilePersistedHook {
+    let config_arc = config_arc.clone();
+    Arc::new(move |path: &std::path::Path| {
+        if !path.starts_with(&channel_workspace) {
+            return;
+        }
+        let cfg = config_arc.read();
+        let cleanup_config = cleanup_config_from_config(&cfg);
+        drop(cfg);
+        if let Err(error) =
+            zeroclaw_infra::temp_file_manager::TempFileManager::trigger_cleanup_by_path(
+                &channel_workspace,
+                path,
+                &cleanup_config,
+                false, // channel-message path: skip user `files_cleanup.rules`
+            )
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "path": path.display().to_string(),
+                        "error": error.to_string(),
+                    })),
+                "File-persisted cleanup hook failed"
+            );
+        }
+    })
+}
+
 /// Build a single channel instance by config section name (e.g. "telegram").
 fn build_channel_by_id(
     config_arc: &Arc<RwLock<Config>>,
@@ -6331,7 +6371,6 @@ fn build_channel_by_id(
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_external_peers("qq", &alias))
             };
-            let cleanup_config_resolver = make_cleanup_config_resolver(config_arc);
             Ok(Arc::new(
                 QQChannel::new(
                     qq.app_id.clone(),
@@ -6340,8 +6379,11 @@ fn build_channel_by_id(
                     peer_resolver,
                 )
                 .with_workspace_dir(config.channel_workspace_dir("qq.default"))
-                .with_proxy_url(qq.proxy_url.clone())
-                .with_cleanup_config_resolver(cleanup_config_resolver),
+                .with_file_persisted_hook(make_file_persisted_hook(
+                    config_arc,
+                    config.channel_workspace_dir("qq.default"),
+                ))
+                .with_proxy_url(qq.proxy_url.clone()),
             ))
         }
         #[cfg(not(feature = "channel-qq"))]
@@ -6362,14 +6404,16 @@ fn build_channel_by_id(
                     let alias = alias.clone();
                     Arc::new(move || cfg_arc.read().channel_external_peers("lark", &alias))
                 };
-                let cleanup_config_resolver = make_cleanup_config_resolver(config_arc);
                 Ok(Arc::new(
                     LarkChannel::from_config(lk, alias, peer_resolver)
                         .with_approval_timeout_secs(lk.approval_timeout_secs)
                         .with_per_user_session(lk.per_user_session)
                         .with_streaming(lk.stream_mode, lk.draft_update_interval_ms)
                         .with_workspace_dir(config.channel_workspace_dir("lark.default"))
-                        .with_cleanup_config_resolver(cleanup_config_resolver),
+                        .with_file_persisted_hook(make_file_persisted_hook(
+                            config_arc,
+                            config.channel_workspace_dir("lark.default"),
+                        )),
                 ))
             }
             #[cfg(not(feature = "channel-lark"))]
@@ -6400,11 +6444,13 @@ fn build_channel_by_id(
                     Arc::new(move || cfg_arc.read().channel_external_peers("lark", &alias))
                 };
                 let channel_ref = format!("feishu.{alias}");
-                let cleanup_config_resolver = make_cleanup_config_resolver(config_arc);
                 Ok(Arc::new(
                     LarkChannel::from_config(lk, alias, peer_resolver)
                         .with_workspace_dir(config.channel_workspace_dir(&channel_ref))
-                        .with_cleanup_config_resolver(cleanup_config_resolver),
+                        .with_file_persisted_hook(make_file_persisted_hook(
+                            config_arc,
+                            config.channel_workspace_dir(&channel_ref),
+                        )),
                 ))
             }
             #[cfg(not(feature = "channel-lark"))]
@@ -6425,8 +6471,6 @@ fn build_channel_by_id(
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_external_peers("dingtalk", &alias))
             };
-            let cleanup_config_resolver = make_cleanup_config_resolver(config_arc);
-
             let mut channel = DingTalkChannel::new(
                 dt.client_id.clone(),
                 dt.client_secret.clone(),
@@ -6435,7 +6479,10 @@ fn build_channel_by_id(
             )
             .with_proxy_url(dt.proxy_url.clone())
             .with_workspace_dir(config.channel_workspace_dir("dingtalk.default"))
-            .with_cleanup_config_resolver(cleanup_config_resolver)
+            .with_file_persisted_hook(make_file_persisted_hook(
+                config_arc,
+                config.channel_workspace_dir("dingtalk.default"),
+            ))
             .with_streaming(dt.stream_mode, dt.streaming_update_interval_ms);
 
             // Configure AI card template if provided
@@ -6462,11 +6509,13 @@ fn build_channel_by_id(
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_external_peers("wecom", &alias))
             };
-            Ok(Arc::new(WeComChannel::new(
-                wc.webhook_key.clone(),
-                alias,
-                peer_resolver,
-            )))
+            Ok(Arc::new(
+                WeComChannel::new(wc.webhook_key.clone(), alias, peer_resolver)
+                    .with_file_persisted_hook(make_file_persisted_hook(
+                        config_arc,
+                        config.data_dir.clone(),
+                    )),
+            ))
         }
         #[cfg(not(feature = "channel-wecom"))]
         "wecom" => {
@@ -6508,12 +6557,18 @@ fn build_channel_by_id(
                     peers
                 })
             };
-            Ok(Arc::new(WeComWsChannel::new_with_alias(
-                wc,
-                alias.clone(),
-                peer_resolver,
-                &config.channel_workspace_dir(&format!("wecom_ws.{alias}")),
-            )?))
+            Ok(Arc::new(
+                WeComWsChannel::new_with_alias(
+                    wc,
+                    alias.clone(),
+                    peer_resolver,
+                    &config.channel_workspace_dir(&format!("wecom_ws.{alias}")),
+                )?
+                .with_file_persisted_hook(make_file_persisted_hook(
+                    config_arc,
+                    config.channel_workspace_dir(&format!("wecom_ws.{alias}")),
+                )),
+            ))
         }
         #[cfg(not(feature = "channel-wecom-ws"))]
         channel_id
@@ -6537,7 +6592,6 @@ fn build_channel_by_id(
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_external_peers("wechat", &alias))
             };
-            let cleanup_config_resolver = make_cleanup_config_resolver(config_arc);
             Ok(Arc::new(
                 WeChatChannel::new(
                     alias,
@@ -6548,7 +6602,10 @@ fn build_channel_by_id(
                 )?
                 .with_persistence(config_arc.clone())
                 .with_workspace_dir(config.data_dir.clone())
-                .with_cleanup_config_resolver(cleanup_config_resolver),
+                .with_file_persisted_hook(make_file_persisted_hook(
+                    config_arc,
+                    config.data_dir.clone(),
+                )),
             ))
         }
         #[cfg(not(feature = "channel-wechat"))]
@@ -7910,7 +7967,6 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_external_peers("lark", &alias))
         };
-        let cleanup_config_resolver = make_cleanup_config_resolver(config_arc);
         let display_name = if lk.use_feishu { "Feishu" } else { "Lark" };
         channels.push(ConfiguredChannel {
             display_name,
@@ -7921,7 +7977,10 @@ fn collect_configured_channels(
                     .with_per_user_session(lk.per_user_session)
                     .with_streaming(lk.stream_mode, lk.draft_update_interval_ms)
                     .with_transcription(config.transcription.clone())
-                    .with_cleanup_config_resolver(cleanup_config_resolver),
+                    .with_file_persisted_hook(make_file_persisted_hook(
+                        config_arc,
+                        config.channel_workspace_dir(&format!("lark.{alias}")),
+                    )),
             ),
         });
     }
@@ -8046,7 +8105,6 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_external_peers("dingtalk", &alias))
         };
-        let cleanup_config_resolver = make_cleanup_config_resolver(config_arc);
         let mut dingtalk_channel = DingTalkChannel::new(
             dt.client_id.clone(),
             dt.client_secret.clone(),
@@ -8055,7 +8113,10 @@ fn collect_configured_channels(
         )
         .with_proxy_url(dt.proxy_url.clone())
         .with_workspace_dir(config.channel_workspace_dir(&format!("dingtalk.{alias}")))
-        .with_cleanup_config_resolver(cleanup_config_resolver)
+        .with_file_persisted_hook(make_file_persisted_hook(
+            config_arc,
+            config.channel_workspace_dir(&format!("dingtalk.{alias}")),
+        ))
         .with_streaming(dt.stream_mode, dt.streaming_update_interval_ms);
         if let Some(ref template_id) = dt.ai_card_template_id {
             dingtalk_channel = dingtalk_channel.with_ai_card_template(template_id.clone());
@@ -8091,7 +8152,6 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_external_peers("qq", &alias))
         };
-        let cleanup_config_resolver = make_cleanup_config_resolver(config_arc);
         channels.push(ConfiguredChannel {
             display_name: "QQ",
             alias: Some(alias.clone()),
@@ -8105,7 +8165,10 @@ fn collect_configured_channels(
                 .with_workspace_dir(config.channel_workspace_dir(&format!("qq.{alias}")))
                 .with_proxy_url(qq.proxy_url.clone())
                 .with_transcription(config.transcription.clone())
-                .with_cleanup_config_resolver(cleanup_config_resolver),
+                .with_file_persisted_hook(make_file_persisted_hook(
+                    config_arc,
+                    config.channel_workspace_dir(&format!("qq.{alias}")),
+                )),
             ),
         });
     }
@@ -8209,11 +8272,13 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "WeCom",
             alias: Some(alias.clone()),
-            channel: Arc::new(WeComChannel::new(
-                wc.webhook_key.clone(),
-                alias.clone(),
-                peer_resolver,
-            )),
+            channel: Arc::new(
+                WeComChannel::new(wc.webhook_key.clone(), alias.clone(), peer_resolver)
+                    .with_file_persisted_hook(make_file_persisted_hook(
+                        config_arc,
+                        config.data_dir.clone(),
+                    )),
+            ),
         });
     }
 
@@ -8267,7 +8332,10 @@ fn collect_configured_channels(
             Ok(channel) => channels.push(ConfiguredChannel {
                 display_name: "WeCom WebSocket",
                 alias: Some(alias.clone()),
-                channel: Arc::new(channel),
+                channel: Arc::new(channel.with_file_persisted_hook(make_file_persisted_hook(
+                    config_arc,
+                    config.channel_workspace_dir(&format!("wecom_ws.{alias}")),
+                ))),
             }),
             Err(err) => {
                 ::zeroclaw_log::record!(
@@ -8308,7 +8376,6 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_external_peers("wechat", &alias))
         };
-        let cleanup_config_resolver = make_cleanup_config_resolver(config_arc);
         match WeChatChannel::new(
             alias.clone(),
             peer_resolver,
@@ -8326,7 +8393,10 @@ fn collect_configured_channels(
                             .with_workspace_dir(
                                 config.channel_workspace_dir(&format!("wechat.{alias}")),
                             )
-                            .with_cleanup_config_resolver(cleanup_config_resolver),
+                            .with_file_persisted_hook(make_file_persisted_hook(
+                                config_arc,
+                                config.channel_workspace_dir(&format!("wechat.{alias}")),
+                            )),
                     ),
                 });
             }
@@ -15517,7 +15587,7 @@ BTC is currently around $65,000 based on latest tool output."#
         .unwrap();
         drop(tx);
 
-        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 2).await;
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 2, None).await;
 
         // Deterministic concurrency check: the dispatcher should have processed
         // both messages in parallel, so the peak number of simultaneously
@@ -15659,7 +15729,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
         });
 
-        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4).await;
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4, None).await;
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
@@ -15809,7 +15879,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
         });
 
-        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4).await;
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4, None).await;
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
@@ -15962,7 +16032,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
         });
 
-        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4).await;
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4, None).await;
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
@@ -16105,7 +16175,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
         });
 
-        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4).await;
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4, None).await;
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
@@ -21003,7 +21073,7 @@ This is an example JSON object for profile settings."#;
             .unwrap();
         });
 
-        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4).await;
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4, None).await;
         send_task.await.unwrap();
 
         // Both tasks should have completed — different threads, no cancellation.

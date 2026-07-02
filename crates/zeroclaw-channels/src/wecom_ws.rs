@@ -241,6 +241,11 @@ pub struct WeComWsChannel {
         Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<()>>>>>,
     respond_msg_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     last_cleanup: Arc<Mutex<Instant>>,
+    /// Runtime hook invoked after the channel persists a media
+    /// file. Wired by the orchestrator at construction time; the
+    /// `on_file_persisted` default trait method delegates to this
+    /// when present.
+    file_persisted_hook: Option<zeroclaw_api::channel::FilePersistedHook>,
     idempotency: Arc<SimpleIdempotencyStore>,
     req_id_map: Arc<Mutex<HashMap<String, String>>>, // stream_id → req_id
 }
@@ -298,7 +303,17 @@ impl WeComWsChannel {
             last_cleanup: Arc::new(Mutex::new(Instant::now())),
             idempotency: Arc::new(SimpleIdempotencyStore::new()),
             req_id_map: Arc::new(Mutex::new(HashMap::new())),
+            file_persisted_hook: None,
         })
+    }
+    /// Install the runtime hook that the channel will invoke after
+    /// persisting a media file. Wired by the orchestrator.
+    pub fn with_file_persisted_hook(
+        mut self,
+        hook: zeroclaw_api::channel::FilePersistedHook,
+    ) -> Self {
+        self.file_persisted_hook = Some(hook);
+        self
     }
 
     async fn wait_for_ws_sender(&self) -> Result<mpsc::Sender<WsOutbound>> {
@@ -1377,6 +1392,7 @@ impl WeComWsChannel {
                 )
             })?;
 
+        self.on_file_persisted(&path);
         self.maybe_cleanup_files();
 
         let abs = path.canonicalize().unwrap_or(path);
@@ -1449,6 +1465,12 @@ impl ::zeroclaw_api::attribution::Attributable for WeComWsChannel {
 
 #[async_trait]
 impl Channel for WeComWsChannel {
+    fn on_file_persisted(&self, path: &std::path::Path) {
+        if let Some(hook) = &self.file_persisted_hook {
+            hook(path);
+        }
+    }
+
     fn name(&self) -> &str {
         "wecom_ws"
     }

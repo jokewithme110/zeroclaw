@@ -69,9 +69,6 @@ const UPLOAD_MEDIA_TYPE_FILE: u32 = 3;
 
 /// Shared max size for inbound/outbound media handling.
 const WECHAT_MEDIA_MAX_BYTES: u64 = 100 * 1024 * 1024;
-type CleanupConfigResolver =
-    Arc<dyn Fn() -> zeroclaw_infra::temp_file_manager::TempFileConfig + Send + Sync>;
-
 type Aes128EcbEnc = ecb::Encryptor<aes::Aes128>;
 type Aes128EcbDec = ecb::Decryptor<aes::Aes128>;
 
@@ -476,8 +473,9 @@ pub struct WeChatChannel {
     /// Workspace directory used for storing inbound attachments and resolving
     /// `/workspace/...` paths from generated replies.
     workspace_dir: Option<PathBuf>,
-    /// Resolves cleanup config from canonical state at write-time.
-    cleanup_config_resolver: Option<CleanupConfigResolver>,
+    /// Runtime hook invoked after the channel persists a media
+    /// file. Wired by the orchestrator at construction time.
+    file_persisted_hook: Option<zeroclaw_api::channel::FilePersistedHook>,
 }
 
 /// Persistent account data (token + metadata).
@@ -724,7 +722,7 @@ impl WeChatChannel {
             typing_handle: Mutex::new(None),
             state_dir,
             workspace_dir: None,
-            cleanup_config_resolver: None,
+            file_persisted_hook: None,
         };
 
         // Try to load persisted state
@@ -738,17 +736,22 @@ impl WeChatChannel {
     }
 
     /// Resolve cleanup config from canonical state whenever a file is saved.
-    pub fn with_cleanup_config_resolver(mut self, resolver: CleanupConfigResolver) -> Self {
-        self.cleanup_config_resolver = Some(resolver);
-        self
-    }
-
     /// Wire the shared Config handle so `persist_allowed_identity` can
     /// write a paired user into `peer_groups` and save. The long-running
     /// daemon sets this from the orchestrator; tests and one-shot
     /// callers leave it unset (pairing works at runtime, doesn't persist).
     pub fn with_persistence(mut self, config: Arc<parking_lot::RwLock<Config>>) -> Self {
         self.persist = Some(config);
+        self
+    }
+
+    /// Install the runtime hook that the channel will invoke after
+    /// persisting a media file. Wired by the orchestrator.
+    pub fn with_file_persisted_hook(
+        mut self,
+        hook: zeroclaw_api::channel::FilePersistedHook,
+    ) -> Self {
+        self.file_persisted_hook = Some(hook);
         self
     }
 
@@ -1573,27 +1576,7 @@ impl WeChatChannel {
             return None;
         }
 
-        if let Some(resolve_cleanup_config) = self.cleanup_config_resolver.as_ref() {
-            let cleanup_config = resolve_cleanup_config();
-            if let Err(error) =
-                zeroclaw_infra::temp_file_manager::TempFileManager::trigger_cleanup_by_path(
-                    workspace_dir,
-                    &local_path,
-                    &cleanup_config,
-                )
-            {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "file_path": local_path.display().to_string(),
-                            "error": error.to_string(),
-                        })),
-                    "Failed to trigger cleanup for saved attachment"
-                );
-            }
-        }
+        self.on_file_persisted(&local_path);
 
         Some(format_attachment_content(
             spec.kind,
@@ -2078,6 +2061,12 @@ impl ::zeroclaw_api::attribution::Attributable for WeChatChannel {
 
 #[async_trait]
 impl Channel for WeChatChannel {
+    fn on_file_persisted(&self, path: &std::path::Path) {
+        if let Some(hook) = &self.file_persisted_hook {
+            hook(path);
+        }
+    }
+
     fn name(&self) -> &str {
         "wechat"
     }

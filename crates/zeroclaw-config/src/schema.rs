@@ -11513,6 +11513,10 @@ pub struct ChannelsConfig {
 
 // ── Temporary File Cleanup Configuration ─────────────────────────
 
+/// Per-channel cleanup directory. New channels only need an entry here
+/// — no code change in the channel itself. The orchestrator scans the
+/// declared `path` whenever the channel receives a message that carries
+/// attachments, keeping the channel completely out of the cleanup
 /// Configuration for a single temporary file cleanup rule.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]

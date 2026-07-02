@@ -96,64 +96,138 @@ pub struct TempFileManager {
 }
 
 impl TempFileManager {
+    /// Built-in shortcut rules keyed by their relative directory name.
+    /// Behavior must stay identical to the historical hard-coded list:
+    /// `qq_files/`, `wechat_files/`, `dingtalk_files/`, `lark_files/`
+    /// use the universal retention/size with a `*` pattern, while
+    /// `media/` keeps its special `node_snap_*` pattern. New channels
+    /// that follow the `<id>_files/` convention pick up the universal
+    /// limits automatically without a code change.
+    const BUILTIN_DIR_PATTERNS: &'static [(&'static str, Option<&'static str>)] = &[
+        ("qq_files/", Some("*")),
+        ("wechat_files/", Some("*")),
+        ("dingtalk_files/", Some("*")),
+        ("lark_files/", Some("*")),
+        ("media/", Some("node_snap_*")),
+    ];
+
+    /// Derive the channel-specific `<id>_files/` rule for a given file path.
+    /// Returns `Some(rule)` only when the file's first workspace-relative
+    /// segment ends with `_files`, so e.g. `attachments/telegram/...` does
+    /// not accidentally pick up a `telegram` channel mapping. The five
+    /// built-in entries above are excluded so they keep their declared
+    /// patterns (e.g. `media/node_snap_*`).
+    fn channel_builtin_rule(
+        workspace_root: &Path,
+        file_path: &Path,
+        retention_hours: u64,
+        max_size_mb: u64,
+    ) -> Option<TempCleanupRule> {
+        let rel = file_path.strip_prefix(workspace_root).ok()?;
+        let first = rel.components().next()?.as_os_str().to_str()?;
+        if !first.ends_with("_files") {
+            return None;
+        }
+        let dir = format!("{}/", first);
+        if Self::BUILTIN_DIR_PATTERNS.iter().any(|(p, _)| *p == dir) {
+            return None;
+        }
+        Some(TempCleanupRule {
+            path: dir,
+            pattern: Some("*".to_string()),
+            retention_hours,
+            max_size_mb,
+        })
+    }
+
+    /// Pick a generic fallback rule for a file that did not match any
+    /// built-in channel convention and has no explicit `files_cleanup.rules`
+    /// entry. Uses the file's first workspace-relative directory as the
+    /// cleanup target so any channel's attachments end up governed by the
+    /// universal retention/size limits. Returns `None` when the file is
+    /// not under the workspace, sits directly at the workspace root, or
+    /// lives inside a protected system directory.
+    fn generic_fallback_rule(
+        workspace_root: &Path,
+        file_path: &Path,
+        retention_hours: u64,
+        max_size_mb: u64,
+    ) -> Option<TempCleanupRule> {
+        let rel = file_path.strip_prefix(workspace_root).ok()?;
+        let first = rel.components().next()?.as_os_str().to_str()?;
+        if first.is_empty() {
+            return None;
+        }
+        let dir = format!("{}/", first);
+        if is_protected_path(workspace_root, &dir) {
+            return None;
+        }
+        Some(TempCleanupRule {
+            path: dir,
+            pattern: Some("*".to_string()),
+            retention_hours,
+            max_size_mb,
+        })
+    }
+
     /// Trigger cleanup for one freshly written file using the canonical cleanup config.
+    ///
+    /// `include_custom_rules` controls whether the user's
+    /// `files_cleanup.rules` entries participate in the rule-resolution
+    /// walk. Callers on the inbound (channel-message) path pass `false`
+    /// so that those rules — which are written against the global
+    /// `data_dir` workspace and reserved for the scheduled scan — don't
+    /// apply. Callers on the scheduled-scan and manual-cleanup paths
+    /// pass `true` to keep the historical behavior.
     pub fn trigger_cleanup_by_path(
         workspace_root: &Path,
         file_path: &Path,
         config: &TempFileConfig,
+        include_custom_rules: bool,
     ) -> Result<()> {
         if !config.enabled {
             return Ok(());
         }
 
         let mut rule_configs = Vec::new();
-        let qq_dir = workspace_root.join("qq_files");
-        let wechat_dir = workspace_root.join("wechat_files");
-        let dingtalk_dir = workspace_root.join("dingtalk_files");
-        let lark_dir = workspace_root.join("lark_files");
-        let media_dir = workspace_root.join("media");
-
-        if file_path.starts_with(&qq_dir) {
-            rule_configs.push(TempCleanupRule {
-                path: "qq_files/".to_string(),
-                pattern: Some("*".to_string()),
-                retention_hours: config.temp_file_retention_hours,
-                max_size_mb: config.temp_file_max_size_mb,
-            });
-        } else if file_path.starts_with(&wechat_dir) {
-            rule_configs.push(TempCleanupRule {
-                path: "wechat_files/".to_string(),
-                pattern: Some("*".to_string()),
-                retention_hours: config.temp_file_retention_hours,
-                max_size_mb: config.temp_file_max_size_mb,
-            });
-        } else if file_path.starts_with(&dingtalk_dir) {
-            rule_configs.push(TempCleanupRule {
-                path: "dingtalk_files/".to_string(),
-                pattern: Some("*".to_string()),
-                retention_hours: config.temp_file_retention_hours,
-                max_size_mb: config.temp_file_max_size_mb,
-            });
-        } else if file_path.starts_with(&lark_dir) {
-            rule_configs.push(TempCleanupRule {
-                path: "lark_files/".to_string(),
-                pattern: Some("*".to_string()),
-                retention_hours: config.temp_file_retention_hours,
-                max_size_mb: config.temp_file_max_size_mb,
-            });
-        } else if file_path.starts_with(&media_dir) {
-            rule_configs.push(TempCleanupRule {
-                path: "media/".to_string(),
-                pattern: Some("node_snap_*".to_string()),
-                retention_hours: config.temp_file_retention_hours,
-                max_size_mb: config.temp_file_max_size_mb,
-            });
+        for (dir, pattern) in Self::BUILTIN_DIR_PATTERNS {
+            let builtin_abs = workspace_root.join(dir);
+            if file_path.starts_with(&builtin_abs) {
+                rule_configs.push(TempCleanupRule {
+                    path: (*dir).to_string(),
+                    pattern: pattern.map(str::to_string),
+                    retention_hours: config.temp_file_retention_hours,
+                    max_size_mb: config.temp_file_max_size_mb,
+                });
+            }
         }
 
-        for custom_rule in &config.rules {
-            if file_path.starts_with(workspace_root.join(&custom_rule.path)) {
-                rule_configs.push(custom_rule.clone());
+        if let Some(channel_rule) = Self::channel_builtin_rule(
+            workspace_root,
+            file_path,
+            config.temp_file_retention_hours,
+            config.temp_file_max_size_mb,
+        ) {
+            rule_configs.push(channel_rule);
+        }
+
+        if include_custom_rules {
+            for custom_rule in &config.rules {
+                if file_path.starts_with(workspace_root.join(&custom_rule.path)) {
+                    rule_configs.push(custom_rule.clone());
+                }
             }
+        }
+
+        if rule_configs.is_empty()
+            && let Some(fallback) = Self::generic_fallback_rule(
+                workspace_root,
+                file_path,
+                config.temp_file_retention_hours,
+                config.temp_file_max_size_mb,
+            )
+        {
+            rule_configs.push(fallback);
         }
 
         for rule_config in rule_configs {
@@ -215,43 +289,11 @@ impl TempFileManager {
 
         let mut rules = Vec::new();
 
-        // 生成内置规则
-        let builtin_rules = Self::generate_builtin_rules(config);
-        for rule_config in &builtin_rules {
-            match CleanupRule::new(
-                &workspace_root,
-                &rule_config.path,
-                rule_config.pattern.as_deref(),
-                rule_config.retention_hours,
-                rule_config.max_size_mb,
-            ) {
-                Ok(rule) => {
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        temp_file_event(json!({
-                            "rule_path": rule.path_display(),
-                            "retention_hours": rule_config.retention_hours,
-                            "max_size_mb": rule_config.max_size_mb
-                        })),
-                        "Registered built-in cleanup rule"
-                    );
-                    rules.push(Arc::new(rule));
-                }
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        temp_file_event(json!({
-                            "rule_path": rule_config.path,
-                            "error": e.to_string()
-                        }))
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                        "Failed to create built-in cleanup rule"
-                    );
-                }
-            }
-        }
-
-        // 添加用户自定义规则（跳过受保护的系统目录）
+        // 添加用户自定义规则（跳过受保护的系统目录）。
+        // 注：内置规则（qq_files/、wechat_files/ 等）不再注册到
+        // `self.rules`，因此不再随定时扫描自动执行。消息触发清理
+        // 仍由 `BUILTIN_DIR_PATTERNS` 在 `trigger_cleanup_by_path`
+        // 中按需提供，与本扫描路径解耦。
         for rule_config in &config.rules {
             // 检查是否是受保护的目录
             if is_protected_path(&workspace_root, &rule_config.path) {
@@ -306,42 +348,6 @@ impl TempFileManager {
         })
     }
 
-    /// 生成内置规则（qq_files/, wechat_files/, dingtalk_files/, lark_files/, media/node_snap_*）
-    fn generate_builtin_rules(config: &TempFileConfig) -> Vec<TempCleanupRule> {
-        vec![
-            TempCleanupRule {
-                path: "qq_files/".to_string(),
-                pattern: Some("*".to_string()),
-                retention_hours: config.temp_file_retention_hours,
-                max_size_mb: config.temp_file_max_size_mb,
-            },
-            TempCleanupRule {
-                path: "wechat_files/".to_string(),
-                pattern: Some("*".to_string()),
-                retention_hours: config.temp_file_retention_hours,
-                max_size_mb: config.temp_file_max_size_mb,
-            },
-            TempCleanupRule {
-                path: "dingtalk_files/".to_string(),
-                pattern: Some("*".to_string()),
-                retention_hours: config.temp_file_retention_hours,
-                max_size_mb: config.temp_file_max_size_mb,
-            },
-            TempCleanupRule {
-                path: "lark_files/".to_string(),
-                pattern: Some("*".to_string()),
-                retention_hours: config.temp_file_retention_hours,
-                max_size_mb: config.temp_file_max_size_mb,
-            },
-            TempCleanupRule {
-                path: "media/".to_string(),
-                pattern: Some("node_snap_*".to_string()),
-                retention_hours: config.temp_file_retention_hours,
-                max_size_mb: config.temp_file_max_size_mb,
-            },
-        ]
-    }
-
     /// 登记文件并触发对应规则的清理
     pub fn register(&self, path: &Path, _category: Option<TempFileCategory>) -> Result<()> {
         if !self.enabled {
@@ -382,7 +388,13 @@ impl TempFileManager {
         Ok(())
     }
 
-    /// 手动执行所有规则的清理（供 CLI 命令调用）
+    /// 手动执行所有规则的清理（供 CLI 命令调用）。
+    ///
+    /// 仅遍历 `self.rules`，即用户在 `files_cleanup.rules`
+    /// 中显式声明的规则。历史内置的 `qq_files/`、`wechat_files/`、
+    /// `dingtalk_files/`、`lark_files/`、`media/node_snap_*`
+    /// 不再随本扫描执行 —— 它们的消息触发清理由
+    /// `trigger_cleanup_by_path` 在 C 路径上处理。
     pub fn enforce_all(&self) -> Result<EnforceReport> {
         let mut report = EnforceReport {
             rules_executed: 0,

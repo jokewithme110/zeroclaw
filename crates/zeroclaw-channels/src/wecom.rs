@@ -14,6 +14,13 @@ pub struct WeComChannel {
     /// Resolves inbound external peers from canonical state at message-time.
     /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    /// Runtime hook invoked after the channel persists a media
+    /// file. Wired by the orchestrator at construction time; the
+    /// `on_file_persisted` default trait method delegates to this
+    /// when present. WeCom itself is a webhook channel with no
+    /// inbound file downloads today, but the field keeps the
+    /// interface consistent with the rest of the channel fleet.
+    file_persisted_hook: Option<zeroclaw_api::channel::FilePersistedHook>,
 }
 
 impl WeComChannel {
@@ -26,6 +33,7 @@ impl WeComChannel {
             webhook_key,
             alias: alias.into(),
             peer_resolver,
+            file_persisted_hook: None,
         }
     }
 
@@ -38,6 +46,16 @@ impl WeComChannel {
             "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={}",
             self.webhook_key
         )
+    }
+
+    /// Install the runtime hook that the channel will invoke after
+    /// persisting a media file. Wired by the orchestrator.
+    pub fn with_file_persisted_hook(
+        mut self,
+        hook: zeroclaw_api::channel::FilePersistedHook,
+    ) -> Self {
+        self.file_persisted_hook = Some(hook);
+        self
     }
 
     /// Check whether `user_id` is on the allowlist for this WeCom channel.
@@ -66,6 +84,12 @@ impl ::zeroclaw_api::attribution::Attributable for WeComChannel {
 
 #[async_trait]
 impl Channel for WeComChannel {
+    fn on_file_persisted(&self, path: &std::path::Path) {
+        if let Some(hook) = &self.file_persisted_hook {
+            hook(path);
+        }
+    }
+
     fn name(&self) -> &str {
         "wecom"
     }

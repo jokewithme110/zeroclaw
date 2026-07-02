@@ -23,9 +23,6 @@ const QQ_MAX_AUDIO_TRANSCRIPTION_BYTES: u64 = 25 * 1024 * 1024;
 
 /// Maximum entries in the upload cache before eviction.
 const UPLOAD_CACHE_CAPACITY: usize = 500;
-type CleanupConfigResolver =
-    Arc<dyn Fn() -> zeroclaw_infra::temp_file_manager::TempFileConfig + Send + Sync>;
-
 /// QQ API media file types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QQMediaFileType {
@@ -303,8 +300,11 @@ pub struct QQChannel {
     dedup: Arc<RwLock<HashSet<String>>>,
     /// Workspace directory for saving downloaded attachments.
     workspace_dir: Option<PathBuf>,
-    /// Resolves cleanup config from canonical state at write-time.
-    cleanup_config_resolver: Option<CleanupConfigResolver>,
+    /// Runtime hook invoked after the channel persists a media
+    /// file. Wired by the orchestrator at construction time; the
+    /// `on_file_persisted` default trait method delegates to this
+    /// when present.
+    file_persisted_hook: Option<zeroclaw_api::channel::FilePersistedHook>,
     /// Upload cache: avoids re-uploading the same file within TTL.
     upload_cache: Arc<RwLock<HashMap<String, UploadCacheEntry>>>,
     /// Per-channel proxy URL override.
@@ -333,7 +333,7 @@ impl QQChannel {
             token_cache: Arc::new(RwLock::new(None)),
             dedup: Arc::new(RwLock::new(HashSet::new())),
             workspace_dir: None,
-            cleanup_config_resolver: None,
+            file_persisted_hook: None,
             upload_cache: Arc::new(RwLock::new(HashMap::new())),
             proxy_url: None,
             transcription_manager: None,
@@ -354,13 +354,15 @@ impl QQChannel {
         self
     }
 
-    /// Resolve cleanup config from canonical state whenever a file is saved.
-    pub fn with_cleanup_config_resolver(mut self, resolver: CleanupConfigResolver) -> Self {
-        self.cleanup_config_resolver = Some(resolver);
+    /// Set a per-channel proxy URL that overrides the global proxy config.
+    pub fn with_file_persisted_hook(
+        mut self,
+        hook: zeroclaw_api::channel::FilePersistedHook,
+    ) -> Self {
+        self.file_persisted_hook = Some(hook);
         self
     }
 
-    /// Set a per-channel proxy URL that overrides the global proxy config.
     pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
         self.proxy_url = proxy_url;
         self
@@ -1025,31 +1027,7 @@ impl QQChannel {
 
         let bytes = resp.bytes().await?.to_vec();
         tokio::fs::write(&dest, &bytes).await?;
-
-        if let (Some(workspace), Some(resolve_cleanup_config)) = (
-            self.workspace_dir.as_deref(),
-            self.cleanup_config_resolver.as_ref(),
-        ) {
-            let cleanup_config = resolve_cleanup_config();
-            if let Err(error) =
-                zeroclaw_infra::temp_file_manager::TempFileManager::trigger_cleanup_by_path(
-                    workspace,
-                    &dest,
-                    &cleanup_config,
-                )
-            {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "file_path": dest.display().to_string(),
-                            "error": error.to_string(),
-                        })),
-                    "Failed to trigger cleanup for downloaded attachment"
-                );
-            }
-        }
+        self.on_file_persisted(&dest);
 
         Ok((dest, bytes))
     }
@@ -1138,6 +1116,12 @@ impl ::zeroclaw_api::attribution::Attributable for QQChannel {
 
 #[async_trait]
 impl Channel for QQChannel {
+    fn on_file_persisted(&self, path: &std::path::Path) {
+        if let Some(hook) = &self.file_persisted_hook {
+            hook(path);
+        }
+    }
+
     fn name(&self) -> &str {
         "qq"
     }

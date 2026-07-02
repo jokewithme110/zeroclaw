@@ -23,9 +23,6 @@ const DINGTALK_USER_BATCH_SEND_URL: &str =
     "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend";
 const DINGTALK_GROUP_SEND_URL: &str = "https://api.dingtalk.com/v1.0/robot/groupMessages/send";
 type DingTalkWsStream = zeroclaw_config::schema::ProxiedWsStream;
-type CleanupConfigResolver =
-    Arc<dyn Fn() -> zeroclaw_infra::temp_file_manager::TempFileConfig + Send + Sync>;
-
 macro_rules! dingtalk_info {
     ($message:expr) => {
         ::zeroclaw_log::record!(
@@ -103,8 +100,9 @@ pub struct DingTalkChannel {
     proxy_url: Option<String>,
     /// Workspace directory for saving downloaded images.
     workspace_dir: Option<PathBuf>,
-    /// Resolves cleanup config from canonical state at write-time.
-    cleanup_config_resolver: Option<CleanupConfigResolver>,
+    /// Runtime hook invoked after the channel persists a media
+    /// file. Wired by the orchestrator at construction time.
+    file_persisted_hook: Option<zeroclaw_api::channel::FilePersistedHook>,
     /// Upload cache: avoids re-uploading the same image within TTL.
     upload_cache: Arc<RwLock<HashMap<String, UploadCacheEntry>>>,
     /// Streaming mode for AI card responses (off/partial).
@@ -183,7 +181,7 @@ impl DingTalkChannel {
             reply_targets: Arc::new(RwLock::new(HashMap::new())),
             proxy_url: None,
             workspace_dir: None,
-            cleanup_config_resolver: None,
+            file_persisted_hook: None,
             upload_cache: Arc::new(RwLock::new(HashMap::new())),
             stream_mode: StreamMode::Off,
             streaming_update_interval_ms: 1000,
@@ -210,12 +208,6 @@ impl DingTalkChannel {
     /// Set a per-channel proxy URL that overrides the global proxy config.
     pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
         self.proxy_url = proxy_url;
-        self
-    }
-
-    /// Resolve cleanup config from canonical state whenever a file is saved.
-    pub fn with_cleanup_config_resolver(mut self, resolver: CleanupConfigResolver) -> Self {
-        self.cleanup_config_resolver = Some(resolver);
         self
     }
 
@@ -975,6 +967,12 @@ impl ::zeroclaw_api::attribution::Attributable for DingTalkChannel {
 
 #[async_trait]
 impl Channel for DingTalkChannel {
+    fn on_file_persisted(&self, path: &std::path::Path) {
+        if let Some(hook) = &self.file_persisted_hook {
+            hook(path);
+        }
+    }
+
     fn name(&self) -> &str {
         "dingtalk"
     }
@@ -1311,6 +1309,16 @@ impl DingTalkChannel {
         self
     }
 
+    /// Install the runtime hook that the channel will invoke after
+    /// persisting a media file. Wired by the orchestrator.
+    pub fn with_file_persisted_hook(
+        mut self,
+        hook: zeroclaw_api::channel::FilePersistedHook,
+    ) -> Self {
+        self.file_persisted_hook = Some(hook);
+        self
+    }
+
     fn existing_local_image_path(image_path: &str) -> Option<&Path> {
         let path = Path::new(image_path);
         if !path.exists() {
@@ -1563,22 +1571,7 @@ impl DingTalkChannel {
                         }),
                         "DingTalk: image saved"
                     );
-                    if let Some(resolve_cleanup_config) = self.cleanup_config_resolver.as_ref() {
-                        let cleanup_config = resolve_cleanup_config();
-                        if let Err(error) = zeroclaw_infra::temp_file_manager::TempFileManager::trigger_cleanup_by_path(
-                            workspace,
-                            &path,
-                            &cleanup_config,
-                        ) {
-                            dingtalk_warn!(
-                                ::serde_json::json!({
-                                    "path": path.display().to_string(),
-                                    "error": error.to_string(),
-                                }),
-                                "DingTalk: cleanup trigger failed after saving image"
-                            );
-                        }
-                    }
+                    self.on_file_persisted(&path);
                     return Some(format!("[IMAGE:{}]", path.display()));
                 }
             }
