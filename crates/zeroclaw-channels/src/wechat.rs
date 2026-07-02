@@ -534,49 +534,57 @@ fn build_base_info() -> serde_json::Value {
     })
 }
 
+/// Filter markdown, aligning with openclaw-weixin's `StreamingMarkdownFilter`.
+///
+/// Preserved: code fences, tables, bold (`**`), italic (`*`, `_`), H1-H4 headings.
+/// Stripped: H5/H6, blockquotes, lists, inline code, strikethrough.
+/// Removed: images. Links become plain text.
 fn markdown_to_plain_text(text: &str) -> String {
-    // TODO: Cache these Regex values instead of compiling them on every send path.
-    let code_block_re = regex::Regex::new(r"```[^\n]*\n?([\s\S]*?)```").unwrap();
+    // Remove images: ![alt](url)
     let image_re = regex::Regex::new(r"!\[[^\]]*\]\([^)]*\)").unwrap();
-    let link_re = regex::Regex::new(r"\[([^\]]+)\]\([^)]*\)").unwrap();
-    let heading_re = regex::Regex::new(r"(?m)^\s{0,3}#{1,6}\s+").unwrap();
-    let blockquote_re = regex::Regex::new(r"(?m)^>\s?").unwrap();
-    let bullet_re = regex::Regex::new(r"(?m)^\s*[-*+]\s+").unwrap();
-    let emphasis_re = regex::Regex::new(r"(\*\*|__|~~|`|\*)").unwrap();
-    let table_separator_re = regex::Regex::new(r"^\|[\s:|-]+\|$").unwrap();
-    let table_row_re = regex::Regex::new(r"^\|(.+)\|$").unwrap();
+    let mut result = image_re.replace_all(text, "").into_owned();
 
-    let mut result = code_block_re.replace_all(text, "$1").into_owned();
-    result = image_re.replace_all(&result, "").into_owned();
+    // Links to text: [text](url) -> text
+    let link_re = regex::Regex::new(r"\[([^\]]+)\]\([^)]*\)").unwrap();
     result = link_re.replace_all(&result, "$1").into_owned();
 
-    let mut lines = Vec::new();
-    for line in result.lines() {
-        if table_separator_re.is_match(line) {
-            continue;
-        }
+    // H5/H6 only: ##### ######
+    let h5_h6_re = regex::Regex::new(r"(?m)^\s{0,3}#{5,6}\s+").unwrap();
+    result = h5_h6_re.replace_all(&result, "").into_owned();
 
-        if let Some(captures) = table_row_re.captures(line) {
-            let inner = captures.get(1).map(|value| value.as_str()).unwrap_or("");
-            lines.push(
-                inner
-                    .split('|')
-                    .map(str::trim)
-                    .filter(|cell| !cell.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("  "),
-            );
-        } else {
-            lines.push(line.to_string());
-        }
-    }
-
-    result = lines.join("\n");
-    result = heading_re.replace_all(&result, "").into_owned();
+    // Blockquotes: >
+    let blockquote_re = regex::Regex::new(r"(?m)^>\s?").unwrap();
     result = blockquote_re.replace_all(&result, "").into_owned();
-    result = bullet_re.replace_all(&result, "").into_owned();
-    result = emphasis_re.replace_all(&result, "").into_owned();
 
+    // Lists: -, *, +
+    let bullet_re = regex::Regex::new(r"(?m)^\s*[-*+]\s+").unwrap();
+    result = bullet_re.replace_all(&result, "").into_owned();
+
+    // Strikethrough: ~~text~~
+    let strike_re = regex::Regex::new(r"~~([^~]+)~~").unwrap();
+    result = strike_re.replace_all(&result, "$1").into_owned();
+
+    // Inline code: `code`
+    let inline_code_re = regex::Regex::new(r"`([^`]+)`").unwrap();
+    result = inline_code_re.replace_all(&result, "$1").into_owned();
+
+    // Bold3: ***text***, ___text___
+    let bold3_re = regex::Regex::new(r"\*\*\*([^*]+)\*\*\*").unwrap();
+    result = bold3_re.replace_all(&result, "$1").into_owned();
+    let ubold3_re = regex::Regex::new(r"___([^_]+)___").unwrap();
+    result = ubold3_re.replace_all(&result, "$1").into_owned();
+
+    // Italic: *text*, _text_
+    let italic_star_re = regex::Regex::new(r"\*([^*]+)\*").unwrap();
+    result = italic_star_re.replace_all(&result, "$1").into_owned();
+    let italic_under_re = regex::Regex::new(r"_([^_]+)_").unwrap();
+    result = italic_under_re.replace_all(&result, "$1").into_owned();
+
+    // Bold: **text**
+    let bold_re = regex::Regex::new(r"\*\*([^*]+)\*\*").unwrap();
+    result = bold_re.replace_all(&result, "$1").into_owned();
+
+    // Normalize newlines
     while result.contains("\n\n\n") {
         result = result.replace("\n\n\n", "\n\n");
     }
