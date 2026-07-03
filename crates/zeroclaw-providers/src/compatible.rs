@@ -3935,7 +3935,7 @@ mod tests {
         assert_eq!(converted[0].role, "tool");
         assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_abc"));
         assert!(matches!(
-            converted[1].content.as_ref(),
+            converted[0].content.as_ref(),
             Some(MessageContent::Text(value)) if value == "done"
         ));
     }

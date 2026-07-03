@@ -13510,6 +13510,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         zeroclaw_runtime::observability::clear_broadcast_hook();
+        drop(_guard);
 
         let hook = Arc::new(RecordingObserver::default());
         let hook_observer: Arc<dyn Observer> = hook.clone();
@@ -15587,7 +15588,7 @@ BTC is currently around $65,000 based on latest tool output."#
         .unwrap();
         drop(tx);
 
-        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 2, None).await;
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 2).await;
 
         // Deterministic concurrency check: the dispatcher should have processed
         // both messages in parallel, so the peak number of simultaneously
@@ -15729,7 +15730,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
         });
 
-        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4, None).await;
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4).await;
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
@@ -15879,7 +15880,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
         });
 
-        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4, None).await;
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4).await;
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
@@ -16032,7 +16033,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
         });
 
-        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4, None).await;
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4).await;
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
@@ -16175,7 +16176,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
         });
 
-        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4, None).await;
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4).await;
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
@@ -21073,7 +21074,7 @@ This is an example JSON object for profile settings."#;
             .unwrap();
         });
 
-        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4, None).await;
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4).await;
         send_task.await.unwrap();
 
         // Both tasks should have completed — different threads, no cancellation.

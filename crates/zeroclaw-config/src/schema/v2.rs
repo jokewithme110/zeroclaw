@@ -114,6 +114,9 @@ pub const V3_CHANNEL_TYPES: &[&str] = &[
     "voice_duplex",
     "mqtt",
     "amqp",
+    "bot_service",
+    "ict",
+    "webchat",
 ];
 
 impl V2Config {

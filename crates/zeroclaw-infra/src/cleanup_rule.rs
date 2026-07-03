@@ -24,8 +24,13 @@ pub fn is_protected_path(_workspace_root: &Path, rel_path: &str) -> bool {
         }
     }
 
-    // 绝对路径绕过 workspace 约束，禁止作为清理目录。
+    // Absolute path bypass workspace constraint, disallowed as cleanup target.
     if rel_path.starts_with('/') {
+        return true;
+    }
+
+    // Directory traversal attempts bypass workspace, disallowed.
+    if normalized.contains("..") {
         return true;
     }
 

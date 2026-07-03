@@ -804,6 +804,7 @@ action = "deny"
                 status: "connected".to_string(),
                 capabilities: vec!["flashlight.turnOn".to_string(), "camera.snap".to_string()],
                 meta: Some(raw_node_meta()),
+                events: None,
             }],
             described: None,
             invoke_count: AtomicUsize::new(0),
@@ -870,6 +871,7 @@ action = "deny"
             status: "connected".to_string(),
             capabilities: vec!["flashlight.turnOn".to_string(), "camera.snap".to_string()],
             meta: Some(raw_node_meta()),
+            events: None,
         };
         let registry = Arc::new(MockNodeRegistry {
             nodes: vec![NodeInfo {
@@ -877,6 +879,7 @@ action = "deny"
                 status: "connected".to_string(),
                 capabilities: vec!["flashlight.turnOn".to_string(), "camera.snap".to_string()],
                 meta: Some(raw_node_meta()),
+                events: None,
             }],
             described: Some(described),
             invoke_count: AtomicUsize::new(0),
@@ -934,6 +937,7 @@ action = "allow"
                 status: "connected".to_string(),
                 capabilities: vec!["flashlight.turnOn".to_string(), "camera.snap".to_string()],
                 meta: Some(raw_node_meta()),
+                events: None,
             }],
             described: None,
             invoke_count: AtomicUsize::new(0),
@@ -988,6 +992,7 @@ action = "allow"
                 status: "connected".to_string(),
                 capabilities: vec!["flashlight.turnOn".to_string(), "camera.snap".to_string()],
                 meta: Some(raw_node_meta()),
+                events: None,
             }],
             described: None,
             invoke_count: AtomicUsize::new(0),

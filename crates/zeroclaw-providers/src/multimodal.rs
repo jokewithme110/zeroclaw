@@ -257,6 +257,34 @@ fn count_image_markers_with_latest_tool_results(
         .sum()
 }
 
+/// Like [`count_image_markers_with_latest_tool_results`] but excludes images
+/// that will definitively be skipped (e.g. remote URLs when
+/// `allow_remote_fetch` is false), so they do not consume the image budget
+/// during pre-trim.
+fn count_loadable_image_markers(
+    messages: &[ChatMessage],
+    latest_tool_result_indices: &HashSet<usize>,
+    config: &MultimodalConfig,
+) -> usize {
+    messages
+        .iter()
+        .enumerate()
+        .filter(|(index, message)| {
+            should_normalize_message_images(*index, message, latest_tool_result_indices)
+        })
+        .map(|(_, message)| {
+            parse_image_markers(&message.content)
+                .1
+                .iter()
+                .filter(|source| {
+                    let is_remote = source.starts_with("http://") || source.starts_with("https://");
+                    !is_remote || config.allow_remote_fetch
+                })
+                .count()
+        })
+        .sum()
+}
+
 pub fn contains_image_markers(messages: &[ChatMessage]) -> bool {
     count_image_markers(messages) > 0
 }
@@ -489,9 +517,18 @@ async fn prepare_messages_inner(
     let max_bytes = max_image_size_mb.saturating_mul(1024 * 1024);
 
     let latest_tool_indices = latest_tool_result_indices(messages);
-    let total_images = count_image_markers_with_latest_tool_results(messages, &latest_tool_indices);
+    // Raw marker count drives the no-op early exit: even markers that will
+    // ultimately be skipped (e.g. remote URLs with `allow_remote_fetch`
+    // disabled) must still flow through per-message normalization so the
+    // raw reference is stripped and a "could not be loaded" note is
+    // appended. The loadable count below is used only for the image-budget
+    // trim decision, where definitively-skipped markers must not consume
+    // the limit.
+    let total_image_markers =
+        count_image_markers_with_latest_tool_results(messages, &latest_tool_indices);
+    let total_images = count_loadable_image_markers(messages, &latest_tool_indices, config);
 
-    if total_images == 0 {
+    if total_image_markers == 0 {
         return Ok(PreparedMessages {
             messages: messages
                 .iter()

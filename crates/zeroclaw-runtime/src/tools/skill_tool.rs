@@ -141,10 +141,20 @@ impl Tool for SkillShellTool {
             });
         }
 
-        // Build and execute the command
+        // Build and execute the command. Prefer the skill's own directory so
+        // commands that operate on skill-local files run in the right cwd, but
+        // fall back to the workspace when that directory does not (yet) exist
+        // — otherwise `current_dir` on a missing path makes the shell fail to
+        // spawn, which silently breaks both freshly-referenced and removed
+        // skills.
+        let work_dir = if self.execution_dir.is_dir() {
+            &self.execution_dir
+        } else {
+            &self.security.workspace_dir
+        };
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c").arg(&command);
-        cmd.current_dir(&self.execution_dir);
+        cmd.current_dir(work_dir);
         cmd.env_clear();
 
         // Only pass safe environment variables
@@ -383,7 +393,7 @@ mod tests {
 
     #[test]
     fn skill_shell_tool_name_is_prefixed() {
-        let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security());
+        let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security(), None);
         assert_eq!(tool.name(), "my_skill__run_lint");
     }
 
@@ -570,6 +580,9 @@ mod tests {
             args: HashMap::new(),
             target: Some("shell".to_string()),
             locked_args: HashMap::new(),
+            method: None,
+            headers: HashMap::new(),
+            body: None,
         }
     }
 
@@ -722,6 +735,9 @@ mod tests {
             args: HashMap::new(),
             target: Some("composio".to_string()),
             locked_args: locked.clone(),
+            method: None,
+            headers: HashMap::new(),
+            body: None,
         };
         let tool = SkillBuiltinTool::new("my_skill", &st, target, locked);
         // Caller passes only "input"; locked args provide action_name + app.
@@ -787,6 +803,9 @@ mod tests {
             args: HashMap::new(),
             target: Some(target.to_string()),
             locked_args: locked,
+            method: None,
+            headers: HashMap::new(),
+            body: None,
         }
     }
 
@@ -926,6 +945,9 @@ mod tests {
                 args: HashMap::new(),
                 target: Some("shell".to_string()),
                 locked_args: HashMap::new(),
+                method: None,
+                headers: HashMap::new(),
+                body: None,
             }],
             prompts: vec![],
             location: None,

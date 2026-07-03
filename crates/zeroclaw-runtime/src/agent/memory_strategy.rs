@@ -244,8 +244,10 @@ mod tests {
 
     #[test]
     fn resolves_to_default_when_strategy_is_literal_default() {
-        let mut cfg = MemoryConfig::default();
-        cfg.strategy = Some("default".to_string());
+        let cfg = MemoryConfig {
+            strategy: Some("default".to_string()),
+            ..MemoryConfig::default()
+        };
         let strategy = resolve_memory_strategy(cfg, none_memory(), std::path::PathBuf::new(), 5);
         let _ = strategy;
     }
@@ -255,8 +257,10 @@ mod tests {
         // Names a plugin strategy that isn't registered. With no global
         // registry installed (or the name absent), the resolver must log a
         // warning and fall back to the default rather than panic.
-        let mut cfg = MemoryConfig::default();
-        cfg.strategy = Some("definitely-not-registered".to_string());
+        let cfg = MemoryConfig {
+            strategy: Some("definitely-not-registered".to_string()),
+            ..MemoryConfig::default()
+        };
         let strategy = resolve_memory_strategy(cfg, none_memory(), std::path::PathBuf::new(), 5);
         let _ = strategy;
     }

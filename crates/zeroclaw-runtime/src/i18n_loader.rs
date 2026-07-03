@@ -25,10 +25,16 @@ pub fn format_ftl_messages(ftl_source: &str, locale: &str) -> HashMap<String, St
             && let Some(pattern) = message.value()
         {
             let mut errors = vec![];
+            // Format without external args. Messages that reference variables
+            // (e.g. `{ $provider }`) still resolve to a usable value with the
+            // missing references rendered as their fallback; the resolver reports
+            // these as non-fatal `errors` rather than aborting. Dropping such keys
+            // here would silently omit every parameterized error string from the
+            // pre-formatted lookup map, so insert the value regardless of
+            // non-fatal resolver warnings.
             let value = bundle.format_pattern(pattern, None, &mut errors);
-            if errors.is_empty() {
-                map.insert(identifier.to_string(), value.into_owned());
-            }
+            let _ = errors;
+            map.insert(identifier.to_string(), value.into_owned());
         }
     }
     map

@@ -841,9 +841,14 @@ api_token = "{encrypted}"
 
     #[tokio::test]
     async fn execute_sends_auth_secret_as_authorization_header() {
-        let listener = match tokio::net::TcpListener::bind("[::1]:0").await {
+        // Bind on IPv4 loopback so the request is not captured by an
+        // environment HTTP proxy: operators' `NO_PROXY` lists almost always
+        // cover `127.0.0.1` but frequently omit the IPv6 loopback `::1`,
+        // which would route the tool's request through the proxy and prevent
+        // the in-process server from ever observing it.
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
             Ok(l) => l,
-            Err(_) => return, // IPv6 loopback is unavailable in this environment.
+            Err(_) => return, // loopback is unavailable in this environment.
         };
         let port = listener.local_addr().unwrap().port();
         let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
@@ -880,7 +885,7 @@ api_token = "Bearer from-secret"
         .unwrap();
         let tool = HttpRequestTool::new_with_config(
             security,
-            vec!["::1".into()],
+            vec!["127.0.0.1".into()],
             1_000_000,
             5,
             true,
@@ -893,7 +898,7 @@ api_token = "Bearer from-secret"
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             tool.execute(json!({
-                "url": format!("http://[::1]:{port}/"),
+                "url": format!("http://127.0.0.1:{port}/"),
                 "auth_secret": "api_token",
                 "headers": {
                     "Authorization": "Bearer literal"

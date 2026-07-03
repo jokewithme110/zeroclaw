@@ -679,7 +679,10 @@ fn build_native_assistant_history(
     let content = if text.trim().is_empty() {
         serde_json::Value::Null
     } else {
-        serde_json::Value::String(text.trim().to_string())
+        // Strip inline `<think>` scratchpads from persisted content; reasoning
+        // is preserved separately via `reasoning_content` and must not leak
+        // into the assistant text that downstream turns re-read (issue #7254).
+        serde_json::Value::String(strip_think_tags(text).trim().to_string())
     };
 
     let mut obj = serde_json::json!({
@@ -1960,7 +1963,11 @@ pub async fn run_tool_call_loop(
 
         // Unified path via ModelProvider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
-        let request_tools = if !tool_specs.is_empty() {
+        // Attach native tool specs only when the provider actually supports
+        // native tools; otherwise the model emits tool calls as text and the
+        // request must not advertise a `tools` field (which would also wrongly
+        // disable text-mode streaming via the gating below).
+        let request_tools = if use_native_tools {
             Some(tool_specs.as_slice())
         } else {
             None
@@ -2150,11 +2157,11 @@ pub async fn run_tool_call_loop(
                     output_tool_calls_json: serde_json::to_string(&resp.tool_calls).ok(),
                 });
 
-                let response_text = if tool_specs.is_empty() {
-                    strip_think_tags(resp.text_or_empty())
-                } else {
-                    resp.text_or_empty().to_string()
-                };
+                // Always strip private `<think>` scratchpads from the response
+                // text: reasoning is carried separately via `reasoning_content`,
+                // and think tags must never reach user-facing output, history,
+                // or downstream tool-call text parsing (issue #7254).
+                let response_text = strip_think_tags(resp.text_or_empty());
                 // First try native structured tool calls (OpenAI-format).
                 // Fall back to text-based parsing (XML tags, markdown blocks,
                 // GLM format) only if the model_provider returned no native calls —
@@ -2439,9 +2446,8 @@ pub async fn run_tool_call_loop(
             if !tool_calls.is_empty() {
                 let _ = tx
                     .send(StreamDelta::Status(format!(
-                        "\u{1f4ac} 我需要先调用 {} 个工具来获取更多信息 , (本次推理耗时 {} 秒)\n",
+                        "\u{1f4ac} Got {} tool call(s) ({llm_secs}s)\n",
                         tool_calls.len(),
-                        llm_secs
                     )))
                     .await;
             }
@@ -2506,13 +2512,15 @@ pub async fn run_tool_call_loop(
         // the structured call payload; relay it to draft-capable channels.
         if !display_text.is_empty() {
             if !native_tool_calls.is_empty()
-                && let Some(ref _tx) = on_delta
+                && let Some(ref tx) = on_delta
             {
-                let mut narration = display_text.clone();
+                // Sanitize before relay so private `<think>` scratchpads
+                // never reach draft-capable channels (issue #7254).
+                let mut narration = strip_think_tags(&display_text);
                 if !narration.ends_with('\n') {
                     narration.push('\n');
                 }
-                // let _ = tx.send(StreamDelta::Text(narration)).await;
+                let _ = tx.send(StreamDelta::Text(narration)).await;
             }
             if !silent {
                 print!("{display_text}");
@@ -3171,10 +3179,10 @@ pub async fn run_tool_call_loop(
         WARN,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-            .with_attrs(::serde_json::json!({"error": "Agent exceeded maximum tool iterations"})),
-        "Agent exceeded maximum tool iterations"
+            .with_attrs(::serde_json::json!({"error": format!("Agent exceeded maximum tool iterations ({max_iterations})")})),
+        format!("Agent exceeded maximum tool iterations ({max_iterations})")
     );
-    anyhow::bail!("Agent exceeded maximum tool iterations")
+    anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
 }
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -5433,6 +5441,7 @@ mod tests {
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
     use crate::agent::tool_execution::execute_one_tool;
     use tempfile::tempdir;
+    use zeroclaw_config::schema::ModelPricing;
     use zeroclaw_providers::ChatMessage;
     use zeroclaw_tool_call_parser::parse_tool_calls;
 
@@ -9636,7 +9645,9 @@ This is an example, not an invocation."#;
         assert!(!result.contains("<think>"));
         assert!(
             deltas.iter().all(|delta| match delta {
-                StreamDelta::Status(text) | StreamDelta::Text(text) =>
+                StreamDelta::Status(text)
+                | StreamDelta::Text(text)
+                | StreamDelta::Reasoning(text) =>
                     !text.contains("private chain of thought") && !text.contains("<think>"),
             }),
             "draft deltas must not expose inline think tags: {deltas:?}"
@@ -9714,6 +9725,7 @@ This is an example, not an invocation."#;
         while let Some(delta) = rx.recv().await {
             match delta {
                 StreamDelta::Status(_) => {}
+                StreamDelta::Reasoning(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -9787,6 +9799,7 @@ This is an example, not an invocation."#;
         while let Some(delta) = rx.recv().await {
             match delta {
                 StreamDelta::Status(_) => {}
+                StreamDelta::Reasoning(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -10582,7 +10595,13 @@ This is an example, not an invocation."#;
 
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
-            visible_deltas.push_str(&text);
+            match delta {
+                StreamDelta::Status(_) => {}
+                StreamDelta::Reasoning(_) => {}
+                StreamDelta::Text(text) => {
+                    visible_deltas.push_str(&text);
+                }
+            }
         }
 
         assert!(outcome.response_text.contains("\"toolcalls\""));
@@ -12375,7 +12394,7 @@ Let me check the result."#;
         };
         let observer = NoopObserver;
         let workspace = tempfile::TempDir::new().unwrap();
-        let cost_config = zeroclaw_config::schema::CostConfig {
+        let mut cost_config = zeroclaw_config::schema::CostConfig {
             enabled: true,
             ..zeroclaw_config::schema::CostConfig::default()
         };

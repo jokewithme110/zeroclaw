@@ -278,8 +278,8 @@ impl DingTalkChannel {
     /// Docs: https://open.dingtalk.com/document/orgapp/interface-for-creating-a-card-instance
     async fn send_ai_card(&self, recipient: &str, initial_content: &str) -> anyhow::Result<String> {
         let template_id = self.ai_card_template_id.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "AI card template ID not configured. Use with_ai_card_template() to set it."
+            anyhow::Error::msg(
+                "AI card template ID not configured. Use with_ai_card_template() to set it.",
             )
         })?;
 
@@ -312,7 +312,7 @@ impl DingTalkChannel {
         });
         let obj = create_body
             .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("DingTalk: create_body must be a JSON object"))?;
+            .ok_or_else(|| anyhow::Error::msg("DingTalk: create_body must be a JSON object"))?;
         if is_group {
             obj.insert(
                 "imGroupOpenSpaceModel".into(),
@@ -496,7 +496,7 @@ impl DingTalkChannel {
     ///   buffer; we never use incremental updates because LLM tokens
     ///   can interleave with tool calls in non-monotonic ways.
     /// - `isFinalize=true` closes the card (triggers the "Done" reaction).
-    /// Docs: https://open.dingtalk.com/document/development/api-streamingupdate
+    ///   Docs: https://open.dingtalk.com/document/development/api-streamingupdate
     async fn streaming_update_card(
         &self,
         card_instance_id: &str,

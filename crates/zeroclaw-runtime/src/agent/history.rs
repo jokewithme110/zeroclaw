@@ -403,12 +403,19 @@ pub fn trim_history(
 
     let messages_before = history.len();
 
-    let target_keep =
-        effective_recent_history_keep(max_history, recent_keep).unwrap_or(max_history);
+    let explicit_keep = effective_recent_history_keep(max_history, recent_keep);
+    let target_keep = explicit_keep.unwrap_or(max_history);
     let dropped_range = match anchor_idx {
         Some(anchor) if target_keep >= 2 => {
-            // Reserve one slot for the anchor; keep `target_keep - 1` most recent.
-            let tail_keep = target_keep - 1;
+            // Reserve one slot for the anchor when deriving the tail window
+            // from `max_history`. An explicit `recent_keep`, however, is a
+            // trailing-message budget on top of the anchor (see the
+            // "generational" eviction contract), so use it verbatim instead
+            // of subtracting the anchor slot again.
+            let tail_keep = match explicit_keep {
+                Some(explicit) => explicit,
+                None => target_keep - 1,
+            };
             let tail_start = history.len().saturating_sub(tail_keep);
             // Middle range to drop: (anchor + 1) .. tail_start.
             let drop_start = anchor + 1;

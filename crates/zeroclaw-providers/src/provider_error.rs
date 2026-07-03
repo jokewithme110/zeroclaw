@@ -284,15 +284,15 @@ mod tests {
 
     #[test]
     fn classify_auth_failed_401() {
-        let err = anyhow::anyhow!(
-            "Anthropic API error (401 Unauthorized): authentication_error: invalid x-api-key"
+        let err = anyhow::Error::msg(
+            "Anthropic API error (401 Unauthorized): authentication_error: invalid x-api-key",
         );
         assert_eq!(classify_provider_error(&err), ProviderErrorKind::AuthFailed);
     }
 
     #[test]
     fn classify_rate_limited_429() {
-        let err = anyhow::anyhow!("429 Too Many Requests: rate limit reached");
+        let err = anyhow::Error::msg("429 Too Many Requests: rate limit reached");
         assert_eq!(
             classify_provider_error(&err),
             ProviderErrorKind::RateLimited
@@ -301,7 +301,7 @@ mod tests {
 
     #[test]
     fn classify_quota_exceeded_business_error() {
-        let err = anyhow::anyhow!("429: insufficient_quota, please check billing");
+        let err = anyhow::Error::msg("429: insufficient_quota, please check billing");
         assert_eq!(
             classify_provider_error(&err),
             ProviderErrorKind::QuotaExceeded
@@ -310,7 +310,7 @@ mod tests {
 
     #[test]
     fn classify_model_not_found() {
-        let err = anyhow::anyhow!("The model 'gpt-5' does not exist");
+        let err = anyhow::Error::msg("The model 'gpt-5' does not exist");
         assert_eq!(
             classify_provider_error(&err),
             ProviderErrorKind::ModelNotFound
@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn classify_network_error_send_request() {
-        let err = anyhow::anyhow!("reqwest error: error sending request for url");
+        let err = anyhow::Error::msg("reqwest error: error sending request for url");
         assert_eq!(
             classify_provider_error(&err),
             ProviderErrorKind::NetworkError
@@ -342,14 +342,14 @@ mod tests {
 
     #[test]
     fn classify_timeout_error() {
-        let err = anyhow::anyhow!("LLM inference step timed out after 30s");
+        let err = anyhow::Error::msg("LLM inference step timed out after 30s");
         assert_eq!(classify_provider_error(&err), ProviderErrorKind::Timeout);
     }
 
     #[test]
     fn classify_context_window_exceeded() {
-        let err = anyhow::anyhow!(
-            "OpenAI Codex stream error: Your input exceeds the context window of this model."
+        let err = anyhow::Error::msg(
+            "OpenAI Codex stream error: Your input exceeds the context window of this model.",
         );
         assert_eq!(
             classify_provider_error(&err),
@@ -359,14 +359,14 @@ mod tests {
 
     #[test]
     fn timeout_is_not_classified_as_network_error() {
-        let err = anyhow::anyhow!("request timed out while waiting for upstream response");
+        let err = anyhow::Error::msg("request timed out while waiting for upstream response");
         assert!(is_timeout_error(&err));
         assert!(!is_network_error(&err));
     }
 
     #[test]
     fn classify_server_error_500() {
-        let err = anyhow::anyhow!("Anthropic API error (500 Internal Server Error)");
+        let err = anyhow::Error::msg("Anthropic API error (500 Internal Server Error)");
         assert_eq!(
             classify_provider_error(&err),
             ProviderErrorKind::ServerError
@@ -375,7 +375,7 @@ mod tests {
 
     #[test]
     fn classify_gateway_timeout_as_server_error() {
-        let err = anyhow::anyhow!("504 Gateway Timeout");
+        let err = anyhow::Error::msg("504 Gateway Timeout");
         assert_eq!(
             classify_provider_error(&err),
             ProviderErrorKind::ServerError

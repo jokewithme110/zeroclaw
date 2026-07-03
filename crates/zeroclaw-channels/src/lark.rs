@@ -5587,6 +5587,7 @@ mod tests {
         assert_eq!(LARK_IMAGE_MAX_BYTES, 10 * 1024 * 1024);
     }
 
+    #[test]
     fn lark_image_resource_url_matches_region() {
         let ch = make_channel();
         assert_eq!(

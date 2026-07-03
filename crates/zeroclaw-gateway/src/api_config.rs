@@ -2332,7 +2332,7 @@ mod tests {
         // does NOT mint/rotate/persist it itself, so legitimate drift between
         // disk and memory IS surfaceable. Empty for now — `paired_tokens` is
         // the only `[gateway]` secret and it's gateway-managed.
-        const OPERATOR_EDITED_GATEWAY_SECRETS: &[&str] = &[];
+        const OPERATOR_EDITED_GATEWAY_SECRETS: &[&str] = &["gateway.node_control.auth_token"];
 
         let cfg = zeroclaw_config::schema::Config::default();
         let unclassified: Vec<String> = cfg

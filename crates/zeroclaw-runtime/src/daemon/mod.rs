@@ -1600,6 +1600,9 @@ mod tests {
                 client_secret: "client_secret".into(),
                 proxy_url: None,
                 excluded_tools: vec![],
+                stream_mode: zeroclaw_config::schema::StreamMode::default(),
+                streaming_update_interval_ms: 500,
+                ai_card_template_id: None,
             },
         );
         assert!(has_supervised_channels(&config));

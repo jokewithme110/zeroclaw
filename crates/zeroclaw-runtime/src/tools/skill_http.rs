@@ -57,6 +57,32 @@ impl SkillHttpTool {
             required.push(serde_json::Value::String(name.clone()));
         }
 
+        // Advertise the HTTP control fields the tool also accepts at runtime
+        // (parsed by `parse_method` / `parse_headers` / the body substitution
+        // path). They are optional: `method` defaults to GET and `headers` /
+        // `body` are only sent when provided.
+        properties.insert(
+            "method".to_string(),
+            serde_json::json!({
+                "type": "string",
+                "description": "HTTP method (GET, POST, PUT, DELETE, ...). Defaults to GET."
+            }),
+        );
+        properties.insert(
+            "headers".to_string(),
+            serde_json::json!({
+                "type": "object",
+                "description": "Additional HTTP headers to send with the request."
+            }),
+        );
+        properties.insert(
+            "body".to_string(),
+            serde_json::json!({
+                "type": ["object", "string"],
+                "description": "Optional request body. May be a JSON object or a template string with {{arg}} placeholders."
+            }),
+        );
+
         serde_json::json!({
             "type": "object",
             "properties": properties,
@@ -496,6 +522,8 @@ mod tests {
             kind: "http".to_string(),
             command: "https://api.example.com/{{tenant}}/items".to_string(),
             args: HashMap::new(),
+            target: None,
+            locked_args: HashMap::new(),
             method: Some("{{verb}}".to_string()),
             headers,
             body: Some(serde_json::json!({

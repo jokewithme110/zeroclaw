@@ -45,18 +45,15 @@ impl HookRunner {
         #[cfg(feature = "plugins-wasm")]
         {
             use crate::hooks::wasm::WasmHook;
-            match zeroclaw_plugins::host::PluginHost::new(workspace_dir) {
-                Ok(host) => {
-                    let details = host.hook_plugin_details();
-                    for (manifest, wasm_path) in details {
-                        self.register(Box::new(WasmHook::from_wasm(
-                            wasm_path.to_path_buf(),
-                            manifest.permissions.clone(),
-                            manifest.name.clone(),
-                        )));
-                    }
+            if let Ok(host) = zeroclaw_plugins::host::PluginHost::new(workspace_dir) {
+                let details = host.hook_plugin_details();
+                for (manifest, wasm_path) in details {
+                    self.register(Box::new(WasmHook::from_wasm(
+                        wasm_path.to_path_buf(),
+                        manifest.permissions.clone(),
+                        manifest.name.clone(),
+                    )));
                 }
-                Err(_) => {}
             }
         }
         self

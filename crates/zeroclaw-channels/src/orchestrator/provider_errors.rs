@@ -51,7 +51,7 @@ mod tests {
 
     #[test]
     fn timeout_renders_parameterized_message() {
-        let err = anyhow::anyhow!("LLM inference step timed out after 30s");
+        let err = anyhow::Error::msg("LLM inference step timed out after 30s");
         let render_ctx = ProviderErrorRenderContext {
             provider: "DeepSeek",
             model: "deepseek-chat",
@@ -65,7 +65,7 @@ mod tests {
 
     #[test]
     fn unknown_error_uses_friendly_fallback() {
-        let err = anyhow::anyhow!("raw internal stack trace details should not leak");
+        let err = anyhow::Error::msg("raw internal stack trace details should not leak");
         let render_ctx = ProviderErrorRenderContext {
             provider: "DeepSeek",
             model: "deepseek-chat",
@@ -79,7 +79,7 @@ mod tests {
 
     #[test]
     fn provider_ref_alias_is_not_shown_to_users() {
-        let err = anyhow::anyhow!("429: insufficient_quota, please check billing");
+        let err = anyhow::Error::msg("429: insufficient_quota, please check billing");
         let render_ctx = ProviderErrorRenderContext {
             provider: "deepseek.default",
             model: "deepseek-v4-flash",

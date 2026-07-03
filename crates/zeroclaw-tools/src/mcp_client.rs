@@ -704,6 +704,7 @@ done
             transport: McpTransport::Stdio,
             url: None,
             headers: std::collections::HashMap::default(),
+            danger_accept_invalid_certs: false,
         };
 
         let registry = McpRegistry::connect_all(&[config])

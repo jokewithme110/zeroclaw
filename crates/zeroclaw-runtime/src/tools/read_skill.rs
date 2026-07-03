@@ -362,7 +362,7 @@ description = "Ship safely"
     #[tokio::test]
     async fn reads_plugin_builtin_skill_by_qualified_name() {
         use tempfile::TempDir;
-        use zeroclaw_config::schema::{AliasedAgentConfig, PluginSecurityConfig, PluginsConfig};
+        use zeroclaw_config::schema::{PluginSecurityConfig, PluginsConfig};
 
         let tmp = TempDir::new().unwrap();
 
@@ -404,10 +404,7 @@ capabilities = ["skill"]
         };
 
         // Ensure the "default" agent exists so load_skills_for_agent can resolve bundles
-        config
-            .agents
-            .entry("default".to_string())
-            .or_insert_with(AliasedAgentConfig::default);
+        config.agents.entry("default".to_string()).or_default();
 
         let tool = ReadSkillTool::new(
             Arc::new(config),

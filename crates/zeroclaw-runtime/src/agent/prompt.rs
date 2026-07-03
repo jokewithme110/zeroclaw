@@ -488,7 +488,7 @@ mod tests {
             model_name: "test-model",
             tools: &tools,
             skills: &skills,
-            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
+            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: false,

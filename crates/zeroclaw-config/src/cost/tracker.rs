@@ -1212,7 +1212,7 @@ mod tests {
         writeln!(file).unwrap();
         file.sync_all().unwrap();
 
-        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let tracker = CostTracker::new(config_with_timezone("UTC"), tmp.path()).unwrap();
         let today_cost = tracker.get_daily_cost(Utc::now().date_naive()).unwrap();
         assert!((today_cost - valid_usage.cost_usd).abs() < f64::EPSILON);
     }

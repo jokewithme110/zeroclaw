@@ -452,6 +452,8 @@ mod tests {
                 channel: None,
                 agent_alias: None,
                 turn_id: None,
+                input_json: None,
+                input_tools_json: None,
             },
             ObserverEvent::ToolCall {
                 tool: "shell".into(),

@@ -3059,6 +3059,10 @@ mod tests {
     fn denied_group_message_mentions_chatid_and_userid() {
         let inbound = test_inbound("group", Some("zeroclaw_group"), "zeroclaw_user");
         let text = build_access_denied_message(&inbound, AccessDecision::Denied, "primary");
+        // The denied message must surface the raw platform chatid/userid
+        // verbatim — they are operator-actionable identifiers the admin copies
+        // into allowed_groups/allowed_users, so they must NOT be brand-rewritten
+        // (which would corrupt the real WeCom id).
         assert!(text.contains("zeroclaw_group"));
         assert!(text.contains("zeroclaw_user"));
         assert!(text.contains("allowed_groups"));
@@ -3481,6 +3485,8 @@ mod tests {
         );
 
         let denied = responder.await.unwrap();
+        // Raw platform identifiers must appear verbatim (see
+        // denied_group_message_mentions_chatid_and_userid).
         assert!(denied.contains("zeroclaw_group"));
         assert!(denied.contains("zeroclaw_user"));
         assert!(denied.contains("allowed_groups"));

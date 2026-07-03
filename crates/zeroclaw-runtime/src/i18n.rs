@@ -249,11 +249,15 @@ fn format_cli_string_with_args(
 /// localised strings track the brand without needing per-key placeholder
 /// rewriting in every locale. Runs after Fluent substitution, so existing
 /// `{$product_name}` callers and hardcoded literals both end up consistent.
-fn apply_brand_replacements(mut s: String) -> String {
-    let brand = zeroclaw_api::branding::bin_name();
-    s = s.replace("zeroclaw", &brand);
-    s = s.replace("ZeroClaw", &brand);
-    s
+fn apply_brand_replacements(s: String) -> String {
+    // Delegate to the canonical branding rewriter rather than reimplementing
+    // it. `branding::rewrite` is a no-op under the default brand values
+    // (BRAND="ZeroClaw", BRAND_SLUG="zeroclaw") and otherwise maps each literal
+    // to its correct casing/slug (display name, slug, env prefix). The previous
+    // inline implementation unconditionally rewrote lowercase `zeroclaw` to the
+    // display name even under defaults, which capitalised CLI command strings
+    // (`zeroclaw skills …`) and diverged from the documented contract.
+    zeroclaw_api::branding::rewrite(&s).into_owned()
 }
 
 fn load_ftl_from_disk(locale: &str, filename: &str) -> Option<String> {
@@ -329,6 +333,18 @@ pub fn normalize_locale(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::i18n_loader::{format_ftl_message, format_ftl_messages};
+    use std::sync::{Mutex, OnceLock};
+
+    /// Serializes env-mutating `detect_locale` tests (see usage sites).
+    static LOCALE_ENV_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn locale_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        LOCALE_ENV_GUARD
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap()
+    }
 
     #[test]
     fn english_descriptions_are_embedded() {
@@ -668,6 +684,11 @@ mod tests {
 
     #[test]
     fn detect_locale_uses_locale_env_fallbacks() {
+        // Both `detect_locale_*` tests mutate the process-wide ZEROCLAW_LOCALE
+        // (and one of them ZEROCLAW_CONFIG_DIR) env vars. Under the default
+        // parallel test executor they overwrite each other and race the
+        // `detect_locale()` read. Serialize them so each observes a stable env.
+        let _guard = locale_env_lock();
         let previous = std::env::var("ZEROCLAW_LOCALE").ok();
         // SAFETY: test mutates process env in a controlled scope.
         unsafe { std::env::set_var("ZEROCLAW_LOCALE", "zh_CN.UTF-8") };
@@ -686,6 +707,7 @@ mod tests {
 
     #[test]
     fn detect_locale_prefers_config_dir_profile_before_env_locale() {
+        let _guard = locale_env_lock();
         let temp = tempfile::tempdir().expect("tempdir");
         let config_dir = temp.path().join("profile-a");
         std::fs::create_dir_all(&config_dir).expect("config dir");

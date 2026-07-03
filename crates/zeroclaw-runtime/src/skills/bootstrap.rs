@@ -490,9 +490,11 @@ mod tests {
 
     fn fixture() -> (TempDir, Config) {
         let dir = tempfile::tempdir().unwrap();
-        let mut cfg = Config::default();
-        cfg.config_path = dir.path().join("config.toml");
-        cfg.data_dir = dir.path().join("data");
+        let cfg = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Config::default()
+        };
         (dir, cfg)
     }
 

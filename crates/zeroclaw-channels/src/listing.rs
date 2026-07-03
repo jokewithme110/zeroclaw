@@ -198,6 +198,25 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         type_keys: &["acp-server", "acp_server"],
         compiled: cfg!(feature = "channel-acp-server"),
     },
+    ChannelCompileSpec {
+        schema_name: None,
+        type_keys: &["webchat"],
+        // `webchat` is compiled unconditionally (`pub mod webchat` in lib.rs),
+        // so it is always available — not gated on a feature.
+        compiled: true,
+    },
+    ChannelCompileSpec {
+        schema_name: None,
+        type_keys: &["bot-service", "bot_service"],
+        // `bot_service` is compiled unconditionally (`pub mod bot_service` in
+        // lib.rs), so it is always available — not gated on a feature.
+        compiled: true,
+    },
+    ChannelCompileSpec {
+        schema_name: None,
+        type_keys: &["ict"],
+        compiled: cfg!(feature = "channel-ict"),
+    },
 ];
 
 fn compiled_channel_names() -> impl Iterator<Item = &'static str> {

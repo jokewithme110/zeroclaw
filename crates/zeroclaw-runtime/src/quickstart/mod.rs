@@ -1508,7 +1508,18 @@ fn materialize_default_skills_bundle(config: &mut Config) {
     // create_map_key returns Ok(false) on existing key (idempotent),
     // Ok(true) on insertion. We don't propagate the error: the FTUE
     // bundle is best-effort and the operator can configure one later.
-    let _ = config.create_map_key("skill-bundles", "default");
+    // The section path must match the `Configurable` field name verbatim
+    // (`snake_to_kebab` is an identity passthrough), i.e. `skill_bundles`,
+    // not the TOML-style `skill-bundles` hyphen form. The freshly inserted
+    // entry must also be marked dirty so `save_dirty` persists it across
+    // reload (mirroring `write_risk_preset`); otherwise an empty default
+    // bundle survives in memory but is dropped on the next load.
+    if config
+        .create_map_key("skill_bundles", "default")
+        .unwrap_or(false)
+    {
+        config.mark_dirty("skill_bundles.default");
+    }
 }
 
 // ── Agent ──────────────────────────────────────────────────────────
@@ -1577,7 +1588,7 @@ fn apply_agent(
         }
     }
     if config.skill_bundles.contains_key("default") {
-        let path = format!("{prefix}.skill-bundles");
+        let path = format!("{prefix}.skill_bundles");
         if let Err(err) = config.set_prop_persistent(&path, "[\"default\"]") {
             errors.push(QuickstartError::new(
                 QuickstartStep::Agent,

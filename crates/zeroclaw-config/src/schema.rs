@@ -6129,6 +6129,8 @@ pub struct NodeControlConfig {
     /// Optional shared secret for node-control HTTP/WebSocket APIs.
     /// When set, inbound requests must include `X-Node-Control-Token`.
     #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
     pub auth_token: Option<String>,
     /// Auto-discovery via soft-bus FIFO pipe (`[gateway.node_control.auto_discovery]`).
     #[serde(default)]
@@ -10007,6 +10009,8 @@ pub struct ObservabilityConfig {
     /// secret so the value is ChaCha20-Poly1305-encrypted when serialized to
     /// the on-disk config.
     #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
     pub langfuse_secret_key: Option<String>,
 
     /// Langfuse base URL. Defaults to `"https://cloud.langfuse.com"`. Override
@@ -20029,6 +20033,7 @@ auto_save = true
             acp: AcpConfig::default(),
             channels: ChannelsConfig {
                 webchat: HashMap::new(),
+                ict: HashMap::new(),
                 bot_service: HashMap::new(),
                 precheck_reply_intent: false,
                 cli: true,
@@ -21553,6 +21558,7 @@ allowed_users = ["@u:matrix.org"]
     async fn channels_with_imessage_and_matrix() {
         let c = ChannelsConfig {
             webchat: HashMap::new(),
+            ict: HashMap::new(),
             bot_service: HashMap::new(),
             precheck_reply_intent: false,
             cli: true,
@@ -22023,6 +22029,7 @@ allowed_numbers = ["+1", "+2"]
     async fn channels_with_whatsapp() {
         let c = ChannelsConfig {
             webchat: HashMap::new(),
+            ict: HashMap::new(),
             bot_service: HashMap::new(),
             precheck_reply_intent: false,
             cli: true,

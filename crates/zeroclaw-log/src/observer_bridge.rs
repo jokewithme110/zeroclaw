@@ -367,6 +367,7 @@ mod tests {
                 channel,
                 agent_alias,
                 turn_id,
+                ..
             } => {
                 assert_eq!(model_provider, "anthropic");
                 assert_eq!(model, "claude-sonnet-4-6");

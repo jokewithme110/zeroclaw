@@ -1624,11 +1624,10 @@ pub fn uninstall_local_skill(skills_path: &Path, slug: &str) -> Result<bool> {
 }
 
 /// Initialize the skills directory with a README
-pub fn init_skills_dir(workspace_dir: &Path) -> Result<()> {
-    let dir = skills_dir(workspace_dir);
-    std::fs::create_dir_all(&dir)?;
+pub fn init_skills_dir(skills_path: &Path) -> Result<()> {
+    std::fs::create_dir_all(skills_path)?;
 
-    let readme = dir.join("README.md");
+    let readme = skills_path.join("README.md");
     if !readme.exists() {
         std::fs::write(
             &readme,

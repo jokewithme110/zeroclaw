@@ -327,19 +327,16 @@ pub fn create_plugin(
         let config_file = plugins_dir.join("wasmtime-cache.toml");
         let cache_dir = plugins_dir.join("wasmruntime");
 
-        match std::fs::create_dir_all(&cache_dir) {
-            Ok(()) => {
-                let cache_toml = format!(
-                    r#"[cache]
+        if let Ok(()) = std::fs::create_dir_all(&cache_dir) {
+            let cache_toml = format!(
+                r#"[cache]
 directory = "{}"
 "#,
-                    cache_dir.display()
-                );
-                if std::fs::write(&config_file, cache_toml).is_ok() {
-                    builder = builder.with_cache_config(&config_file);
-                }
+                cache_dir.display()
+            );
+            if std::fs::write(&config_file, cache_toml).is_ok() {
+                builder = builder.with_cache_config(&config_file);
             }
-            Err(_) => {}
         }
     }
 

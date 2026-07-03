@@ -4047,6 +4047,7 @@ mod tests {
     use zeroclaw_api::channel::ChannelMessage;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
     use zeroclaw_providers::ModelProvider;
+    use zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy;
 
     /// Generate a random hex secret at runtime to avoid hard-coded cryptographic values.
     fn generate_test_secret() -> String {

@@ -44,12 +44,22 @@ impl Tool for SkillRemoveTool {
     }
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
-        let slug = args
+        let Some(slug) = args
             .get("slug")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow::Error::msg("missing or empty 'slug' parameter"))?;
+        else {
+            // Argument validation reports a failed tool result (not an
+            // `Err`) so the agent loop relays it back to the model as tool
+            // output to self-correct, matching the not-installed/error paths
+            // below.
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("missing or empty 'slug' parameter".to_string()),
+            });
+        };
 
         let skills_path = skills_dir(&self.workspace_dir);
 

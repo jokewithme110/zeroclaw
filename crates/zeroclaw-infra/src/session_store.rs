@@ -593,8 +593,8 @@ mod tests {
         let meta = backend.get_session_metadata("mtime_test").unwrap();
 
         // last_activity should be close to the file mtime, not Utc::now()
-        assert!(meta.last_activity >= before - Duration::seconds(1));
-        assert!(meta.last_activity <= after + Duration::seconds(1));
+        assert!(meta.last_activity >= before - chrono::Duration::seconds(1));
+        assert!(meta.last_activity <= after + chrono::Duration::seconds(1));
 
         // Verify it's using file mtime by checking created_at == last_activity
         // (since we only have one timestamp source - the file mtime)

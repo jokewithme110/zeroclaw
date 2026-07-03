@@ -834,6 +834,8 @@ mod tests {
             channel: Some("wss".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
+            input_json: None,
+            input_tools_json: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             model_provider: "anthropic".into(),
@@ -846,6 +848,10 @@ mod tests {
             channel: Some("wss".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
+            cached_input_tokens: None,
+            cost_usd: None,
+            output_text: None,
+            output_tool_calls_json: None,
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
             tool: "shell".into(),
