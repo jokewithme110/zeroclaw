@@ -333,6 +333,7 @@ Examples:
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ContactsCommands {
     /// List all channel contacts
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 List all channel contacts from received messages.
 
@@ -827,6 +828,7 @@ pub enum SopCommands {
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DataManagementCommands {
     /// Show temporary file usage and cleanup status
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Show temporary file usage and cleanup configuration status.
 \n\
@@ -838,6 +840,7 @@ Examples:
   zeroclaw data-management temp-status")]
     TempStatus,
     /// Manually trigger temporary file cleanup
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Manually trigger a cleanup of temporary files.
 \n\

@@ -550,3 +550,45 @@ cli-channels-notion = {"  "}{$status} Notion
 cli-channels-start-hint = Para iniciar canales: zeroclaw channel start
 cli-channels-doctor-hint = Para comprobar el estado:    zeroclaw channel doctor
 cli-channels-configure-hint = Para configurar:      zeroclaw config set channels.<name>.<field>=<value>
+
+# ── data-management (zeroclaw data-management) ──
+cli-dm-status-title = Estado de limpieza de archivos temporales
+cli-dm-config = Configuración:
+cli-dm-enabled = {"  "}Habilitado: {$value}
+cli-dm-scheduled-cleanup = {"  "}Limpieza programada: {$value}
+cli-dm-scheduled-disabled = desactivado
+cli-dm-scheduled-minutes = cada {$minutes} minutos
+cli-dm-scheduled-hours = cada {$hours} horas
+cli-dm-retention = {"  "}Retención integrada: {$value} horas
+cli-dm-max-size = {"  "}Tamaño máx. integrado: {$value} MB
+cli-dm-custom-rules-count = {"  "}Reglas personalizadas: {$count}
+cli-dm-custom-rules-header = Reglas personalizadas:
+cli-dm-custom-rule-item = {"  "}{$n}. path={$path}, pattern={$pattern}, retention={$retention}h, max_size={$max_size}MB
+cli-dm-usage-header = Información de uso:
+cli-dm-qq-header = {"  "}Adjuntos QQ (qq_files/):
+cli-dm-node-header = {"  "}Capturas de cámara del nodo (media/node_snap_*):
+cli-dm-total-size = {"    "}Tamaño total: {$size} MB
+cli-dm-file-count = {"    "}Número de archivos: {$count}
+cli-dm-oldest = {"    "}Archivo más antiguo: hace {$age} horas
+cli-dm-newest = {"    "}Archivo más reciente: hace {$age} horas
+cli-dm-qq-error = {"  "}Adjuntos QQ: Error - {$error}
+cli-dm-node-error = {"  "}Capturas de cámara del nodo: Error - {$error}
+cli-dm-custom-rule-header = {"  "}Regla personalizada ({$path}):
+cli-dm-custom-rule-error = {"  "}Regla personalizada ({$path}): Error - {$error}
+cli-dm-warn-manager = Aviso: error al crear el gestor de archivos temporales: {$error}
+cli-dm-disabled = La limpieza de archivos temporales está desactivada en la configuración.
+cli-dm-disabled-hint = Actívala con files_cleanup.enabled = true en config.toml
+cli-dm-clean-start = Iniciando limpieza manual de archivos temporales...
+cli-dm-clean-done = Limpieza completada:
+cli-dm-rules-executed = {"  "}Reglas ejecutadas: {$count}
+cli-dm-files-deleted = {"  "}Archivos eliminados: {$count}
+cli-dm-space-freed = {"    "}Espacio liberado: {$size} MB
+cli-dm-errors-header = Errores encontrados:
+cli-dm-clean-failed = Error de limpieza: {$error}
+cli-dm-init-failed = Error al inicializar el gestor de archivos temporales: {$error}
+
+# ── channel contacts (zeroclaw channel contacts list) ──
+cli-contacts-none = No se encontraron contactos.
+cli-contacts-col-channel = Canal
+cli-contacts-col-recipient = Destinatario
+cli-contacts-col-last-seen = Última vez visto

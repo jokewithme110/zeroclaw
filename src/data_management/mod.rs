@@ -6,11 +6,10 @@
 use crate::DataManagementCommands;
 use crate::config::Config;
 use anyhow::{Context, Result};
-use std::path::PathBuf;
-use std::sync::Arc;
 use zeroclaw_infra::temp_file_manager::{
     TempCleanupRule as InfraRule, TempFileCategory, TempFileConfig,
 };
+use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 
 /// Handle data management CLI commands
 pub fn handle_command(cmd: DataManagementCommands, config: &Config) -> Result<()> {
@@ -24,45 +23,77 @@ pub fn handle_command(cmd: DataManagementCommands, config: &Config) -> Result<()
 fn show_temp_status(config: &Config) -> Result<()> {
     let tf_config = &config.files_cleanup;
 
-    println!("Temporary File Cleanup Status");
+    println!("{}", get_required_cli_string("cli-dm-status-title"));
     println!("============================\n");
 
-    println!("Configuration:");
-    println!("  Enabled: {}", tf_config.enabled);
+    println!("{}", get_required_cli_string("cli-dm-config"));
+    let enabled_str = tf_config.enabled.to_string();
     println!(
-        "  Scheduled cleanup: {}",
-        if tf_config.scheduled_cleanup_enabled {
-            let hours = tf_config.scheduled_cleanup_interval_hours;
-            let minutes = hours * 60.0;
-            if minutes < 60.0 {
-                format!("every {:.2} minutes", minutes)
-            } else {
-                format!("every {:.1} hours", hours)
-            }
+        "{}",
+        get_required_cli_string_with_args("cli-dm-enabled", &[("value", &enabled_str)])
+    );
+    let scheduled_value = if tf_config.scheduled_cleanup_enabled {
+        let hours = tf_config.scheduled_cleanup_interval_hours;
+        let minutes = hours * 60.0;
+        if minutes < 60.0 {
+            get_required_cli_string_with_args(
+                "cli-dm-scheduled-minutes",
+                &[("minutes", &format!("{:.2}", minutes))],
+            )
         } else {
-            "disabled".to_string()
+            get_required_cli_string_with_args(
+                "cli-dm-scheduled-hours",
+                &[("hours", &format!("{:.1}", hours))],
+            )
         }
-    );
+    } else {
+        get_required_cli_string("cli-dm-scheduled-disabled")
+    };
     println!(
-        "  Built-in retention: {} hours",
-        tf_config.temp_file_retention_hours
+        "{}",
+        get_required_cli_string_with_args(
+            "cli-dm-scheduled-cleanup",
+            &[("value", &scheduled_value)]
+        )
     );
+    let retention_str = tf_config.temp_file_retention_hours.to_string();
     println!(
-        "  Built-in max size: {} MB",
-        tf_config.temp_file_max_size_mb
+        "{}",
+        get_required_cli_string_with_args("cli-dm-retention", &[("value", &retention_str)])
     );
-    println!("  Custom rules: {}", tf_config.rules.len());
+    let max_size_str = tf_config.temp_file_max_size_mb.to_string();
+    println!(
+        "{}",
+        get_required_cli_string_with_args("cli-dm-max-size", &[("value", &max_size_str)])
+    );
+    let rules_count_str = tf_config.rules.len().to_string();
+    println!(
+        "{}",
+        get_required_cli_string_with_args(
+            "cli-dm-custom-rules-count",
+            &[("count", &rules_count_str)]
+        )
+    );
 
     if !tf_config.rules.is_empty() {
-        println!("\nCustom Rules:");
+        println!(
+            "\n{}",
+            get_required_cli_string("cli-dm-custom-rules-header")
+        );
         for (i, rule) in tf_config.rules.iter().enumerate() {
+            let pattern_str = format!("{:?}", rule.pattern);
             println!(
-                "  {}. path={}, pattern={:?}, retention={}h, max_size={}MB",
-                i + 1,
-                rule.path,
-                rule.pattern,
-                rule.retention_hours,
-                rule.max_size_mb
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-dm-custom-rule-item",
+                    &[
+                        ("n", &(i + 1).to_string()),
+                        ("path", rule.path.as_str()),
+                        ("pattern", &pattern_str),
+                        ("retention", &rule.retention_hours.to_string()),
+                        ("max_size", &rule.max_size_mb.to_string()),
+                    ],
+                )
             );
         }
     }
@@ -91,49 +122,97 @@ fn show_temp_status(config: &Config) -> Result<()> {
         &infra_config,
     ) {
         Ok(manager) => {
-            println!("\nUsage Information:");
+            println!("\n{}", get_required_cli_string("cli-dm-usage-header"));
 
             // Query QQ attachments
             match manager.get_usage(&TempFileCategory::QqAttachments) {
                 Ok(usage) => {
-                    println!("\n  QQ Attachments (qq_files/):");
-                    println!("    Total size: {:.2} MB", usage.total_size_mb);
-                    println!("    File count: {}", usage.file_count);
+                    println!("\n{}", get_required_cli_string("cli-dm-qq-header"));
+                    println!(
+                        "{}",
+                        get_required_cli_string_with_args(
+                            "cli-dm-total-size",
+                            &[("size", &format!("{:.2}", usage.total_size_mb))]
+                        )
+                    );
+                    println!(
+                        "{}",
+                        get_required_cli_string_with_args(
+                            "cli-dm-file-count",
+                            &[("count", &usage.file_count.to_string())]
+                        )
+                    );
                     if usage.file_count > 0 {
                         println!(
-                            "    Oldest file: {:.1} hours old",
-                            usage.oldest_file_age_hours
+                            "{}",
+                            get_required_cli_string_with_args(
+                                "cli-dm-oldest",
+                                &[("age", &format!("{:.1}", usage.oldest_file_age_hours))]
+                            )
                         );
                         println!(
-                            "    Newest file: {:.1} hours old",
-                            usage.newest_file_age_hours
+                            "{}",
+                            get_required_cli_string_with_args(
+                                "cli-dm-newest",
+                                &[("age", &format!("{:.1}", usage.newest_file_age_hours))]
+                            )
                         );
                     }
                 }
                 Err(e) => {
-                    println!("  QQ Attachments: Error - {}", e);
+                    println!(
+                        "{}",
+                        get_required_cli_string_with_args(
+                            "cli-dm-qq-error",
+                            &[("error", &e.to_string())]
+                        )
+                    );
                 }
             }
 
             // Query Node camera snapshots
             match manager.get_usage(&TempFileCategory::NodeCameraSnaps) {
                 Ok(usage) => {
-                    println!("\n  Node Camera Snaps (media/node_snap_*):");
-                    println!("    Total size: {:.2} MB", usage.total_size_mb);
-                    println!("    File count: {}", usage.file_count);
+                    println!("\n{}", get_required_cli_string("cli-dm-node-header"));
+                    println!(
+                        "{}",
+                        get_required_cli_string_with_args(
+                            "cli-dm-total-size",
+                            &[("size", &format!("{:.2}", usage.total_size_mb))]
+                        )
+                    );
+                    println!(
+                        "{}",
+                        get_required_cli_string_with_args(
+                            "cli-dm-file-count",
+                            &[("count", &usage.file_count.to_string())]
+                        )
+                    );
                     if usage.file_count > 0 {
                         println!(
-                            "    Oldest file: {:.1} hours old",
-                            usage.oldest_file_age_hours
+                            "{}",
+                            get_required_cli_string_with_args(
+                                "cli-dm-oldest",
+                                &[("age", &format!("{:.1}", usage.oldest_file_age_hours))]
+                            )
                         );
                         println!(
-                            "    Newest file: {:.1} hours old",
-                            usage.newest_file_age_hours
+                            "{}",
+                            get_required_cli_string_with_args(
+                                "cli-dm-newest",
+                                &[("age", &format!("{:.1}", usage.newest_file_age_hours))]
+                            )
                         );
                     }
                 }
                 Err(e) => {
-                    println!("  Node Camera Snaps: Error - {}", e);
+                    println!(
+                        "{}",
+                        get_required_cli_string_with_args(
+                            "cli-dm-node-error",
+                            &[("error", &e.to_string())]
+                        )
+                    );
                 }
             }
 
@@ -143,28 +222,64 @@ fn show_temp_status(config: &Config) -> Result<()> {
                     TempFileCategory::Custom(rule.path.trim_end_matches('/').to_string());
                 match manager.get_usage(&category) {
                     Ok(usage) => {
-                        println!("\n  Custom Rule ({}):", rule.path);
-                        println!("    Total size: {:.2} MB", usage.total_size_mb);
-                        println!("    File count: {}", usage.file_count);
+                        println!(
+                            "\n{}",
+                            get_required_cli_string_with_args(
+                                "cli-dm-custom-rule-header",
+                                &[("path", rule.path.as_str())]
+                            )
+                        );
+                        println!(
+                            "{}",
+                            get_required_cli_string_with_args(
+                                "cli-dm-total-size",
+                                &[("size", &format!("{:.2}", usage.total_size_mb))]
+                            )
+                        );
+                        println!(
+                            "{}",
+                            get_required_cli_string_with_args(
+                                "cli-dm-file-count",
+                                &[("count", &usage.file_count.to_string())]
+                            )
+                        );
                         if usage.file_count > 0 {
                             println!(
-                                "    Oldest file: {:.1} hours old",
-                                usage.oldest_file_age_hours
+                                "{}",
+                                get_required_cli_string_with_args(
+                                    "cli-dm-oldest",
+                                    &[("age", &format!("{:.1}", usage.oldest_file_age_hours))]
+                                )
                             );
                             println!(
-                                "    Newest file: {:.1} hours old",
-                                usage.newest_file_age_hours
+                                "{}",
+                                get_required_cli_string_with_args(
+                                    "cli-dm-newest",
+                                    &[("age", &format!("{:.1}", usage.newest_file_age_hours))]
+                                )
                             );
                         }
                     }
                     Err(e) => {
-                        println!("  Custom Rule ({}): Error - {}", rule.path, e);
+                        println!(
+                            "{}",
+                            get_required_cli_string_with_args(
+                                "cli-dm-custom-rule-error",
+                                &[("path", rule.path.as_str()), ("error", &e.to_string()),],
+                            )
+                        );
                     }
                 }
             }
         }
         Err(e) => {
-            println!("\nWarning: Failed to create temp file manager: {}", e);
+            println!(
+                "\n{}",
+                get_required_cli_string_with_args(
+                    "cli-dm-warn-manager",
+                    &[("error", &e.to_string())]
+                )
+            );
         }
     }
 
@@ -177,12 +292,12 @@ fn trigger_temp_cleanup(config: &Config) -> Result<()> {
     let tf_config = &config.files_cleanup;
 
     if !tf_config.enabled {
-        println!("Temporary file cleanup is disabled in configuration.");
-        println!("Enable it by setting files_cleanup.enabled = true in config.toml");
+        println!("{}", get_required_cli_string("cli-dm-disabled"));
+        println!("{}", get_required_cli_string("cli-dm-disabled-hint"));
         return Ok(());
     }
 
-    println!("Starting manual temporary file cleanup...\n");
+    println!("{}\n", get_required_cli_string("cli-dm-clean-start"));
 
     let infra_config = TempFileConfig {
         enabled: tf_config.enabled,
@@ -206,36 +321,63 @@ fn trigger_temp_cleanup(config: &Config) -> Result<()> {
         config.data_dir.clone(),
         &infra_config,
     ) {
-        Ok(manager) => {
-            match manager.enforce_all() {
-                Ok(report) => {
-                    println!("Cleanup completed:");
-                    println!("  Rules executed: {}", report.rules_executed);
-                    println!("  Files deleted: {}", report.files_deleted);
+        Ok(manager) => match manager.enforce_all() {
+            Ok(report) => {
+                println!("{}", get_required_cli_string("cli-dm-clean-done"));
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-dm-rules-executed",
+                        &[("count", &report.rules_executed.to_string())]
+                    )
+                );
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-dm-files-deleted",
+                        &[("count", &report.files_deleted.to_string())]
+                    )
+                );
 
-                    // Estimate bytes freed (simplified - actual implementation would track this)
-                    if report.bytes_freed > 0 {
-                        println!(
-                            "  Space freed: {:.2} MB",
-                            report.bytes_freed as f64 / 1024.0 / 1024.0
-                        );
-                    }
-
-                    if !report.errors.is_empty() {
-                        println!("\nErrors encountered:");
-                        for (rule_path, error_msg) in &report.errors {
-                            println!("  - {}: {}", rule_path, error_msg);
-                        }
-                    }
+                if report.bytes_freed > 0 {
+                    println!(
+                        "{}",
+                        get_required_cli_string_with_args(
+                            "cli-dm-space-freed",
+                            &[(
+                                "size",
+                                &format!("{:.2}", report.bytes_freed as f64 / 1024.0 / 1024.0)
+                            )]
+                        )
+                    );
                 }
-                Err(e) => {
-                    println!("Cleanup failed: {}", e);
-                    return Err(e);
+
+                if !report.errors.is_empty() {
+                    println!("\n{}", get_required_cli_string("cli-dm-errors-header"));
+                    for (rule_path, error_msg) in &report.errors {
+                        println!("  - {}: {}", rule_path, error_msg);
+                    }
                 }
             }
-        }
+            Err(e) => {
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-dm-clean-failed",
+                        &[("error", &e.to_string())]
+                    )
+                );
+                return Err(e);
+            }
+        },
         Err(e) => {
-            println!("Failed to initialize temp file manager: {}", e);
+            println!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-dm-init-failed",
+                    &[("error", &e.to_string())]
+                )
+            );
             return Err(e);
         }
     }

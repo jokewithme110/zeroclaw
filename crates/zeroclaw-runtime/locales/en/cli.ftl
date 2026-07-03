@@ -644,3 +644,45 @@ cli-channels-notion = {"  "}{$status} Notion
 cli-channels-start-hint = To start channels: zeroclaw channel start
 cli-channels-doctor-hint = To check health:    zeroclaw channel doctor
 cli-channels-configure-hint = To configure:      zeroclaw config set channels.<name>.<field>=<value>
+
+# ── data-management (zeroclaw data-management) ──
+cli-dm-status-title = Temporary File Cleanup Status
+cli-dm-config = Configuration:
+cli-dm-enabled = {"  "}Enabled: {$value}
+cli-dm-scheduled-cleanup = {"  "}Scheduled cleanup: {$value}
+cli-dm-scheduled-disabled = disabled
+cli-dm-scheduled-minutes = every {$minutes} minutes
+cli-dm-scheduled-hours = every {$hours} hours
+cli-dm-retention = {"  "}Built-in retention: {$value} hours
+cli-dm-max-size = {"  "}Built-in max size: {$value} MB
+cli-dm-custom-rules-count = {"  "}Custom rules: {$count}
+cli-dm-custom-rules-header = Custom Rules:
+cli-dm-custom-rule-item = {"  "}{$n}. path={$path}, pattern={$pattern}, retention={$retention}h, max_size={$max_size}MB
+cli-dm-usage-header = Usage Information:
+cli-dm-qq-header = {"  "}QQ Attachments (qq_files/):
+cli-dm-node-header = {"  "}Node Camera Snaps (media/node_snap_*):
+cli-dm-total-size = {"    "}Total size: {$size} MB
+cli-dm-file-count = {"    "}File count: {$count}
+cli-dm-oldest = {"    "}Oldest file: {$age} hours old
+cli-dm-newest = {"    "}Newest file: {$age} hours old
+cli-dm-qq-error = {"  "}QQ Attachments: Error - {$error}
+cli-dm-node-error = {"  "}Node Camera Snaps: Error - {$error}
+cli-dm-custom-rule-header = {"  "}Custom Rule ({$path}):
+cli-dm-custom-rule-error = {"  "}Custom Rule ({$path}): Error - {$error}
+cli-dm-warn-manager = Warning: Failed to create temp file manager: {$error}
+cli-dm-disabled = Temporary file cleanup is disabled in configuration.
+cli-dm-disabled-hint = Enable it by setting files_cleanup.enabled = true in config.toml
+cli-dm-clean-start = Starting manual temporary file cleanup...
+cli-dm-clean-done = Cleanup completed:
+cli-dm-rules-executed = {"  "}Rules executed: {$count}
+cli-dm-files-deleted = {"  "}Files deleted: {$count}
+cli-dm-space-freed = {"    "}Space freed: {$size} MB
+cli-dm-errors-header = Errors encountered:
+cli-dm-clean-failed = Cleanup failed: {$error}
+cli-dm-init-failed = Failed to initialize temp file manager: {$error}
+
+# ── channel contacts (zeroclaw channel contacts list) ──
+cli-contacts-none = No contacts found.
+cli-contacts-col-channel = Channel
+cli-contacts-col-recipient = Recipient
+cli-contacts-col-last-seen = Last Seen

@@ -576,3 +576,45 @@ cli-secret-long-about =
     zeroclaw secret update OPENAI_API_KEY
     zeroclaw secret delete OPENAI_API_KEY
     zeroclaw secret encrypt "chiffrer ce message"
+
+# ── data-management (zeroclaw data-management) ──
+cli-dm-status-title = État du nettoyage des fichiers temporaires
+cli-dm-config = Configuration :
+cli-dm-enabled = {"  "}Activé : {$value}
+cli-dm-scheduled-cleanup = {"  "}Nettoyage planifié : {$value}
+cli-dm-scheduled-disabled = désactivé
+cli-dm-scheduled-minutes = toutes les {$minutes} minutes
+cli-dm-scheduled-hours = toutes les {$hours} heures
+cli-dm-retention = {"  "}Rétention intégrée : {$value} heures
+cli-dm-max-size = {"  "}Taille max intégrée : {$value} MB
+cli-dm-custom-rules-count = {"  "}Règles personnalisées : {$count}
+cli-dm-custom-rules-header = Règles personnalisées :
+cli-dm-custom-rule-item = {"  "}{$n}. path={$path}, pattern={$pattern}, retention={$retention}h, max_size={$max_size}MB
+cli-dm-usage-header = Informations d'utilisation :
+cli-dm-qq-header = {"  "}Pièces jointes QQ (qq_files/) :
+cli-dm-node-header = {"  "}Captures caméra nœud (media/node_snap_*) :
+cli-dm-total-size = {"    "}Taille totale : {$size} MB
+cli-dm-file-count = {"    "}Nombre de fichiers : {$count}
+cli-dm-oldest = {"    "}Fichier le plus ancien : il y a {$age} heures
+cli-dm-newest = {"    "}Fichier le plus récent : il y a {$age} heures
+cli-dm-qq-error = {"  "}Pièces jointes QQ : Erreur - {$error}
+cli-dm-node-error = {"  "}Captures caméra nœud : Erreur - {$error}
+cli-dm-custom-rule-header = {"  "}Règle personnalisée ({$path}) :
+cli-dm-custom-rule-error = {"  "}Règle personnalisée ({$path}) : Erreur - {$error}
+cli-dm-warn-manager = Avertissement : échec de la création du gestionnaire de fichiers temporaires : {$error}
+cli-dm-disabled = Le nettoyage des fichiers temporaires est désactivé dans la configuration.
+cli-dm-disabled-hint = Activez-le avec files_cleanup.enabled = true dans config.toml
+cli-dm-clean-start = Démarrage du nettoyage manuel des fichiers temporaires...
+cli-dm-clean-done = Nettoyage terminé :
+cli-dm-rules-executed = {"  "}Règles exécutées : {$count}
+cli-dm-files-deleted = {"  "}Fichiers supprimés : {$count}
+cli-dm-space-freed = {"    "}Espace libéré : {$size} MB
+cli-dm-errors-header = Erreurs rencontrées :
+cli-dm-clean-failed = Échec du nettoyage : {$error}
+cli-dm-init-failed = Échec de l'initialisation du gestionnaire de fichiers temporaires : {$error}
+
+# ── channel contacts (zeroclaw channel contacts list) ──
+cli-contacts-none = Aucun contact trouvé.
+cli-contacts-col-channel = Canal
+cli-contacts-col-recipient = Destinataire
+cli-contacts-col-last-seen = Dernière activité

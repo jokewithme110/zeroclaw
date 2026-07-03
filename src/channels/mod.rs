@@ -213,7 +213,7 @@ fn handle_contacts_command(command: ContactsCommands, config: &Config) -> Result
                 if json {
                     println!("[]");
                 } else {
-                    println!("No contacts found.");
+                    println!("{}", get_required_cli_string("cli-contacts-none"));
                 }
                 return Ok(());
             }
@@ -225,7 +225,12 @@ fn handle_contacts_command(command: ContactsCommands, config: &Config) -> Result
                 println!("{}", json_output);
             } else {
                 // Output as table (default, sorted by last_seen desc)
-                println!("{:<10} {:<35} Last Seen", "Channel", "Recipient");
+                println!(
+                    "{:<10} {:<35} {}",
+                    get_required_cli_string("cli-contacts-col-channel"),
+                    get_required_cli_string("cli-contacts-col-recipient"),
+                    get_required_cli_string("cli-contacts-col-last-seen")
+                );
                 println!("{:-<10} {:-<35} {:-<20}", "", "", "");
 
                 for contact in contacts {

@@ -554,3 +554,45 @@ cli-channels-start-hint = チャンネルを開始するには: zeroclaw channel
 cli-channels-doctor-hint = 状態を確認するには:    zeroclaw channel doctor
 cli-channels-configure-hint = 設定するには:      zeroclaw config set channels.<name>.<field>=<value>
 cli-onboard-about = ワークスペースと設定を初期化
+
+# ── data-management (zeroclaw data-management) ──
+cli-dm-status-title = 一時ファイルクリーンアップ状況
+cli-dm-config = 設定：
+cli-dm-enabled = {"  "}有効：{$value}
+cli-dm-scheduled-cleanup = {"  "}定期クリーンアップ：{$value}
+cli-dm-scheduled-disabled = 無効
+cli-dm-scheduled-minutes = {$minutes} 分ごと
+cli-dm-scheduled-hours = {$hours} 時間ごと
+cli-dm-retention = {"  "}組み込み保持時間：{$value} 時間
+cli-dm-max-size = {"  "}組み込み最大サイズ：{$value} MB
+cli-dm-custom-rules-count = {"  "}カスタムルール数：{$count}
+cli-dm-custom-rules-header = カスタムルール：
+cli-dm-custom-rule-item = {"  "}{$n}. path={$path}, pattern={$pattern}, retention={$retention}h, max_size={$max_size}MB
+cli-dm-usage-header = 使用量情報：
+cli-dm-qq-header = {"  "}QQ 添付ファイル (qq_files/)：
+cli-dm-node-header = {"  "}ノードカメラスナップ (media/node_snap_*)：
+cli-dm-total-size = {"    "}合計サイズ：{$size} MB
+cli-dm-file-count = {"    "}ファイル数：{$count}
+cli-dm-oldest = {"    "}最古ファイル：{$age} 時間前
+cli-dm-newest = {"    "}最新ファイル：{$age} 時間前
+cli-dm-qq-error = {"  "}QQ 添付ファイル：エラー - {$error}
+cli-dm-node-error = {"  "}ノードカメラスナップ：エラー - {$error}
+cli-dm-custom-rule-header = {"  "}カスタムルール ({$path})：
+cli-dm-custom-rule-error = {"  "}カスタムルール ({$path})：エラー - {$error}
+cli-dm-warn-manager = 警告：一時ファイルマネージャの作成に失敗しました：{$error}
+cli-dm-disabled = 設定で一時ファイルクリーンアップが無効になっています。
+cli-dm-disabled-hint = config.toml の files_cleanup.enabled = true で有効化できます
+cli-dm-clean-start = 手動の一時ファイルクリーンアップを開始しています...
+cli-dm-clean-done = クリーンアップ完了：
+cli-dm-rules-executed = {"  "}実行ルール数：{$count}
+cli-dm-files-deleted = {"  "}削除ファイル数：{$count}
+cli-dm-space-freed = {"    "}解放容量：{$size} MB
+cli-dm-errors-header = 発生したエラー：
+cli-dm-clean-failed = クリーンアップ失敗：{$error}
+cli-dm-init-failed = 一時ファイルマネージャの初期化に失敗しました：{$error}
+
+# ── channel contacts (zeroclaw channel contacts list) ──
+cli-contacts-none = 連絡先が見つかりません。
+cli-contacts-col-channel = チャネル
+cli-contacts-col-recipient = 受信者
+cli-contacts-col-last-seen = 最終確認

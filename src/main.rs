@@ -971,6 +971,7 @@ Examples:
         plugin_command: PluginCommands,
     },
     /// Manage data retention and temporary file cleanup
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Manage data retention and temporary file cleanup.
 \n\

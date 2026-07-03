@@ -564,3 +564,45 @@ cli-channels-notion = {"  "}{$status} Notion
 cli-channels-start-hint = 启动渠道：zeroclaw channel start
 cli-channels-doctor-hint = 检查健康状况：    zeroclaw channel doctor
 cli-channels-configure-hint = 配置方法：      zeroclaw config set channels.<name>.<field>=<value>
+
+# ── data-management (zeroclaw data-management) ──
+cli-dm-status-title = 临时文件清理状态
+cli-dm-config = 配置：
+cli-dm-enabled = {"  "}已启用：{$value}
+cli-dm-scheduled-cleanup = {"  "}定时清理：{$value}
+cli-dm-scheduled-disabled = 已禁用
+cli-dm-scheduled-minutes = 每 {$minutes} 分钟
+cli-dm-scheduled-hours = 每 {$hours} 小时
+cli-dm-retention = {"  "}内置保留时间：{$value} 小时
+cli-dm-max-size = {"  "}内置最大体积：{$value} MB
+cli-dm-custom-rules-count = {"  "}自定义规则数：{$count}
+cli-dm-custom-rules-header = 自定义规则：
+cli-dm-custom-rule-item = {"  "}{$n}. path={$path}, pattern={$pattern}, retention={$retention}h, max_size={$max_size}MB
+cli-dm-usage-header = 用量信息：
+cli-dm-qq-header = {"  "}QQ 附件 (qq_files/)：
+cli-dm-node-header = {"  "}节点摄像头快照 (media/node_snap_*)：
+cli-dm-total-size = {"    "}总体积：{$size} MB
+cli-dm-file-count = {"    "}文件数：{$count}
+cli-dm-oldest = {"    "}最旧文件：{$age} 小时前
+cli-dm-newest = {"    "}最新文件：{$age} 小时前
+cli-dm-qq-error = {"  "}QQ 附件：错误 - {$error}
+cli-dm-node-error = {"  "}节点摄像头快照：错误 - {$error}
+cli-dm-custom-rule-header = {"  "}自定义规则 ({$path})：
+cli-dm-custom-rule-error = {"  "}自定义规则 ({$path})：错误 - {$error}
+cli-dm-warn-manager = 警告：创建临时文件管理器失败：{$error}
+cli-dm-disabled = 配置中已禁用临时文件清理。
+cli-dm-disabled-hint = 在 config.toml 中设置 files_cleanup.enabled = true 以启用
+cli-dm-clean-start = 正在开始手动临时文件清理...
+cli-dm-clean-done = 清理完成：
+cli-dm-rules-executed = {"  "}已执行规则：{$count}
+cli-dm-files-deleted = {"  "}已删除文件：{$count}
+cli-dm-space-freed = {"    "}已释放空间：{$size} MB
+cli-dm-errors-header = 遇到的错误：
+cli-dm-clean-failed = 清理失败：{$error}
+cli-dm-init-failed = 初始化临时文件管理器失败：{$error}
+
+# ── channel contacts (zeroclaw channel contacts list) ──
+cli-contacts-none = 未找到联系人。
+cli-contacts-col-channel = 渠道
+cli-contacts-col-recipient = 接收者
+cli-contacts-col-last-seen = 最后在线
