@@ -11991,7 +11991,7 @@ pub enum StreamMode {
 }
 
 fn default_draft_update_interval_ms() -> u64 {
-    1000
+    100
 }
 
 fn default_multi_message_delay_ms() -> u64 {

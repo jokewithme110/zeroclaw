@@ -146,6 +146,229 @@ struct UploadCacheEntry {
     expires_at: u64,
 }
 
+/// Token cache entry with expiration time.
+/// DingTalk access tokens are valid for 7200 seconds (2 hours).
+/// We refresh 60 seconds early to avoid boundary issues.
+#[derive(Clone)]
+struct TokenCacheEntry {
+    token: String,
+    expires_at: Instant,
+}
+
+impl TokenCacheEntry {
+    fn new(token: String) -> Self {
+        // Token valid for 7200 seconds, refresh 60 seconds early
+        Self {
+            token,
+            expires_at: Instant::now() + Duration::from_secs(7200 - 60),
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        Instant::now() >= self.expires_at
+    }
+}
+
+/// Lightweight async handle for making DingTalk API calls.
+/// Contains only the minimal state needed for HTTP requests,
+/// used for async API calls without blocking the main channel.
+#[derive(Clone)]
+pub struct DingTalkChannelAsync {
+    client_id: String,
+    client_secret: String,
+    proxy_url: Option<String>,
+    /// Access token cache (2 hour validity)
+    token_cache: Arc<RwLock<Option<TokenCacheEntry>>>,
+}
+
+impl DingTalkChannelAsync {
+    /// Build an HTTP client with the same proxy configuration as the main channel.
+    fn http_client(&self) -> reqwest::Client {
+        zeroclaw_config::schema::build_channel_proxy_client(
+            "channel.dingtalk.async",
+            self.proxy_url.as_deref(),
+        )
+    }
+
+    /// Get access token for API calls with caching.
+    /// Tokens are cached for 2 hours (7200 seconds) per DingTalk's specification.
+    /// Uses double-checked locking to handle concurrent requests efficiently.
+    async fn get_access_token(&self) -> anyhow::Result<String> {
+        // Fast path: check cache with read lock
+        {
+            let cache = self.token_cache.read().await;
+            if let Some(entry) = cache.as_ref() {
+                if !entry.is_expired() {
+                    let remaining_secs = entry.expires_at.duration_since(Instant::now()).as_secs();
+                    dingtalk_debug!(
+                        ::serde_json::json!({
+                            "remaining_secs": remaining_secs,
+                        }),
+                        "DingTalk: using cached access token"
+                    );
+                    return Ok(entry.token.clone());
+                }
+            }
+        }
+
+        // Slow path: acquire write lock and fetch new token
+        // Use double-checked locking to avoid duplicate requests
+        {
+            // Re-check cache after acquiring write lock
+            let cache = self.token_cache.read().await;
+            if let Some(entry) = cache.as_ref() {
+                if !entry.is_expired() {
+                    let remaining_secs = entry.expires_at.duration_since(Instant::now()).as_secs();
+                    dingtalk_debug!(
+                        ::serde_json::json!({
+                            "remaining_secs": remaining_secs,
+                        }),
+                        "DingTalk: using cached access token (after re-check)"
+                    );
+                    return Ok(entry.token.clone());
+                }
+            }
+        }
+
+        // Cache miss or expired: fetch new token
+        dingtalk_info!("DingTalk: fetching new access token");
+
+        let mut last_error = None;
+        for attempt in 1..=DINGTALK_OUTBOUND_MAX_ATTEMPTS {
+            match self.request_access_token_once().await {
+                Ok(token) => {
+                    // Update cache
+                    {
+                        let mut cache = self.token_cache.write().await;
+                        // Final check to avoid overwriting valid token from concurrent request
+                        if let Some(entry) = cache.as_ref() {
+                            if !entry.is_expired() {
+                                return Ok(entry.token.clone());
+                            }
+                        }
+                        *cache = Some(TokenCacheEntry::new(token.clone()));
+                    }
+
+                    if attempt > 1 {
+                        dingtalk_info!(
+                            ::serde_json::json!({
+                                "attempt": attempt,
+                            }),
+                            "DingTalk: access token request recovered after retry"
+                        );
+                    }
+                    return Ok(token);
+                }
+                Err(error) => {
+                    if attempt >= DINGTALK_OUTBOUND_MAX_ATTEMPTS {
+                        return Err(error);
+                    }
+
+                    dingtalk_warn!(
+                        ::serde_json::json!({
+                            "attempt": attempt,
+                            "max_attempts": DINGTALK_OUTBOUND_MAX_ATTEMPTS,
+                            "error": error.to_string(),
+                        }),
+                        "DingTalk: access token request failed, retrying"
+                    );
+                    last_error = Some(error);
+                    tokio::time::sleep(DINGTALK_OUTBOUND_RETRY_DELAY).await;
+                }
+            }
+        }
+
+        Err(last_error
+            .unwrap_or_else(|| anyhow::Error::msg("DingTalk: access token retry exhausted")))
+    }
+
+    /// Request access token once (single attempt).
+    async fn request_access_token_once(&self) -> anyhow::Result<String> {
+        let body = serde_json::json!({
+            "appKey": self.client_id,
+            "appSecret": self.client_secret,
+        });
+
+        let resp = self
+            .http_client()
+            .post("https://api.dingtalk.com/v1.0/oauth2/accessToken")
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(anyhow::anyhow!(
+                "DingTalk access token request failed with status {}: {}",
+                status,
+                resp.text().await.unwrap_or_default()
+            ));
+        }
+
+        #[derive(Deserialize)]
+        struct TokenResponse {
+            #[serde(rename = "accessToken")]
+            access_token: String,
+        }
+
+        let token_resp: TokenResponse = resp.json().await?;
+        Ok(token_resp.access_token)
+    }
+
+    /// Update an AI card via streamingUpdate API.
+    /// This is the async version used for background updates.
+    async fn streaming_update_card(
+        &self,
+        card_instance_id: &str,
+        content: &str,
+        is_final: bool,
+    ) -> anyhow::Result<()> {
+        let token = self.get_access_token().await?;
+
+        // Each update carries a unique GUID per the official SDK.
+        let guid = Uuid::new_v4().to_string();
+
+        let body = serde_json::json!({
+            "outTrackId": card_instance_id,
+            "guid": guid,
+            "key": "content",
+            "content": content,
+            "isFull": true,
+            "isFinalize": is_final,
+            "isError": false,
+        });
+
+        let resp = self
+            .http_client()
+            .put("https://api.dingtalk.com/v1.0/card/streaming")
+            .header("x-acs-dingtalk-access-token", &token)
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let error_text = resp.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "DingTalk streamingUpdate failed with status {}: {}",
+                status,
+                error_text
+            ));
+        }
+
+        dingtalk_debug!(
+            ::serde_json::json!({
+                "out_track_id": card_instance_id,
+                "content_bytes": content.len(),
+                "is_final": is_final,
+            }),
+            "DingTalk: streamingUpdate card success"
+        );
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DingTalkReplyTarget {
     User(String),
@@ -238,6 +461,18 @@ impl DingTalkChannel {
         // 50ms still leaves 6x headroom.
         self.streaming_update_interval_ms = update_interval_ms;
         self
+    }
+
+    /// Create a lightweight clone for async API calls.
+    /// This clones only the necessary fields for making HTTP requests,
+    /// avoiding the overhead of cloning the entire channel state.
+    fn clone_for_async_call(&self) -> DingTalkChannelAsync {
+        DingTalkChannelAsync {
+            client_id: self.client_id.clone(),
+            client_secret: self.client_secret.clone(),
+            proxy_url: self.proxy_url.clone(),
+            token_cache: Arc::new(RwLock::new(None)),
+        }
     }
 
     /// Check if streaming mode is enabled.
@@ -1073,10 +1308,15 @@ impl Channel for DingTalkChannel {
             let mut cache = self.pending_streaming_text.lock().await;
             cache.remove(message_id).unwrap_or_else(|| text.to_string())
         };
+
+        // Reset the throttle timer BEFORE making the API call.
+        // This is critical: we want the next call to be allowed after
+        // `interval_ms` from NOW, not after the API response returns.
         {
             let mut last_guard = self.last_streaming_edit.lock().await;
             last_guard.insert(message_id.to_string(), Instant::now());
         }
+
         dingtalk_debug!(
             ::serde_json::json!({
                 "card_id": message_id,
@@ -1084,18 +1324,27 @@ impl Channel for DingTalkChannel {
             }),
             "DingTalk: update_draft flush"
         );
-        if let Err(error) = self
-            .streaming_update_card(message_id, &to_send, false)
-            .await
-        {
-            dingtalk_warn!(
-                ::serde_json::json!({
-                    "out_track_id": message_id,
-                    "error": error.to_string(),
-                }),
-                "DingTalk: update_draft streaming call failed"
-            );
-        }
+
+        // Spawn the API call asynchronously to avoid blocking the caller.
+        // This allows the orchestrator to continue processing LLM tokens
+        // without waiting for the DingTalk API response (~350ms).
+        let self_arc = Arc::new(self.clone_for_async_call());
+        let message_id = message_id.to_string();
+        zeroclaw_spawn::spawn!(async move {
+            if let Err(error) = self_arc
+                .streaming_update_card(&message_id, &to_send, false)
+                .await
+            {
+                dingtalk_warn!(
+                    ::serde_json::json!({
+                        "out_track_id": message_id,
+                        "error": error.to_string(),
+                    }),
+                    "DingTalk: update_draft streaming call failed (async)"
+                );
+            }
+        });
+
         Ok(())
     }
 

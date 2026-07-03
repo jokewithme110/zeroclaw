@@ -5248,6 +5248,15 @@ async fn process_channel_message_body(
 
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "draft_id": draft_id,
+                                "channel": channel.name(),
+                            })),
+                        "Orchestrator: calling finalize_draft"
+                    );
                     if let Err(e) = channel
                         .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
                         .await
@@ -5266,7 +5275,10 @@ async fn process_channel_message_body(
                             .send(&SendMessage::reply_to(&msg, &delivered_response))
                             .await;
                     }
-                } else if let Err(e) = channel
+                } else {
+                    // draft_message_id is None - finalize_draft won't be called
+                }
+                if let Err(e) = channel
                     .send(
                         &SendMessage::reply_to(&msg, &delivered_response)
                             .with_cancellation(cancellation_token.clone()),

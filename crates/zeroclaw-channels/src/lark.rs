@@ -63,6 +63,15 @@ const LARK_SEND_MAX_ATTEMPTS: u32 = 4;
 const LARK_SEND_RETRY_DELAY: Duration = Duration::from_millis(500);
 const LARK_STREAM_CONNECT_MAX_ATTEMPTS: u32 = 3;
 const LARK_STREAM_CONNECT_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+// Cardkit streaming constants (official Feishu API)
+const LARK_CARDKIT_CONTENT_MAX_CHARS: usize = 100_000;
+const LARK_CARDKIT_STREAM_ELEMENT_ID: &str = "markdown_stream";
+const LARK_CARDKIT_SEQUENCE_NOT_INCREMENTING_CODE: i64 = 300317;
+const LARK_CARDKIT_IN_INTERACTION_CODE: i64 = 200810;
+const LARK_CARDKIT_UPDATE_MULTI_FALSE_CODE: i64 = 300302;
+const LARK_CARDKIT_INVALID_CARD_JSON_CODE: i64 = 200220;
+
 macro_rules! lark_info {
     ($message:expr) => {
         ::zeroclaw_log::record!(
@@ -131,6 +140,18 @@ fn unicode_to_lark_emoji_type(emoji: &str) -> Option<&'static str> {
         "🎉" => Some("PARTY"),
         _ => None,
     }
+}
+
+/// Per-card streaming state for Cardkit path.
+/// SSOT check: This is runtime cache, not a config duplicate.
+#[derive(Debug, Clone)]
+struct LarkCardStreamState {
+    card_id: String,                 // URL param from POST /cards response
+    element_id: String,              // Element ID (constant "markdown_stream")
+    sequence: i32,                   // int32, strictly incrementing
+    last_sent_content: String,       // Short-circuit: skip PUT if equal
+    current_uuid: String,            // Idempotency ID, rotated on bump
+    last_pushed_at: Option<Instant>, // Throttle window anchor
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -545,24 +566,15 @@ fn build_interactive_card_body(recipient: &str, markdown: &str) -> serde_json::V
 /// exceeds the budget we cut at the last UTF-8 boundary that still leaves
 /// room for an `…_(updating)_` suffix, so the user sees a visible signal
 /// that the card was clipped while updates continue.
-fn truncate_card_markdown(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
+/// Truncate markdown content to fit within Cardkit's character limit.
+/// Cardkit limits are in Unicode code points, not bytes.
+fn truncate_card_markdown_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
         return text.to_string();
     }
     let suffix = "\n\n…_(updating)_";
-    let budget = max_bytes.saturating_sub(suffix.len());
-    let mut end = 0;
-    for (idx, ch) in text.char_indices() {
-        let next = idx + ch.len_utf8();
-        if next > budget {
-            break;
-        }
-        end = next;
-    }
-    let mut out = String::with_capacity(end + suffix.len());
-    out.push_str(&text[..end]);
-    out.push_str(suffix);
-    out
+    let budget = max_chars.saturating_sub(suffix.chars().count());
+    text.chars().take(budget).collect::<String>() + suffix
 }
 
 /// Split markdown content into chunks that fit within the card size limit.
@@ -760,13 +772,8 @@ pub struct LarkChannel {
     /// orchestrator from `[channels.lark.<alias>].draft_update_interval_ms`
     /// via [`Self::with_streaming`].
     draft_update_interval_ms: u64,
-    /// Per-`message_id` timestamp of the last successful PATCH. Reads /
-    /// writes are guarded by an async mutex so concurrent token streams
-    /// cooperate on the same draft without racing the rate-limit window.
-    /// Runtime state (not a config duplicate per SSOT) — bounded by the
-    /// number of in-flight drafts; entries are removed by `finalize_draft`
-    /// and `cancel_draft`.
-    last_draft_edit: Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
+    /// Cardkit streaming state per message_id. Runtime cache (SSOT-compliant).
+    cardkit_streams: Arc<tokio::sync::Mutex<HashMap<String, LarkCardStreamState>>>,
     /// Workspace directory for saving downloaded images.
     workspace_dir: Option<PathBuf>,
     /// Runtime hook invoked after the channel persists a media
@@ -838,7 +845,7 @@ impl LarkChannel {
             reaction_ids: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: 1000,
-            last_draft_edit: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            cardkit_streams: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             workspace_dir: None,
             file_persisted_hook: None,
             upload_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -983,6 +990,45 @@ impl LarkChannel {
         )
     }
 
+    /// Cardkit PUT helper with explicit Content-Type header.
+    async fn cardkit_put(
+        &self,
+        url: &str,
+        token: &str,
+        body: &serde_json::Value,
+    ) -> Result<(reqwest::StatusCode, String), reqwest::Error> {
+        let response = self
+            .http_client()
+            .put(url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json; charset=utf-8")
+            .json(body)
+            .send()
+            .await?;
+        let status = response.status();
+        let text = response.text().await?;
+        Ok((status, text))
+    }
+
+    async fn cardkit_patch(
+        &self,
+        url: &str,
+        token: &str,
+        body: &serde_json::Value,
+    ) -> Result<(reqwest::StatusCode, String), reqwest::Error> {
+        let response = self
+            .http_client()
+            .patch(url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json; charset=utf-8")
+            .json(body)
+            .send()
+            .await?;
+        let status = response.status();
+        let text = response.text().await?;
+        Ok((status, text))
+    }
+
     fn channel_name(&self) -> &'static str {
         self.platform.channel_name()
     }
@@ -1016,6 +1062,24 @@ impl LarkChannel {
     /// resolved/banner state after the user clicks a button).
     fn patch_message_url(&self, message_id: &str) -> String {
         format!("{}/im/v1/messages/{message_id}", self.api_base())
+    }
+
+    // Cardkit URL helpers
+    fn cardkit_create_url(&self) -> String {
+        format!("{}/cardkit/v1/cards", self.api_base())
+    }
+
+    fn cardkit_element_content_url(&self, card_id: &str, element_id: &str) -> String {
+        format!(
+            "{}/cardkit/v1/cards/{}/elements/{}/content",
+            self.api_base(),
+            card_id,
+            element_id
+        )
+    }
+
+    fn cardkit_settings_url(&self, card_id: &str) -> String {
+        format!("{}/cardkit/v1/cards/{}/settings", self.api_base(), card_id)
     }
 
     fn message_reaction_url(&self, message_id: &str) -> String {
@@ -2844,92 +2908,254 @@ impl Channel for LarkChannel {
         !matches!(self.stream_mode, StreamMode::Off)
     }
 
-    /// Open a streaming draft card. Returns `Ok(None)` (caller must
-    /// degrade to `send()`) when streaming is disabled, the initial POST
-    /// fails, or Feishu replies with non-zero `code`. The returned
-    /// `String` is the Feishu `message_id` used by subsequent
-    /// `update_draft` / `finalize_draft` PATCH calls.
+    /// Open a streaming draft card using Cardkit path.
+    /// Returns `Ok(None)` when streaming is disabled or cardkit_create fails.
     async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
         if matches!(self.stream_mode, StreamMode::Off) {
             return Ok(None);
         }
 
-        let placeholder = truncate_card_markdown(
-            if message.content.is_empty() {
-                "_processing…_"
-            } else {
-                message.content.as_str()
-            },
-            LARK_CARD_MARKDOWN_MAX_BYTES,
-        );
-        let body = build_interactive_card_body(&message.recipient, &placeholder);
-        let url = self.send_message_url();
+        let placeholder = if message.content.is_empty() {
+            "_processing…"
+        } else {
+            message.content.as_str()
+        };
 
-        let (status, response) = match self.patch_or_send_once(&url, &body, false).await {
-            Ok(r) => r,
+        match self.cardkit_create(&message.recipient, placeholder).await {
+            Ok(card_id) => {
+                // Send card reference via IM API
+                let token = self.get_tenant_access_token().await?;
+                let send_url = self.send_message_url();
+                let content_payload = serde_json::json!({
+                    "type": "card",
+                    "data": { "card_id": card_id },
+                });
+                let send_body = serde_json::json!({
+                    "receive_id": message.recipient,
+                    "receive_id_type": "open_id",
+                    "msg_type": "interactive",
+                    "content": content_payload.to_string(),
+                });
+
+                let (send_status, send_response) =
+                    match self.send_text_once(&send_url, &token, &send_body).await {
+                        Ok(r) => r,
+                        Err(err) => {
+                            ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(
+                                ::serde_json::json!({"err": format!("{err}"), "card_id": card_id})
+                            ),
+                            "Lark: send_draft failed to send card reference, falling back to send()"
+                        );
+                            return Ok(None);
+                        }
+                    };
+
+                let send_code = extract_lark_response_code(&send_response).unwrap_or(0);
+                if send_code != 0 {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "status": send_status.as_u16(),
+                                "code": send_code,
+                                "card_id": card_id,
+                            })),
+                        "Lark: send_draft send card reference failed, falling back to send()"
+                    );
+                    return Ok(None);
+                }
+
+                let message_id = send_response
+                    .pointer("/data/message_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_default();
+
+                // Log before moving card_id into the state
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "message_id": message_id,
+                            "card_id": card_id,
+                            "stream_mode": "cardkit",
+                        })),
+                    "Lark: send_draft opened Cardkit streaming card"
+                );
+
+                // Initialize streaming state
+                let mut streams = self.cardkit_streams.lock().await;
+                streams.insert(
+                    message_id.clone(),
+                    LarkCardStreamState {
+                        card_id,
+                        element_id: LARK_CARDKIT_STREAM_ELEMENT_ID.to_string(),
+                        sequence: 1,
+                        last_sent_content: placeholder.to_string(),
+                        current_uuid: Uuid::new_v4().to_string(),
+                        last_pushed_at: None,
+                    },
+                );
+
+                Ok(Some(message_id))
+            }
             Err(err) => {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({"err": format!("{err}")})),
-                    "Lark: send_draft failed, falling back to send()"
+                    "Lark: send_draft cardkit_create failed, falling back to send()"
                 );
-                return Ok(None);
+                Ok(None)
             }
-        };
-
-        if !status.is_success() || extract_lark_response_code(&response).unwrap_or(0) != 0 {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "status": status.as_u16(),
-                        "body": response,
-                    })),
-                "Lark: send_draft non-success, falling back to send()"
-            );
-            return Ok(None);
         }
-
-        let message_id = response
-            .pointer("/data/message_id")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-
-        Ok(message_id)
     }
 
     /// Edit a previously-opened draft card with the latest accumulated
-    /// content. Per-`message_id` rate-limited via `last_draft_edit` so we
-    /// stay under Feishu's 5 QPS PATCH cap; calls inside the cooldown window
-    /// are silently dropped (the next caller will catch up). Soft-fails on
-    /// transport / token-refresh / 230020 rate-limit code so streaming token
-    /// loops never abort because of a single edit hiccup.
+    /// content using Cardkit path. Implements throttle-with-pending:
+    /// - Empty text is skipped (prevents "flash of old content")
+    /// - Throttle window (draft_update_interval_ms) is enforced with 50ms floor
+    /// - last_pushed_at only advances on actual PUSH (not on every call)
+    /// - Duplicate content is short-circuited
     async fn update_draft(
         &self,
         _recipient: &str,
         message_id: &str,
         text: &str,
     ) -> anyhow::Result<()> {
-        if message_id.is_empty() {
+        if message_id.is_empty() || text.is_empty() {
             return Ok(());
         }
 
-        {
-            let mut guard = self.last_draft_edit.lock().await;
-            if let Some(last) = guard.get(message_id) {
-                let elapsed_ms = u64::try_from(last.elapsed().as_millis()).unwrap_or(u64::MAX);
-                if elapsed_ms < self.draft_update_interval_ms {
-                    return Ok(());
-                }
+        let interval_ms = self.draft_update_interval_ms.max(50); // 50ms floor for 50 RPS limit
+
+        let mut streams = self.cardkit_streams.lock().await;
+        let state = match streams.get_mut(message_id) {
+            Some(s) => s,
+            None => {
+                // State not found - message may have been finalized already
+                return Ok(());
             }
-            guard.insert(message_id.to_string(), Instant::now());
+        };
+
+        // Throttle decision: check if enough time has elapsed since last PUSH
+        let elapsed_ms = if let Some(last) = state.last_pushed_at {
+            u64::try_from(last.elapsed().as_millis()).unwrap_or(u64::MAX)
+        } else {
+            u64::MAX
+        };
+        let should_push = elapsed_ms >= interval_ms;
+
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "message_id": message_id,
+                    "interval_ms": interval_ms,
+                    "elapsed_ms": elapsed_ms,
+                    "should_push": should_push,
+                    "text_len": text.len(),
+                    "last_sent_len": state.last_sent_content.len(),
+                })
+            ),
+            "Lark: update_draft throttle decision"
+        );
+
+        if !should_push {
+            // Still in throttle window - cache the latest text for next PUSH
+            // Don't advance last_pushed_at here (that would cause window drift)
+            state.last_sent_content = text.to_string();
+            return Ok(());
         }
 
-        let rendered = truncate_card_markdown(text, LARK_CARD_MARKDOWN_MAX_BYTES);
-        self.patch_card_content(message_id, &rendered).await
+        // Short-circuit: same content as last push
+        if text == state.last_sent_content {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "message_id": message_id,
+                    })),
+                "Lark: update_draft skipping duplicate content"
+            );
+            return Ok(());
+        }
+
+        // Clone state for push (release lock during network call)
+        let card_id = state.card_id.clone();
+        let element_id = state.element_id.clone();
+        let sequence = state.sequence;
+        let uuid = state.current_uuid.clone();
+        let content = text.to_string();
+
+        // Reset the throttle timer BEFORE making the API call.
+        // This is critical: we want the next call to be allowed after
+        // `interval_ms` from NOW, not after the API response returns.
+        state.last_pushed_at = Some(Instant::now());
+        state.last_sent_content = content.clone();
+
+        // Release lock before spawning async call
+        drop(streams);
+
+        // Spawn the API call asynchronously to avoid blocking the caller.
+        // This allows the orchestrator to continue processing LLM tokens
+        // without waiting for the Lark API response (~300ms).
+        let self_arc = Arc::new(self.clone());
+        let message_id_owned = message_id.to_string();
+        zeroclaw_spawn::spawn!(async move {
+            let push_start = Instant::now();
+            let content_len = content.len();
+
+            match self_arc
+                .cardkit_push_content(&card_id, &element_id, &content, sequence, &uuid)
+                .await
+            {
+                Ok(()) => {
+                    let push_duration_ms = push_start.elapsed().as_millis();
+
+                    // Success - bump sequence and rotate uuid
+                    self_arc.bump_cardkit_sequence(&message_id_owned).await;
+
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "message_id": message_id_owned,
+                                "sequence": sequence,
+                                "push_duration_ms": push_duration_ms,
+                                "content_len": content_len,
+                            })),
+                        "Lark: update_draft pushed content via Cardkit (async)"
+                    );
+                }
+                Err(err) => {
+                    // Soft fail - don't bump sequence, retry next time with same uuid
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "message_id": message_id_owned,
+                                "error": format!("{err}"),
+                                "error_key": "lark.update_draft.cardkit_push_failed_async",
+                            })),
+                        "Lark: update_draft cardkit_push_content failed (async)"
+                    );
+                }
+            }
+        });
+
+        // Return immediately - the API call is happening in the background
+        Ok(())
     }
 
     /// Same wire shape as `update_draft`; kept as a separate trait method so
@@ -2944,179 +3170,432 @@ impl Channel for LarkChannel {
         self.update_draft(recipient, message_id, text).await
     }
 
-    /// Commit the final response into the draft card. The first chunk is
-    /// PATCH-applied to the existing message_id; any overflow chunks are
-    /// posted as fresh interactive cards (with a single token-refresh retry
-    /// each) so long responses still land in full.
+    /// Commit the final response into the draft card using Cardkit path.
+    /// Snapshot state (don't evict) -> push final content -> close streaming.
     async fn finalize_draft(
         &self,
-        recipient: &str,
+        _recipient: &str,
         message_id: &str,
         text: &str,
     ) -> anyhow::Result<()> {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "message_id": message_id,
+                    "text_len": text.len(),
+                })
+            ),
+            "Lark: finalize_draft called"
+        );
+
         if message_id.is_empty() {
-            return self.send(&SendMessage::new(text, recipient)).await;
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"message_id": message_id})),
+                "Lark: finalize_draft skipped - empty message_id"
+            );
+            return Ok(());
         }
 
-        self.last_draft_edit.lock().await.remove(message_id);
-
-        let chunks = split_markdown_chunks(text, LARK_CARD_MARKDOWN_MAX_BYTES);
-        let first = chunks.first().copied().unwrap_or("");
-        self.patch_card_content(message_id, first).await?;
-
-        if chunks.len() > 1 {
-            let token = self.get_tenant_access_token().await?;
-            let url = self.send_message_url();
-            for chunk in &chunks[1..] {
-                let body = build_interactive_card_body(recipient, chunk);
-                let (status, response) = self.send_text_once(&url, &token, &body).await?;
-                if should_refresh_lark_tenant_token(status, &response) {
-                    self.invalidate_token().await;
-                    let new_token = self.get_tenant_access_token().await?;
-                    let (retry_status, retry_response) =
-                        self.send_text_once(&url, &new_token, &body).await?;
-                    ensure_lark_send_success(
-                        retry_status,
-                        &retry_response,
-                        "after token refresh (finalize_draft)",
-                    )?;
-                } else {
-                    ensure_lark_send_success(status, &response, "finalize_draft chunk")?;
+        // Snapshot state without evicting (cardkit_close_streaming will evict)
+        let state = {
+            let streams = self.cardkit_streams.lock().await;
+            match streams.get(message_id).cloned() {
+                Some(s) => s,
+                None => {
+                    // State not found - may have been finalized already
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"message_id": message_id})),
+                        "Lark: finalize_draft skipped - state not found"
+                    );
+                    return Ok(());
                 }
             }
-        }
+        };
 
-        Ok(())
-    }
-
-    /// Replace the draft body with a "cancelled" marker. Feishu does not
-    /// expose an official "delete-draft" endpoint, so the closest faithful
-    /// signal is a one-line PATCH that overwrites the card content. We
-    /// best-effort emit the marker, then unconditionally evict the
-    /// `last_draft_edit` rate-limit entry so the per-message_id slot is
-    /// reclaimed even when the PATCH itself fails (matching the
-    /// `finalize_draft` cleanup contract — see the field doc on
-    /// `last_draft_edit`).
-    async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
-        let result = self
-            .update_draft(recipient, message_id, "_(cancelled)_")
-            .await;
-        self.last_draft_edit.lock().await.remove(message_id);
-        result
-    }
-}
-
-impl LarkChannel {
-    /// PATCH the draft card body with new markdown content.
-    ///
-    /// Used by both `update_draft` (per-token streaming) and
-    /// `finalize_draft` (last-chunk commit). Soft-fails on every error
-    /// path — transport (reqwest), token-refresh-still-401, the explicit
-    /// 230020 frequency-limit code, and any other non-zero Feishu business
-    /// code — because the streaming caller cannot meaningfully recover
-    /// from a single missed edit and dropping the error keeps the token
-    /// loop alive. The signature still returns `anyhow::Result<()>` for
-    /// caller-shape compatibility, but it never returns `Err`; every
-    /// failure path is logged at WARN/DEBUG with a stable `error_key`
-    /// and the function returns `Ok(())`.
-    async fn patch_card_content(&self, message_id: &str, markdown: &str) -> anyhow::Result<()> {
-        let url = self.patch_message_url(message_id);
-        let body = serde_json::json!({
-            "content": build_card_content(markdown),
-        });
-
-        // First PATCH attempt — soft-fail transport errors instead of
-        // propagating them. The streaming caller invokes this per token,
-        // so a single transport hiccup must not break the token loop.
-        let (status, response) = match self.patch_or_send_once(&url, &body, true).await {
-            Ok(pair) => pair,
+        // Push final content
+        match self
+            .cardkit_push_content(
+                &state.card_id,
+                &state.element_id,
+                text,
+                state.sequence,
+                &state.current_uuid,
+            )
+            .await
+        {
+            Ok(()) => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "message_id": message_id,
+                        })),
+                    "Lark: finalize_draft pushed final content"
+                );
+            }
             Err(err) => {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(::serde_json::json!({
                             "message_id": message_id,
                             "error": format!("{err}"),
-                            "error_key": "lark.draft_patch.transport_failure",
+                            "error_key": "lark.finalize_draft.cardkit_push_failed",
                         })),
-                    "Lark: draft PATCH transport-failed (soft)"
+                    "Lark: finalize_draft cardkit_push_content failed (soft)"
                 );
-                return Ok(());
+            }
+        }
+
+        // Close streaming (evicts state internally)
+        self.cardkit_close_streaming(message_id).await?;
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "message_id": message_id,
+                })
+            ),
+            "Lark: finalize_draft closed streaming"
+        );
+
+        Ok(())
+    }
+
+    /// Cancel a draft using Cardkit path. Push cancel marker -> close streaming.
+    async fn cancel_draft(&self, _recipient: &str, message_id: &str) -> anyhow::Result<()> {
+        if message_id.is_empty() {
+            return Ok(());
+        }
+
+        // Snapshot state without evicting
+        let state = {
+            let streams = self.cardkit_streams.lock().await;
+            match streams.get(message_id).cloned() {
+                Some(s) => s,
+                None => return Ok(()),
             }
         };
 
-        let body_for_inspect = if should_refresh_lark_tenant_token(status, &response) {
-            self.invalidate_token().await;
-            // Retry PATCH after token refresh — same soft-fail discipline:
-            // a transport error on the retry must not propagate.
-            let (retry_status, retry_response) = match self
-                .patch_or_send_once(&url, &body, true)
-                .await
-            {
-                Ok(pair) => pair,
-                Err(err) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "message_id": message_id,
-                                "error": format!("{err}"),
-                                "error_key": "lark.draft_patch.transport_failure_on_retry",
-                            })),
-                        "Lark: draft PATCH retry transport-failed (soft)"
-                    );
-                    return Ok(());
-                }
-            };
-            if should_refresh_lark_tenant_token(retry_status, &retry_response) {
+        // Push cancel marker
+        match self
+            .cardkit_push_content(
+                &state.card_id,
+                &state.element_id,
+                "_(cancelled)_",
+                state.sequence,
+                &state.current_uuid,
+            )
+            .await
+        {
+            Ok(()) => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "message_id": message_id,
+                        })),
+                    "Lark: cancel_draft pushed cancel marker"
+                );
+            }
+            Err(err) => {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(::serde_json::json!({
                             "message_id": message_id,
-                            "body": retry_response,
-                            "error_key": "lark.draft_patch.unauthorized_after_refresh",
+                            "error": format!("{err}"),
+                            "error_key": "lark.cancel_draft.cardkit_push_failed",
                         })),
-                    "Lark: draft PATCH still unauthorized after token refresh"
+                    "Lark: cancel_draft cardkit_push_content failed (soft)"
                 );
-                return Ok(());
             }
-            retry_response
-        } else {
-            response
-        };
-
-        let code = extract_lark_response_code(&body_for_inspect).unwrap_or(0);
-        if code == LARK_DRAFT_RATE_LIMIT_CODE {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({
-                        "message_id": message_id,
-                        "error_key": "lark.draft_patch.rate_limited",
-                    })),
-                "Lark: draft PATCH rate-limited (code=230020)"
-            );
-            return Ok(());
         }
+
+        // Close streaming (evicts state internally)
+        self.cardkit_close_streaming(message_id).await?;
+
+        Ok(())
+    }
+}
+
+impl LarkChannel {
+    // Cardkit core methods
+
+    /// POST /cardkit/v1/cards - Create a card entity with streaming_mode enabled.
+    /// Returns the card_id for subsequent operations.
+    async fn cardkit_create(&self, recipient: &str, placeholder: &str) -> anyhow::Result<String> {
+        let token = self.get_tenant_access_token().await?;
+        let url = self.cardkit_create_url();
+
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "url": url,
+                    "recipient": recipient,
+                    "placeholder_len": placeholder.len(),
+                })
+            ),
+            "Lark: cardkit_create sending request"
+        );
+
+        // Build card JSON 2.0 with streaming_mode and update_multi enabled
+        // Structure: {schema, config, body: {elements: [...]}}
+        let card_json = serde_json::json!({
+            "schema": "2.0",
+            "config": {
+                "streaming_mode": true,
+                "update_multi": true,
+            },
+            "body": {
+                "elements": [{
+                    "element_id": LARK_CARDKIT_STREAM_ELEMENT_ID,
+                    "tag": "markdown",
+                    "content": truncate_card_markdown_chars(placeholder, LARK_CARDKIT_CONTENT_MAX_CHARS),
+                }]
+            },
+            "i18n": {}
+        });
+
+        // Create card entity - NO receive_id needed at this stage
+        // API format: {type: "card_json", data: card_json_string}
+        let body = serde_json::json!({
+            "type": "card_json",
+            "data": card_json.to_string(),
+        });
+
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({
+                    "card_json_config": card_json.get("config"),
+                    "elements_count": card_json.get("elements").and_then(|e| e.as_array()).map(|a| a.len()).unwrap_or(0),
+                })),
+            "Lark: cardkit_create request body"
+        );
+
+        let (status, response) = self.send_text_once(&url, &token, &body).await?;
+        let code = extract_lark_response_code(&response).unwrap_or(0);
+
         if code != 0 {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
-                        "message_id": message_id,
+                        "status": status.as_u16(),
                         "code": code,
-                        "body": body_for_inspect,
-                        "error_key": "lark.draft_patch.non_zero_code",
                     })),
-                "Lark: draft PATCH soft-failed"
+                "Lark: cardkit_create failed"
+            );
+            anyhow::bail!("cardkit_create failed with code {}", code);
+        }
+
+        let card_id = response
+            .pointer("/data/card_id")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| anyhow::anyhow!("no card_id in response"))?;
+
+        Ok(card_id)
+    }
+
+    /// PUT /cardkit/v1/cards/:card_id/elements/:element_id/content - Push content to card.
+    /// Implements sequence incrementing and uuid rotation per official API.
+    async fn cardkit_push_content(
+        &self,
+        card_id: &str,
+        element_id: &str,
+        content: &str,
+        sequence: i32,
+        uuid: &str,
+    ) -> anyhow::Result<()> {
+        let token = self.get_tenant_access_token().await?;
+        let url = self.cardkit_element_content_url(card_id, element_id);
+
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "url": url,
+                    "card_id": card_id,
+                    "element_id": element_id,
+                    "sequence": sequence,
+                    "uuid": uuid,
+                    "content_len": content.len(),
+                    "content_preview": content.chars().take(50).collect::<String>(),
+                })
+            ),
+            "Lark: cardkit_push_content sending PUT request"
+        );
+
+        // Direct API format: {uuid, content, sequence} (PUT /cardkit/v1/cards/:card_id/elements/:element_id/content)
+        let body = serde_json::json!({
+            "uuid": uuid,
+            "content": truncate_card_markdown_chars(content, LARK_CARDKIT_CONTENT_MAX_CHARS),
+            "sequence": sequence,
+        });
+
+        let (status, response) = self.cardkit_put(&url, &token, &body).await?;
+        // Parse response as JSON to extract code
+        let json: serde_json::Value =
+            serde_json::from_str(&response).unwrap_or(serde_json::Value::Null);
+        let code = extract_lark_response_code(&json).unwrap_or(0);
+
+        // Handle errors per official matrix
+        match code {
+            0 => Ok(()),
+            LARK_CARDKIT_SEQUENCE_NOT_INCREMENTING_CODE => {
+                // 300317: sequence not incrementing - refresh and retry once
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "card_id": card_id,
+                            "sequence": sequence,
+                            "error_key": "lark.cardkit.sequence_not_incrementing",
+                        })),
+                    "Lark: cardkit_push_content sequence not incrementing, refreshing state"
+                );
+                anyhow::bail!("sequence not incrementing: {}", code)
+            }
+            LARK_CARDKIT_IN_INTERACTION_CODE => {
+                // 200810: card in interaction - backoff and skip
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "card_id": card_id,
+                            "error_key": "lark.cardkit.in_interaction",
+                        })),
+                    "Lark: cardkit_push_content card in interaction, backing off"
+                );
+                Ok(())
+            }
+            LARK_CARDKIT_UPDATE_MULTI_FALSE_CODE => {
+                // 300302: update_multi=false - bail (config error)
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "card_id": card_id,
+                            "error_key": "lark.cardkit.update_multi_false",
+                        })),
+                    "Lark: cardkit_push_content update_multi=false (configuration error)"
+                );
+                anyhow::bail!("update_multi=false: {}", code)
+            }
+            LARK_CARDKIT_INVALID_CARD_JSON_CODE => {
+                // 200220: invalid card JSON - bail
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "card_id": card_id,
+                            "error_key": "lark.cardkit.invalid_json",
+                        })),
+                    "Lark: cardkit_push_content invalid card JSON"
+                );
+                anyhow::bail!("invalid card JSON: {}", code)
+            }
+            _ => {
+                // Other errors - soft fail with WARN
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "card_id": card_id,
+                            "code": code,
+                            "status": status.as_u16(),
+                            "error_key": "lark.cardkit.push_content_error",
+                        })),
+                    "Lark: cardkit_push_content failed (soft)"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// PATCH /cardkit/v1/cards/:card_id/settings - Close streaming mode and evict state.
+    async fn cardkit_close_streaming(&self, message_id: &str) -> anyhow::Result<()> {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "message_id": message_id,
+                })
+            ),
+            "Lark: cardkit_close_streaming called"
+        );
+
+        let mut streams = self.cardkit_streams.lock().await;
+        let state = match streams.remove(message_id) {
+            Some(s) => s,
+            None => {
+                // State already gone - silent return (no-op)
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"message_id": message_id})),
+                    "Lark: cardkit_close_streaming skipped - state not found"
+                );
+                return Ok(());
+            }
+        };
+
+        let token = self.get_tenant_access_token().await?;
+        let url = self.cardkit_settings_url(&state.card_id);
+
+        // Direct API format: {settings: JSON.stringify({...}), sequence} (PATCH /cardkit/v1/cards/:card_id/settings)
+        // Note: openclaw implementation uses {streaming_mode: false} directly, not {config: {streaming_mode: false}}
+        let settings_json = serde_json::json!({ "streaming_mode": false }).to_string();
+        let body = serde_json::json!({
+            "settings": settings_json,
+            "sequence": state.sequence.saturating_add(1),
+        });
+
+        // Use PATCH method for settings endpoint
+        let (_status, response) = self.cardkit_patch(&url, &token, &body).await?;
+        let json: serde_json::Value =
+            serde_json::from_str(&response).unwrap_or(serde_json::Value::Null);
+        let code = extract_lark_response_code(&json).unwrap_or(0);
+
+        if code != 0 {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "card_id": &state.card_id,
+                        "code": code,
+                        "error_key": "lark.cardkit_close_streaming.soft_failure",
+                    })),
+                "Lark: cardkit_close_streaming failed (soft)"
             );
         }
         Ok(())
+    }
+
+    /// Bump sequence and rotate uuid after successful push.
+    async fn bump_cardkit_sequence(&self, message_id: &str) {
+        let mut streams = self.cardkit_streams.lock().await;
+        if let Some(state) = streams.get_mut(message_id) {
+            state.sequence = state.sequence.saturating_add(1);
+            state.current_uuid = Uuid::new_v4().to_string();
+        }
     }
 }
 
