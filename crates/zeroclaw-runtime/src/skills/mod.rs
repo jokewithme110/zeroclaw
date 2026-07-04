@@ -1600,10 +1600,10 @@ pub fn skills_dir(workspace_dir: &Path) -> PathBuf {
 pub fn uninstall_local_skill(skills_path: &Path, slug: &str) -> Result<bool> {
     validate_skill_slug(slug)?;
 
-    // Use the same on-disk naming as `install_skillhub_skill` so a
-    // `skill_remove foo-bar` after `skill_install foo-bar` actually
-    // finds the directory (which is written as `foo_bar/`).
-    let dir = skills_path.join(skill_dir_name(slug));
+    // Directory name uses the slug verbatim. `install_skillhub_skill`
+    // and `install_git_skill_source`/`install_local_skill_source` all
+    // write under `skills/<slug>/`, so the reader must match.
+    let dir = skills_path.join(slug);
     if !dir.exists() {
         return Ok(false);
     }
@@ -1621,6 +1621,84 @@ pub fn uninstall_local_skill(skills_path: &Path, slug: &str) -> Result<bool> {
     std::fs::remove_dir_all(&dir)
         .with_context(|| format!("failed to remove skill directory: {}", dir.display()))?;
     Ok(true)
+}
+
+/// Uninstall a skill by its manifest `name` field (NOT its directory slug).
+///
+/// SkillHub is an open platform — third-party skill authors may write
+/// `SKILL.md` with a `name` that differs from the directory slug used by
+/// `install_skillhub_skill`. When the LLM (or operator) only knows the
+/// manifest name, this entry point scans `skills_path`, parses each
+/// entry's `SKILL.md` frontmatter, and removes the first directory whose
+/// manifest `name` matches. The actual deletion delegates to
+/// [`uninstall_local_skill`] so the same path-traversal guard and
+/// canonical-path containment check apply.
+///
+/// Returns:
+/// - `Ok(Some(slug))` when a match was found and removed — `slug` is the
+///   directory name that was deleted, useful for surfacing a precise
+///   follow-up message.
+/// - `Ok(None)` when no installed skill has the requested manifest name.
+/// - `Err` on invalid input (empty/`..`/separators) or filesystem error.
+pub fn uninstall_local_skill_by_name(skills_path: &Path, name: &str) -> Result<Option<String>> {
+    if name.is_empty() {
+        anyhow::bail!("invalid skill name: must be non-empty");
+    }
+    if name.contains("..") || name.contains('/') || name.contains('\\') || name.contains(':') {
+        anyhow::bail!("invalid skill name '{name}': contains '..', '/', '\\\\', or ':'");
+    }
+
+    // Skills directory may not exist on a fresh workspace — treat that as
+    // "no installed skills" rather than an IO error, matching the slug-path
+    // short-circuit in `uninstall_local_skill`. Other I/O errors (e.g. EACCES)
+    // still surface so the caller can distinguish permission issues from
+    // a genuine miss.
+    let entries = match std::fs::read_dir(skills_path) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!(
+                "failed to read skills directory: {}",
+                skills_path.display()
+            )));
+        }
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        // Only consider directories whose own name is a valid slug —
+        // anything else is untrusted leftover and never gets deleted.
+        let slug = match path.file_name().and_then(|n| n.to_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        if validate_skill_slug(slug).is_err() {
+            continue;
+        }
+
+        let skill_md = path.join("SKILL.md");
+        if !skill_md.exists() {
+            continue;
+        }
+
+        let content = match std::fs::read_to_string(&skill_md) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let parsed = parse_skill_markdown(&content);
+        if parsed.meta.name.as_deref() == Some(name) {
+            uninstall_local_skill(skills_path, slug)?;
+            return Ok(Some(slug.to_string()));
+        }
+    }
+
+    Ok(None)
 }
 
 /// Initialize the skills directory with a README
@@ -1776,38 +1854,6 @@ pub fn validate_skill_slug(slug: &str) -> Result<()> {
     Ok(())
 }
 
-/// Derive the on-disk skill directory name from a raw slug.
-///
-/// This is the single source of truth for the on-disk naming convention
-/// used by both `install_skillhub_skill` (writer) and
-/// `uninstall_local_skill` (reader). The two must agree byte-for-byte,
-/// or `skill_remove <slug>` after `skill_install <slug>` will silently
-/// miss the directory.
-///
-/// Rules:
-/// - lowercase
-/// - `-` -> `_`
-/// - keep ASCII alphanumerics + `_`
-/// - drop everything else
-/// - if the result is empty, return the literal `"skill"` (matches the
-///   install-side fallback for a slug like `@1.0.0` with no name part)
-///
-/// Callers are expected to have already run the slug through
-/// [`validate_skill_slug`] before reaching here.
-pub fn skill_dir_name(slug: &str) -> String {
-    let normalized: String = slug
-        .to_lowercase()
-        .chars()
-        .map(|c| if c == '-' { '_' } else { c })
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
-        .collect();
-    if normalized.is_empty() {
-        "skill".to_string()
-    } else {
-        normalized
-    }
-}
-
 /// Build a download URL for a given slug+version on a SkillHub base URL.
 ///
 /// `base_url` should be a normalized SkillHub base URL with no trailing
@@ -1829,7 +1875,7 @@ pub fn skillhub_download_url(base_url: &str, slug: &str, version: &str) -> Strin
 /// `parse_skillhub_source`).
 pub fn skillhub_skill_dir_name(source: &str) -> Result<String> {
     let (slug, _version) = parse_skillhub_source(source)?;
-    Ok(skill_dir_name(&slug))
+    Ok(slug)
 }
 
 pub fn is_git_source(source: &str) -> bool {
@@ -2135,7 +2181,7 @@ pub async fn install_skillhub_skill(
     force: bool,
 ) -> Result<(PathBuf, usize)> {
     let download_url = skillhub_download_url(base_url, slug, version);
-    let installed_dir = skills_path.join(skill_dir_name(slug));
+    let installed_dir = skills_path.join(slug);
     if installed_dir.exists() {
         if force {
             // Force reinstall: remove the existing directory first.

@@ -14,8 +14,8 @@
 //! only API-surface delta.
 
 use zeroclaw_runtime::skills::{
-    is_skillhub_source, parse_http_skill_url, parse_skillhub_source, skill_dir_name,
-    skillhub_download_url, skillhub_skill_dir_name, validate_skill_slug,
+    is_skillhub_source, parse_http_skill_url, parse_skillhub_source, skillhub_download_url,
+    skillhub_skill_dir_name, validate_skill_slug,
 };
 
 // ── is_skillhub_source ──────────────────────────────────────────────
@@ -153,16 +153,21 @@ fn skillhub_download_url_encodes_slug_and_version() {
 // ── skillhub_skill_dir_name ─────────────────────────────────────────
 
 #[test]
-fn skillhub_skill_dir_name_normalizes_hyphens() {
-    // kebab-case -> snake_case (与旧行为一致)
+fn skillhub_skill_dir_name_returns_slug_verbatim() {
+    // SkillHub is an open platform: third-party authors write SKILL.md
+    // with whatever naming they prefer, and `command` strings reference
+    // scripts via paths that contain the original slug (e.g.
+    // `skills/device-health/device-health.sh`). The on-disk directory
+    // must match the slug byte-for-byte so `execution_dir` (= SKILL.md
+    // parent) and the relative script path agree.
     let name = skillhub_skill_dir_name("clawhub:attendance-query-lite").unwrap();
-    assert_eq!(name, "attendance_query_lite");
+    assert_eq!(name, "attendance-query-lite");
 }
 
 #[test]
 fn skillhub_skill_dir_name_handles_url_form() {
     let name = skillhub_skill_dir_name("https://example.com/owner/attendance-query-lite").unwrap();
-    assert_eq!(name, "attendance_query_lite");
+    assert_eq!(name, "attendance-query-lite");
 }
 
 // ── parse_http_skill_url ────────────────────────────────────────────
@@ -223,30 +228,4 @@ fn parse_skillhub_source_now_runs_slug_through_validator() {
     // URL form: last path segment is validated the same way.
     assert!(parse_skillhub_source("https://hub.example.com/..").is_err());
     assert!(parse_skillhub_source("https://hub.example.com/foo$bar").is_err());
-}
-
-// ── skill_dir_name (R3) ──────────────────────────────────────────────
-
-#[test]
-fn skill_dir_name_lowercases_and_normalizes() {
-    assert_eq!(
-        skill_dir_name("Attendance-Query-Lite"),
-        "attendance_query_lite"
-    );
-    assert_eq!(skill_dir_name("foo"), "foo");
-    assert_eq!(skill_dir_name("foo-bar"), "foo_bar");
-    assert_eq!(skill_dir_name("foo.v2"), "foo.v2");
-}
-
-#[test]
-fn skill_dir_name_falls_back_to_lit_skill_for_empty() {
-    // empty -> "skill"; but `---` survives as `___` (filter keeps `_`),
-    // and `..` survives as `..` (filter keeps `.`). Callers are expected
-    // to have already run `validate_skill_slug` (which rejects `..`).
-    assert_eq!(skill_dir_name(""), "skill");
-    assert_eq!(skill_dir_name("---"), "___");
-    assert_eq!(skill_dir_name(".."), "..");
-    // truly empty-after-filter: only non-[A-Za-z0-9_.] chars (e.g. spaces)
-    assert_eq!(skill_dir_name("   "), "skill");
-    assert_eq!(skill_dir_name("foo bar"), "foobar");
 }

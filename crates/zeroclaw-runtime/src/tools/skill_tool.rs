@@ -968,4 +968,81 @@ mod tests {
             "the scoped elevation wrapper must be the only callable path"
         );
     }
+
+    /// Regression test for the SkillHub hyphen-slug path mismatch bug.
+    ///
+    /// `install_skillhub_skill` used to write the skill under
+    /// `skills/device_health/` (hyphen → underscore), so the `execution_dir`
+    /// computed here from `SKILL.md`'s parent would point at `device_health/`
+    /// while the `command` string in the manifest referenced
+    /// `skills/device-health/device-health.sh`. The relative-path lookup then
+    /// resolved to `skills/device_health/skills/device-health/device-health.sh`
+    /// and failed with `not found`.
+    ///
+    /// The fix pins the on-disk directory name to the slug verbatim, so
+    /// `execution_dir` and the `command` path agree on `skills/device-health/...`.
+    /// This test asserts the invariant: `execution_dir` is whatever directory
+    /// the install side just wrote into, byte-for-byte equal to the slug
+    /// directory — not a platform-normalised variant.
+    #[test]
+    fn skill_shell_tool_execution_dir_matches_hyphenated_slug() {
+        use crate::skills::SkillTool;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Mirror the post-install layout: skill directory uses the slug
+        // verbatim (`device-health`, not `device_health`).
+        let skill_root = tmp.path().join("skills").join("device-health");
+        std::fs::create_dir_all(&skill_root).unwrap();
+        let manifest = skill_root.join("SKILL.md");
+        std::fs::write(&manifest, "---\nname: device-health\n---\n").unwrap();
+        // Mirrors the SKILL.md `command` written by the third-party author:
+        // relative path that keeps the original hyphenated slug.
+        std::fs::write(skill_root.join("device-health.sh"), "#!/bin/sh\necho ok\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(skill_root.join("device-health.sh"))
+                .unwrap()
+                .permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(skill_root.join("device-health.sh"), perm).unwrap();
+        }
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+
+        let tool_entry = SkillTool {
+            name: "run".into(),
+            description: "test".into(),
+            kind: "shell".into(),
+            command: "skills/device-health/device-health.sh".into(),
+            args: HashMap::new(),
+            target: None,
+            locked_args: HashMap::new(),
+            method: None,
+            headers: HashMap::new(),
+            body: None,
+        };
+
+        let instance = SkillShellTool::new(
+            "device-health",
+            &tool_entry,
+            security,
+            Some(manifest.as_path()),
+        );
+
+        // The relative-path script lives at `<execution_dir>/skills/device-health/device-health.sh`,
+        // so if `execution_dir` were the buggy `device_health/` the path
+        // would resolve to `device_health/skills/device-health/device-health.sh`
+        // and the script would not be found.
+        assert_eq!(
+            instance.execution_dir, skill_root,
+            "execution_dir must equal the slug directory verbatim; \
+             a hyphenated slug like 'device-health' must NOT be rewritten to \
+             'device_health' here"
+        );
+    }
 }

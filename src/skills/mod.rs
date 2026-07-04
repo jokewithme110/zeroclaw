@@ -97,7 +97,10 @@ pub async fn handle_command(
             let target = if source_path.exists() {
                 source_path
             } else {
-                skills_dir(&workspace_dir).join(zeroclaw_runtime::skills::skill_dir_name(&source))
+                // Installed skills live under `skills/<source>/`. The slug
+                // is used verbatim — `source` here is an installed skill
+                // name (matched against the manifest or directory name).
+                skills_dir(&workspace_dir).join(&source)
             };
 
             if !target.exists() {
@@ -265,13 +268,13 @@ pub async fn handle_command(
             }
 
             // Scan installed skills to find the matching directory.
-            // Match by manifest name first, then by normalized slug
-            // (the on-disk directory name). The two can differ: slug
-            // "taiwan-property-valuation" → dir "taiwan_property_valuation"
-            // while the SKILL.toml declares name = "property-valuation".
+            // Match by manifest name first, then by on-disk directory
+            // name (which is the slug verbatim). The two can differ:
+            // SKILL.toml may declare `name = "property-valuation"` while
+            // the slug used to install was "taiwan-property-valuation".
             let skills = load_skills_with_config(&workspace_dir, config);
             let found = skills.iter().find(|s| s.name == name).or_else(|| {
-                let dir_name = zeroclaw_runtime::skills::skill_dir_name(&name);
+                let dir_name = name.as_str();
                 skills.iter().find(|s| {
                     s.location
                         .as_ref()
@@ -287,10 +290,7 @@ pub async fn handle_command(
                     .as_ref()
                     .and_then(|loc| loc.parent())
                     .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| {
-                        skills_dir(&workspace_dir)
-                            .join(zeroclaw_runtime::skills::skill_dir_name(&name))
-                    });
+                    .unwrap_or_else(|| skills_dir(&workspace_dir).join(&name));
                 let removed_name = &skill.name;
                 std::fs::remove_dir_all(&dir)?;
                 println!(
