@@ -14197,6 +14197,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-fixture-channel"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "serde_json",
+ "tokio",
+ "zeroclaw-api",
+ "zeroclaw-macros",
+]
+
+[[package]]
 name = "zeroclaw-fixture-dynamic"
 version = "0.8.0"
 dependencies = [
@@ -14204,6 +14216,30 @@ dependencies = [
  "async-trait",
  "serde_json",
  "zeroclaw-api",
+ "zeroclaw-macros",
+]
+
+[[package]]
+name = "zeroclaw-fixture-handwritten"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "serde_json",
+ "tokio",
+ "zeroclaw-api",
+]
+
+[[package]]
+name = "zeroclaw-fixture-multi"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "serde_json",
+ "tokio",
+ "zeroclaw-api",
+ "zeroclaw-macros",
 ]
 
 [[package]]
@@ -14338,6 +14374,8 @@ dependencies = [
  "toml 1.1.2+spec-1.1.0",
  "zeroclaw-api",
  "zeroclaw-fixture-dynamic",
+ "zeroclaw-fixture-handwritten",
+ "zeroclaw-fixture-multi",
  "zeroclaw-log",
 ]
 
@@ -14729,6 +14767,8 @@ dependencies = [
  "zeroclaw-config",
  "zeroclaw-dt-nodes",
  "zeroclaw-fixture-dynamic",
+ "zeroclaw-fixture-handwritten",
+ "zeroclaw-fixture-multi",
  "zeroclaw-fixture-static",
  "zeroclaw-gateway",
  "zeroclaw-hardware",

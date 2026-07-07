@@ -1,9 +1,9 @@
 [package]
-name = "zeroclaw-fixture-dynamic"
+name = "zeroclaw-fixture-handwritten"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Reference cdylib plugin for ZeroClaw — used by loader integration tests and as community-facing template."
+description = "Handwritten C-style dynamic plugin fixture (no macros) for ZeroClaw."
 publish = false
 
 [lib]
@@ -11,7 +11,9 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 zeroclaw-api.workspace = true
-zeroclaw-macros.workspace = true
 anyhow = "1.0"
 async-trait = "0.1"
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }

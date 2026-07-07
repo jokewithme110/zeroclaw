@@ -1,7 +1,9 @@
 use proc_macro::TokenStream;
+use proc_macro2::Span;
 use quote::{ToTokens, quote};
 use syn::{
-    Data, DeriveInput, Fields, GenericArgument, Lit, Meta, PathArguments, parse_macro_input,
+    Data, DeriveInput, Fields, FnArg, GenericArgument, ItemFn, Lit, Meta, PathArguments,
+    parse_macro_input,
 };
 
 /// Check if a type is a known compound container (Vec, HashMap, etc.)
@@ -2783,6 +2785,478 @@ fn extract_hashmap_value_type(ty: &syn::Type) -> Option<&syn::Type> {
     extract_type_arg("HashMap", 1, ty)
 }
 
+// ── Plugin attribute macros ─────────────────────────────────────────────────
+
+/// Attribute macro that wraps a Rust factory function into a complete
+/// ZeroClaw dynamic-plugin FFI export.
+///
+/// This is the **single-component** convenience form: it emits the factory
+/// wrapper plus the two required `#[no_mangle]` symbols (`zc_api_version` and
+/// `zc_register_plugins`). If you need to register multiple components from
+/// one cdylib, use [`plugin_module`] with [`plugin_entry`] instead.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// use zeroclaw_macros::plugin;
+/// use zeroclaw_api::tool::Tool;
+///
+/// #[plugin(tool = "my-tool")]
+/// fn make_my_tool() -> Box<dyn Tool> {
+///     Box::new(MyTool)
+/// }
+/// ```
+///
+/// The macro preserves the original function and emits three additional items:
+///
+/// 1. An `unsafe extern "C"` factory wrapper matching [`ToolFactoryFn`]
+///    (or the corresponding factory type for the chosen component kind).
+/// 2. `#[unsafe(no_mangle)] pub extern "C" fn zc_api_version() -> u32`
+/// 3. `#[unsafe(no_mangle)] pub unsafe extern "C" fn zc_register_plugins(handle: *mut PluginHandle)`
+///
+/// # Supported component kinds
+///
+/// | Attribute            | Register callback      | Factory type suffix |
+/// |----------------------|------------------------|---------------------|
+/// | `tool = "name"`      | `register_tool`        | `ToolFactoryFn`     |
+/// | `provider = "name"`  | `register_provider`    | `ProviderFactoryFn` |
+/// | `channel = "name"`   | `register_channel`     | `ChannelFactoryFn`  |
+/// | `memory = "name"`    | `register_memory`      | `MemoryFactoryFn`   |
+/// | `observer = "name"`  | `register_observer`    | `ObserverFactoryFn` |
+/// | `runtime = "name"`   | `register_runtime`     | `RuntimeFactoryFn`  |
+/// | `peripheral = "name"`| `register_peripheral`  | `PeripheralFactoryFn`|
+///
+/// # Factory signatures
+///
+/// The decorated function may have **zero** parameters or **one** `&str`
+/// parameter (the JSON config slice). Anything else is a compile error.
+///
+/// ```rust,ignore
+/// // No config – wrapper ignores the JSON bytes passed by the host.
+/// #[plugin(tool = "echo")]
+/// fn make_echo() -> Box<dyn Tool> { Box::new(EchoTool) }
+///
+/// // With config – wrapper converts the raw bytes to &str and forwards it.
+/// #[plugin(tool = "echo")]
+/// fn make_echo(config: &str) -> Box<dyn Tool> {
+///     let cfg: EchoConfig = serde_json::from_str(config).unwrap();
+///     Box::new(EchoTool::new(cfg))
+/// }
+/// ```
+///
+/// # Safety
+///
+/// The decorated factory must not panic. A panic crossing the `extern "C"`
+/// wrapper boundary is undefined behavior.
+#[proc_macro_attribute]
+pub fn plugin(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = match syn::parse::<PluginArgs>(args) {
+        Ok(a) => a,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let input_fn = match syn::parse::<ItemFn>(input) {
+        Ok(f) => f,
+        Err(e) => return e.to_compile_error().into(),
+    };
+
+    let wrapper = match generate_plugin_wrapper(&args, &input_fn) {
+        Ok(w) => w,
+        Err(e) => return e.to_compile_error().into(),
+    };
+
+    let entry = match PluginEntry::from_args(&args, &input_fn.sig.ident) {
+        Ok(e) => e,
+        Err(e) => return e.to_compile_error().into(),
+    };
+
+    let registry = generate_plugin_registry(&[entry]);
+
+    TokenStream::from(quote! {
+        #input_fn
+        #wrapper
+        #registry
+    })
+}
+
+/// Attribute macro that emits only the factory wrapper for a component.
+///
+/// Use this inside a `#[plugin_module]` block; the module-level macro collects
+/// all `#[plugin_entry(...)]` functions and emits a single `zc_register_plugins`
+/// that registers them all. Using `#[plugin_entry]` outside `#[plugin_module]`
+/// produces a wrapper without exporting the cdylib symbols — useful only when
+/// you write `zc_register_plugins` manually.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// use zeroclaw_macros::{plugin_module, plugin_entry};
+/// use zeroclaw_api::tool::Tool;
+///
+/// #[plugin_module]
+/// mod my_plugin {
+///     use super::*;
+///
+///     #[plugin_entry(tool = "echo")]
+///     fn make_echo() -> Box<dyn Tool> { Box::new(EchoTool) }
+/// }
+/// ```
+///
+/// # Safety
+///
+/// The decorated factory must not panic. A panic crossing the `extern "C"`
+/// wrapper boundary is undefined behavior.
+#[proc_macro_attribute]
+pub fn plugin_entry(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = match syn::parse::<PluginArgs>(args) {
+        Ok(a) => a,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let input_fn = match syn::parse::<ItemFn>(input) {
+        Ok(f) => f,
+        Err(e) => return e.to_compile_error().into(),
+    };
+
+    let wrapper = match generate_plugin_wrapper(&args, &input_fn) {
+        Ok(w) => w,
+        Err(e) => return e.to_compile_error().into(),
+    };
+
+    TokenStream::from(quote! {
+        #input_fn
+        #wrapper
+    })
+}
+
+/// Module-level attribute for multi-component dynamic plugins.
+///
+/// Place `#[plugin_module]` on a module that contains any number of
+/// `#[plugin_entry(kind = "name")]`-decorated factory functions. The macro
+/// scans the module, generates a factory wrapper for each function, and emits
+/// a single pair of `zc_api_version` / `zc_register_plugins` symbols that
+/// register all components at once.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// use zeroclaw_macros::plugin_module;
+/// use zeroclaw_api::tool::Tool;
+///
+/// #[plugin_module]
+/// mod my_plugin {
+///     use super::*;
+///
+///     #[plugin_entry(tool = "echo")]
+///     fn make_echo() -> Box<dyn Tool> { Box::new(EchoTool) }
+///
+///     #[plugin_entry(tool = "reverse")]
+///     fn make_reverse() -> Box<dyn Tool> { Box::new(ReverseTool) }
+/// }
+/// ```
+///
+/// # Safety
+///
+/// Each decorated factory must not panic. A panic crossing the `extern "C"`
+/// wrapper boundary is undefined behavior.
+#[proc_macro_attribute]
+pub fn plugin_module(_args: TokenStream, input: TokenStream) -> TokenStream {
+    let mut module = match syn::parse::<syn::ItemMod>(input) {
+        Ok(m) => m,
+        Err(e) => return e.to_compile_error().into(),
+    };
+
+    let mut entries: Vec<PluginEntry> = Vec::new();
+    let mut new_items: Vec<syn::Item> = Vec::new();
+
+    let items = match module.content.as_mut() {
+        Some((_, items)) => items,
+        None => {
+            return syn::Error::new_spanned(&module, "#[plugin_module] requires a module body")
+                .to_compile_error()
+                .into();
+        }
+    };
+
+    for item in items.drain(..) {
+        match item {
+            syn::Item::Fn(mut item_fn) => {
+                let plugin_attr_idx = item_fn
+                    .attrs
+                    .iter()
+                    .position(|attr| attr.path().is_ident("plugin_entry"));
+
+                match plugin_attr_idx {
+                    Some(idx) => {
+                        let attr = item_fn.attrs.remove(idx);
+                        let args = match attr.parse_args::<PluginArgs>() {
+                            Ok(a) => a,
+                            Err(e) => return e.to_compile_error().into(),
+                        };
+
+                        let wrapper = match generate_plugin_wrapper(&args, &item_fn) {
+                            Ok(w) => w,
+                            Err(e) => return e.to_compile_error().into(),
+                        };
+
+                        let entry = match PluginEntry::from_args(&args, &item_fn.sig.ident) {
+                            Ok(e) => e,
+                            Err(e) => return e.to_compile_error().into(),
+                        };
+                        entries.push(entry);
+
+                        new_items.push(syn::Item::Fn(item_fn));
+                        match syn::parse2::<syn::Item>(wrapper) {
+                            Ok(wrapper_item) => new_items.push(wrapper_item),
+                            Err(e) => return e.to_compile_error().into(),
+                        }
+                    }
+                    None => new_items.push(syn::Item::Fn(item_fn)),
+                }
+            }
+            other => new_items.push(other),
+        }
+    }
+
+    *items = new_items;
+
+    let registry = generate_plugin_registry(&entries);
+    let registry_file: syn::File = match syn::parse2(registry) {
+        Ok(f) => f,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    items.extend(registry_file.items);
+
+    module.to_token_stream().into()
+}
+
+/// Parsed `#[plugin(tool = "name")]` arguments.
+struct PluginArgs {
+    kind: syn::Ident,
+    name: syn::LitStr,
+}
+
+impl syn::parse::Parse for PluginArgs {
+    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+        let kind: syn::Ident = input.parse()?;
+        input.parse::<syn::Token![=]>()?;
+        let name: syn::LitStr = input.parse()?;
+        Ok(PluginArgs { kind, name })
+    }
+}
+
+/// Component kind → register callback, factory type, trait path.
+struct ComponentInfo {
+    register_fn: &'static str,
+    factory_ty: &'static str,
+    trait_path: proc_macro2::TokenStream,
+}
+
+fn component_info(kind: &str) -> Option<ComponentInfo> {
+    match kind {
+        "tool" => Some(ComponentInfo {
+            register_fn: "register_tool",
+            factory_ty: "zeroclaw_api::plugin::ToolFactoryFn",
+            trait_path: quote!(dyn zeroclaw_api::tool::Tool),
+        }),
+        "provider" => Some(ComponentInfo {
+            register_fn: "register_provider",
+            factory_ty: "zeroclaw_api::plugin::ProviderFactoryFn",
+            trait_path: quote!(dyn zeroclaw_api::model_provider::ModelProvider),
+        }),
+        "channel" => Some(ComponentInfo {
+            register_fn: "register_channel",
+            factory_ty: "zeroclaw_api::plugin::ChannelFactoryFn",
+            trait_path: quote!(dyn zeroclaw_api::channel::Channel),
+        }),
+        "memory" => Some(ComponentInfo {
+            register_fn: "register_memory",
+            factory_ty: "zeroclaw_api::plugin::MemoryFactoryFn",
+            trait_path: quote!(dyn zeroclaw_api::memory_traits::Memory),
+        }),
+        "observer" => Some(ComponentInfo {
+            register_fn: "register_observer",
+            factory_ty: "zeroclaw_api::plugin::ObserverFactoryFn",
+            trait_path: quote!(dyn zeroclaw_api::observability_traits::Observer),
+        }),
+        "runtime" => Some(ComponentInfo {
+            register_fn: "register_runtime",
+            factory_ty: "zeroclaw_api::plugin::RuntimeFactoryFn",
+            trait_path: quote!(dyn zeroclaw_api::runtime_traits::RuntimeAdapter),
+        }),
+        "peripheral" => Some(ComponentInfo {
+            register_fn: "register_peripheral",
+            factory_ty: "zeroclaw_api::plugin::PeripheralFactoryFn",
+            trait_path: quote!(dyn zeroclaw_api::peripherals_traits::Peripheral),
+        }),
+        _ => None,
+    }
+}
+
+/// One component entry collected while scanning a `#[plugin_module]`.
+struct PluginEntry {
+    register_fn: syn::Ident,
+    factory_ty: syn::Type,
+    wrapper_ident: syn::Ident,
+    name: syn::LitByteStr,
+}
+
+impl PluginEntry {
+    fn from_args(args: &PluginArgs, factory_ident: &syn::Ident) -> syn::Result<Self> {
+        let info = component_info(&args.kind.to_string())
+            .ok_or_else(|| syn::Error::new_spanned(&args.kind, "unknown component kind"))?;
+
+        Ok(Self {
+            register_fn: syn::Ident::new(info.register_fn, Span::call_site()),
+            factory_ty: syn::parse_str(info.factory_ty)?,
+            wrapper_ident: wrapper_ident_for(factory_ident),
+            name: syn::LitByteStr::new(args.name.value().as_bytes(), Span::call_site()),
+        })
+    }
+}
+
+fn wrapper_ident_for(factory_ident: &syn::Ident) -> syn::Ident {
+    syn::Ident::new(
+        &format!("__zc_factory_{}", factory_ident),
+        Span::call_site(),
+    )
+}
+
+/// Generate only the factory wrapper (original fn + `unsafe extern "C"` wrapper).
+fn generate_plugin_wrapper(
+    args: &PluginArgs,
+    input_fn: &ItemFn,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let info = component_info(&args.kind.to_string())
+        .ok_or_else(|| syn::Error::new_spanned(&args.kind, "unknown component kind"))?;
+
+    let factory_fn = &input_fn.sig.ident;
+    let wrapper_ident = wrapper_ident_for(factory_fn);
+    let trait_path = &info.trait_path;
+
+    let takes_config = matches_factory_signature(input_fn)?;
+
+    let (config_setup, factory_call) = if takes_config {
+        (
+            Some(quote! {
+                let config_str = if config_json.is_null() || config_len == 0 {
+                    ""
+                } else {
+                    match core::str::from_utf8(
+                        core::slice::from_raw_parts(config_json, config_len),
+                    ) {
+                        Ok(s) => s,
+                        Err(_) => return 2,
+                    }
+                };
+            }),
+            quote! { #factory_fn(config_str) },
+        )
+    } else {
+        (None, quote! { #factory_fn() })
+    };
+
+    Ok(quote! {
+        /// Auto-generated FFI factory wrapper.
+        ///
+        /// # Safety
+        /// - Caller must satisfy the contract of [`zeroclaw_api::plugin::DynPlugin`].
+        /// - The decorated factory must not panic. A panic crossing the FFI boundary
+        ///   is undefined behavior.
+        unsafe extern "C" fn #wrapper_ident(
+            config_json: *const u8,
+            config_len: usize,
+            out_ptr: *mut *mut core::ffi::c_void,
+        ) -> i32 {
+            if out_ptr.is_null() {
+                return 1;
+            }
+            #config_setup
+            let boxed_trait: Box<#trait_path> = #factory_call;
+            // Double-box to convert the fat pointer to a thin pointer for FFI.
+            let outer: Box<Box<#trait_path>> = Box::new(boxed_trait);
+            let raw = Box::into_raw(outer) as *mut core::ffi::c_void;
+            // SAFETY: caller guarantees out_ptr points to a writable slot.
+            unsafe { *out_ptr = raw };
+            0
+        }
+    })
+}
+
+/// Generate the shared `zc_api_version` and `zc_register_plugins` symbols.
+fn generate_plugin_registry(entries: &[PluginEntry]) -> proc_macro2::TokenStream {
+    let registrations = entries.iter().map(|entry| {
+        let register_fn = &entry.register_fn;
+        let wrapper_ident = &entry.wrapper_ident;
+        let factory_ty = &entry.factory_ty;
+        let name = &entry.name;
+        quote! {
+            {
+                let name = #name;
+                // SAFETY: name buffer is static; host copies bytes immediately.
+                unsafe {
+                    (h.#register_fn)(
+                        h.inner,
+                        name.as_ptr(),
+                        name.len(),
+                        #wrapper_ident as #factory_ty,
+                    );
+                }
+            }
+        }
+    });
+
+    quote! {
+        /// Version probe — first call the host makes after `dlopen`.
+        ///
+        /// # Safety
+        /// Pure read of a constant; no preconditions.
+        #[unsafe(no_mangle)]
+        pub extern "C" fn zc_api_version() -> u32 {
+            zeroclaw_api::version::API_VERSION_U32
+        }
+
+        /// Registration entry point — host invokes once after version check.
+        ///
+        /// # Safety
+        /// `handle` must be a valid pointer to a host-owned `PluginHandle`.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn zc_register_plugins(
+            handle: *mut zeroclaw_api::plugin::PluginHandle,
+        ) {
+            if handle.is_null() {
+                return;
+            }
+            let h = unsafe { &*handle };
+            #(#registrations)*
+        }
+    }
+}
+
+/// Returns `true` if the function takes a single `&str` argument.
+/// Returns `false` if it takes no arguments.
+/// Errors on any other signature.
+fn matches_factory_signature(input_fn: &ItemFn) -> syn::Result<bool> {
+    match input_fn.sig.inputs.len() {
+        0 => Ok(false),
+        1 => {
+            let arg = input_fn.sig.inputs.first().unwrap();
+            if let FnArg::Typed(pat_type) = arg {
+                let ty_str = pat_type.ty.to_token_stream().to_string().replace(' ', "");
+                if ty_str == "&str" {
+                    return Ok(true);
+                }
+            }
+            Err(syn::Error::new_spanned(
+                arg,
+                "plugin factory may take either no arguments or a single `&str` config argument",
+            ))
+        }
+        _ => Err(syn::Error::new_spanned(
+            &input_fn.sig,
+            "plugin factory may take either no arguments or a single `&str` config argument",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2847,5 +3321,107 @@ mod tests {
             pub token: String
         };
         assert!(has_serde_skip(&field));
+    }
+
+    // ── Plugin macro tests ───────────────────────────────────────────────────
+
+    fn parse_plugin_args(s: &str) -> PluginArgs {
+        syn::parse_str(s).unwrap()
+    }
+
+    fn parse_item_fn(s: &str) -> ItemFn {
+        syn::parse_str(s).unwrap()
+    }
+
+    #[test]
+    fn plugin_wrapper_has_wrapper_function() {
+        let args = parse_plugin_args(r#"tool = "echo""#);
+        let input_fn = parse_item_fn(
+            r#"fn make_echo() -> Box<dyn zeroclaw_api::tool::Tool> {
+                Box::new(EchoTool)
+            }"#,
+        );
+
+        let output = generate_plugin_wrapper(&args, &input_fn)
+            .unwrap()
+            .to_string();
+
+        assert!(output.contains("__zc_factory_make_echo"));
+        assert!(output.contains("unsafe extern \"C\" fn"));
+    }
+
+    #[test]
+    fn plugin_wrapper_uses_defensive_utf8_handling() {
+        let args = parse_plugin_args(r#"tool = "echo""#);
+        let input_fn = parse_item_fn(
+            r#"fn make_echo(config: &str) -> Box<dyn zeroclaw_api::tool::Tool> {
+                Box::new(EchoTool)
+            }"#,
+        );
+
+        let output = generate_plugin_wrapper(&args, &input_fn)
+            .unwrap()
+            .to_string();
+
+        // Defensive UTF-8 handling should emit `return 2` on invalid UTF-8.
+        assert!(output.contains("return 2"));
+        assert!(!output.contains("from_utf8_unchecked"));
+    }
+
+    #[test]
+    fn plugin_registry_emits_single_pair_of_symbols() {
+        let entries = vec![
+            PluginEntry::from_args(
+                &parse_plugin_args(r#"tool = "echo""#),
+                &syn::Ident::new("make_echo", Span::call_site()),
+            )
+            .unwrap(),
+            PluginEntry::from_args(
+                &parse_plugin_args(r#"tool = "reverse""#),
+                &syn::Ident::new("make_reverse", Span::call_site()),
+            )
+            .unwrap(),
+        ];
+
+        let output = generate_plugin_registry(&entries).to_string();
+
+        assert_eq!(
+            output.matches("pub extern \"C\" fn zc_api_version").count(),
+            1
+        );
+        assert_eq!(
+            output
+                .matches("pub unsafe extern \"C\" fn zc_register_plugins")
+                .count(),
+            1
+        );
+        assert!(output.contains("__zc_factory_make_echo"));
+        assert!(output.contains("__zc_factory_make_reverse"));
+    }
+
+    #[test]
+    fn plugin_registry_empty_still_emits_symbols() {
+        let output = generate_plugin_registry(&[]).to_string();
+
+        assert!(output.contains("pub extern \"C\" fn zc_api_version"));
+        assert!(output.contains("pub unsafe extern \"C\" fn zc_register_plugins"));
+    }
+
+    #[test]
+    fn plugin_entry_from_args_rejects_unknown_kind() {
+        let args = parse_plugin_args(r#"gadget = "x""#);
+        let ident = syn::Ident::new("make_x", Span::call_site());
+        assert!(PluginEntry::from_args(&args, &ident).is_err());
+    }
+
+    #[test]
+    fn matches_factory_signature_accepts_no_args_and_str_arg() {
+        let no_args: ItemFn = syn::parse_str("fn f() -> i32 { 0 }").unwrap();
+        let str_arg: ItemFn = syn::parse_str("fn f(cfg: &str) -> i32 { 0 }").unwrap();
+        let bad_arg: ItemFn = syn::parse_str("fn f(cfg: &String) -> i32 { 0 }").unwrap();
+
+        assert!(!matches_factory_signature(&no_args).unwrap());
+        assert!(matches_factory_signature(&str_arg).unwrap());
+        assert!(matches_factory_signature(&bad_arg).is_err());
     }
 }

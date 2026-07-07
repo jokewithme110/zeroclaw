@@ -1,9 +1,9 @@
 [package]
-name = "zeroclaw-fixture-dynamic"
+name = "zeroclaw-fixture-channel"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Reference cdylib plugin for ZeroClaw — used by loader integration tests and as community-facing template."
+description = "Channel plugin fixture for ZeroClaw — tests dynamic channel loading via the plugin system."
 publish = false
 
 [lib]
@@ -15,3 +15,4 @@ zeroclaw-macros.workspace = true
 anyhow = "1.0"
 async-trait = "0.1"
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["time"] }

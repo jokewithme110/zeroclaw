@@ -1,5 +1,5 @@
 [workspace]
-members = [".","crates/zeroclaw-dt-nodes","crates/zeroclaw-skill-security",  "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-spawn", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "crates/zeroclaw-loader", "tests/fixtures/zeroclaw-fixture-static", "tests/fixtures/zeroclaw-fixture-dynamic", "apps/tauri", "tools/fill-translations", "xtask"]
+members = [".","crates/zeroclaw-dt-nodes","crates/zeroclaw-skill-security",  "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-spawn", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "crates/zeroclaw-loader", "tests/fixtures/zeroclaw-fixture-static", "tests/fixtures/zeroclaw-fixture-dynamic", "tests/fixtures/zeroclaw-fixture-multi", "tests/fixtures/zeroclaw-fixture-handwritten", "tests/fixtures/zeroclaw-fixture-channel", "apps/tauri", "tools/fill-translations", "xtask"]
 resolver = "2"
 exclude = ["plugins/image-gen-fal"]
 
@@ -38,6 +38,9 @@ local-ip-address = "0.6"
 zeroclaw-loader = { path = "crates/zeroclaw-loader", version = "0.8.0" }
 zeroclaw-fixture-static = { path = "tests/fixtures/zeroclaw-fixture-static", version = "0.8.0" }
 zeroclaw-fixture-dynamic = { path = "tests/fixtures/zeroclaw-fixture-dynamic", version = "0.8.0" }
+zeroclaw-fixture-multi = { path = "tests/fixtures/zeroclaw-fixture-multi", version = "0.8.0" }
+zeroclaw-fixture-handwritten = { path = "tests/fixtures/zeroclaw-fixture-handwritten", version = "0.8.0" }
+zeroclaw-fixture-channel = { path = "tests/fixtures/zeroclaw-fixture-channel", version = "0.8.0" }
 libloading = "0.8"
 
 [package]
@@ -440,6 +443,8 @@ scopeguard = "1.2"
 rcgen = "0.13"
 zeroclaw-fixture-static.workspace = true
 zeroclaw-fixture-dynamic.workspace = true
+zeroclaw-fixture-multi.workspace = true
+zeroclaw-fixture-handwritten.workspace = true
 zeroclaw-loader.workspace = true
 
 [[test]]

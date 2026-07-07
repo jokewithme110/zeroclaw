@@ -61,14 +61,23 @@ use core::ffi::c_void;
 ///
 /// `out_provider` receives a raw pointer to a heap-allocated
 /// `Box<dyn ModelProvider>` (boxed twice so the caller can recover the wide pointer).
-/// A return value of `0` indicates success; any other value is a plugin-defined
-/// error code.
+/// A return value of `0` indicates success.
+///
+/// # Error codes
+///
+/// Standard error codes emitted by the `#[plugin]` / `#[plugin_module]` macros:
+///
+/// - `1`: `out_provider` is null.
+/// - `2`: `config_json` does not contain valid UTF-8. The host should normally
+///   pass UTF-8 JSON, but plugins must not invoke UB if it does not.
+///
+/// Other positive values may be used for plugin-specific errors.
 ///
 /// # Safety
 ///
-/// The caller must guarantee `config_json` points to `config_len` valid UTF-8
-/// bytes, and that `out_provider` is a writable `*mut *mut c_void`. On success,
-/// the host takes ownership of the returned pointer.
+/// The caller must guarantee `config_json` points to `config_len` bytes that the
+/// plugin may read, and that `out_provider` is a writable `*mut *mut c_void`.
+/// On success, the host takes ownership of the returned pointer.
 pub type ProviderFactoryFn = unsafe extern "C" fn(
     config_json: *const u8,
     config_len: usize,
@@ -86,6 +95,7 @@ pub type ToolFactoryFn = unsafe extern "C" fn(
 ) -> i32;
 
 /// Factory signature for a [`Channel`](crate::channel::Channel) component.
+/// Same contract as [`ProviderFactoryFn`].
 pub type ChannelFactoryFn = unsafe extern "C" fn(
     config_json: *const u8,
     config_len: usize,
@@ -93,6 +103,7 @@ pub type ChannelFactoryFn = unsafe extern "C" fn(
 ) -> i32;
 
 /// Factory signature for a [`Memory`](crate::memory_traits::Memory) component.
+/// Same contract as [`ProviderFactoryFn`].
 pub type MemoryFactoryFn = unsafe extern "C" fn(
     config_json: *const u8,
     config_len: usize,
@@ -111,6 +122,7 @@ pub type MemoryStrategyFactoryFn = unsafe extern "C" fn(
 
 /// Factory signature for an [`Observer`](crate::observability_traits::Observer)
 /// component.
+/// Same contract as [`ProviderFactoryFn`].
 pub type ObserverFactoryFn = unsafe extern "C" fn(
     config_json: *const u8,
     config_len: usize,
@@ -119,6 +131,7 @@ pub type ObserverFactoryFn = unsafe extern "C" fn(
 
 /// Factory signature for a [`RuntimeAdapter`](crate::runtime_traits::RuntimeAdapter)
 /// component.
+/// Same contract as [`ProviderFactoryFn`].
 pub type RuntimeFactoryFn = unsafe extern "C" fn(
     config_json: *const u8,
     config_len: usize,
@@ -127,6 +140,7 @@ pub type RuntimeFactoryFn = unsafe extern "C" fn(
 
 /// Factory signature for a [`Peripheral`](crate::peripherals_traits::Peripheral)
 /// component.
+/// Same contract as [`ProviderFactoryFn`].
 pub type PeripheralFactoryFn = unsafe extern "C" fn(
     config_json: *const u8,
     config_len: usize,
