@@ -21313,7 +21313,10 @@ default_temperature = 0.7
         let json = r#"{"bot_token":"tok","allowed_users":[]}"#;
         let parsed: TelegramConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.stream_mode, StreamMode::Off);
-        assert_eq!(parsed.draft_update_interval_ms, 1000);
+        assert_eq!(
+            parsed.draft_update_interval_ms,
+            default_draft_update_interval_ms()
+        );
         assert!(!parsed.interrupt_on_new_message);
     }
 

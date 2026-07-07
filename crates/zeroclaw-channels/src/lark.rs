@@ -6,9 +6,10 @@ use serde::Deserialize;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
@@ -63,6 +64,8 @@ const LARK_SEND_MAX_ATTEMPTS: u32 = 4;
 const LARK_SEND_RETRY_DELAY: Duration = Duration::from_millis(500);
 const LARK_STREAM_CONNECT_MAX_ATTEMPTS: u32 = 3;
 const LARK_STREAM_CONNECT_RETRY_DELAY: Duration = Duration::from_secs(1);
+const LARK_CARDKIT_CLOSE_STREAMING_MAX_ATTEMPTS: u32 = 3;
+const LARK_CARDKIT_CLOSE_STREAMING_RETRY_DELAY: Duration = Duration::from_millis(200);
 
 // Cardkit streaming constants (official Feishu API)
 const LARK_CARDKIT_CONTENT_MAX_CHARS: usize = 100_000;
@@ -152,6 +155,23 @@ struct LarkCardStreamState {
     last_sent_content: String,       // Short-circuit: skip PUT if equal
     current_uuid: String,            // Idempotency ID, rotated on bump
     last_pushed_at: Option<Instant>, // Throttle window anchor
+}
+
+struct LarkInFlightTracker {
+    count: AtomicUsize,
+    notify: Notify,
+}
+
+struct LarkInFlightPermit {
+    tracker: Arc<LarkInFlightTracker>,
+}
+
+impl Drop for LarkInFlightPermit {
+    fn drop(&mut self) {
+        if self.tracker.count.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.tracker.notify.notify_waiters();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -774,6 +794,10 @@ pub struct LarkChannel {
     draft_update_interval_ms: u64,
     /// Cardkit streaming state per message_id. Runtime cache (SSOT-compliant).
     cardkit_streams: Arc<tokio::sync::Mutex<HashMap<String, LarkCardStreamState>>>,
+    /// Source of truth for per-draft in-flight CardKit update tasks. Used to
+    /// prevent terminal finalize/cancel writes from racing behind older async
+    /// streaming PUTs.
+    cardkit_in_flight: Arc<StdMutex<HashMap<String, Arc<LarkInFlightTracker>>>>,
     /// Workspace directory for saving downloaded images.
     workspace_dir: Option<PathBuf>,
     /// Runtime hook invoked after the channel persists a media
@@ -846,6 +870,7 @@ impl LarkChannel {
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: 1000,
             cardkit_streams: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            cardkit_in_flight: Arc::new(StdMutex::new(HashMap::new())),
             workspace_dir: None,
             file_persisted_hook: None,
             upload_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -1043,6 +1068,64 @@ impl LarkChannel {
 
     fn ws_base(&self) -> &'static str {
         self.platform.ws_base()
+    }
+
+    fn begin_cardkit_in_flight(&self, message_id: &str) -> LarkInFlightPermit {
+        let mut map = self
+            .cardkit_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tracker = map
+            .entry(message_id.to_string())
+            .or_insert_with(|| {
+                Arc::new(LarkInFlightTracker {
+                    count: AtomicUsize::new(0),
+                    notify: Notify::new(),
+                })
+            })
+            .clone();
+        tracker.count.fetch_add(1, Ordering::SeqCst);
+        LarkInFlightPermit { tracker }
+    }
+
+    async fn wait_cardkit_in_flight_drained(&self, message_id: &str) {
+        let tracker = {
+            let map = self
+                .cardkit_in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            map.get(message_id).cloned()
+        };
+        let Some(tracker) = tracker else {
+            return;
+        };
+        loop {
+            if tracker.count.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            tracker.notify.notified().await;
+        }
+    }
+
+    fn prune_cardkit_in_flight(&self, message_id: &str) {
+        let mut map = self
+            .cardkit_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(tracker) = map.get(message_id)
+            && tracker.count.load(Ordering::SeqCst) == 0
+        {
+            map.remove(message_id);
+        }
+    }
+
+    async fn evict_cardkit_runtime(&self, message_id: &str) -> Option<LarkCardStreamState> {
+        let removed_state = {
+            let mut streams = self.cardkit_streams.lock().await;
+            streams.remove(message_id)
+        };
+        self.prune_cardkit_in_flight(message_id);
+        removed_state
     }
 
     fn tenant_access_token_url(&self) -> String {
@@ -2993,6 +3076,7 @@ impl Channel for LarkChannel {
 
                 // Initialize streaming state
                 let mut streams = self.cardkit_streams.lock().await;
+                let initial_uuid = Uuid::new_v4().to_string();
                 streams.insert(
                     message_id.clone(),
                     LarkCardStreamState {
@@ -3000,7 +3084,7 @@ impl Channel for LarkChannel {
                         element_id: LARK_CARDKIT_STREAM_ELEMENT_ID.to_string(),
                         sequence: 1,
                         last_sent_content: placeholder.to_string(),
-                        current_uuid: Uuid::new_v4().to_string(),
+                        current_uuid: initial_uuid,
                         last_pushed_at: None,
                     },
                 );
@@ -3055,21 +3139,6 @@ impl Channel for LarkChannel {
         };
         let should_push = elapsed_ms >= interval_ms;
 
-        ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({
-                    "message_id": message_id,
-                    "interval_ms": interval_ms,
-                    "elapsed_ms": elapsed_ms,
-                    "should_push": should_push,
-                    "text_len": text.len(),
-                    "last_sent_len": state.last_sent_content.len(),
-                })
-            ),
-            "Lark: update_draft throttle decision"
-        );
-
         if !should_push {
             // Still in throttle window - cache the latest text for next PUSH
             // Don't advance last_pushed_at here (that would cause window drift)
@@ -3097,11 +3166,17 @@ impl Channel for LarkChannel {
         let uuid = state.current_uuid.clone();
         let content = text.to_string();
 
+        // Reserve the next sequence/uuid immediately before releasing the lock.
+        // This prevents overlapping update_draft calls from reusing either.
+        state.sequence = state.sequence.saturating_add(1);
+        state.current_uuid = Uuid::new_v4().to_string();
+
         // Reset the throttle timer BEFORE making the API call.
         // This is critical: we want the next call to be allowed after
         // `interval_ms` from NOW, not after the API response returns.
         state.last_pushed_at = Some(Instant::now());
         state.last_sent_content = content.clone();
+        let in_flight_permit = self.begin_cardkit_in_flight(message_id);
 
         // Release lock before spawning async call
         drop(streams);
@@ -3112,6 +3187,7 @@ impl Channel for LarkChannel {
         let self_arc = Arc::new(self.clone());
         let message_id_owned = message_id.to_string();
         zeroclaw_spawn::spawn!(async move {
+            let _in_flight_permit = in_flight_permit;
             let push_start = Instant::now();
             let content_len = content.len();
 
@@ -3122,15 +3198,12 @@ impl Channel for LarkChannel {
                 Ok(()) => {
                     let push_duration_ms = push_start.elapsed().as_millis();
 
-                    // Success - bump sequence and rotate uuid
-                    self_arc.bump_cardkit_sequence(&message_id_owned).await;
-
                     ::zeroclaw_log::record!(
                         INFO,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_attrs(::serde_json::json!({
                                 "message_id": message_id_owned,
-                                "sequence": sequence,
+                                "sequence_used": sequence,
                                 "push_duration_ms": push_duration_ms,
                                 "content_len": content_len,
                             })),
@@ -3138,7 +3211,8 @@ impl Channel for LarkChannel {
                     );
                 }
                 Err(err) => {
-                    // Soft fail - don't bump sequence, retry next time with same uuid
+                    // Soft fail - the reserved sequence/uuid pair stays consumed.
+                    // CardKit requires a fresh uuid for each later attempt.
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -3199,6 +3273,9 @@ impl Channel for LarkChannel {
             return Ok(());
         }
 
+        self.wait_cardkit_in_flight_drained(message_id).await;
+        self.prune_cardkit_in_flight(message_id);
+
         // Snapshot state without evicting (cardkit_close_streaming will evict)
         let state = {
             let streams = self.cardkit_streams.lock().await;
@@ -3209,8 +3286,12 @@ impl Channel for LarkChannel {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({"message_id": message_id})),
-                        "Lark: finalize_draft skipped - state not found"
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "message_id": message_id,
+                                "error_key": "lark.finalize_draft.state_not_found",
+                            })),
+                        "Lark: finalize_draft ABORTED - state not found (already cleaned up?)"
                     );
                     return Ok(());
                 }
@@ -3218,6 +3299,7 @@ impl Channel for LarkChannel {
         };
 
         // Push final content
+        let mut final_content_pushed = false;
         match self
             .cardkit_push_content(
                 &state.card_id,
@@ -3229,6 +3311,7 @@ impl Channel for LarkChannel {
             .await
         {
             Ok(()) => {
+                final_content_pushed = true;
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -3254,7 +3337,25 @@ impl Channel for LarkChannel {
         }
 
         // Close streaming (evicts state internally)
-        self.cardkit_close_streaming(message_id).await?;
+        if let Err(err) = self.cardkit_close_streaming(message_id).await {
+            if final_content_pushed {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "message_id": message_id,
+                            "error": format!("{err}"),
+                            "error_key": "lark.finalize_draft.close_failed_after_final_push",
+                            "consequence": "skipping_resend_to_avoid_duplicate_message",
+                        })),
+                    "Lark: finalize_draft close failed after final content push; preserving final card and skipping resend"
+                );
+                self.evict_cardkit_runtime(message_id).await;
+                return Ok(());
+            }
+            return Err(err);
+        }
 
         ::zeroclaw_log::record!(
             INFO,
@@ -3275,6 +3376,9 @@ impl Channel for LarkChannel {
             return Ok(());
         }
 
+        self.wait_cardkit_in_flight_drained(message_id).await;
+        self.prune_cardkit_in_flight(message_id);
+
         // Snapshot state without evicting
         let state = {
             let streams = self.cardkit_streams.lock().await;
@@ -3285,6 +3389,7 @@ impl Channel for LarkChannel {
         };
 
         // Push cancel marker
+        let mut cancel_marker_pushed = false;
         match self
             .cardkit_push_content(
                 &state.card_id,
@@ -3296,6 +3401,7 @@ impl Channel for LarkChannel {
             .await
         {
             Ok(()) => {
+                cancel_marker_pushed = true;
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -3321,7 +3427,24 @@ impl Channel for LarkChannel {
         }
 
         // Close streaming (evicts state internally)
-        self.cardkit_close_streaming(message_id).await?;
+        if let Err(err) = self.cardkit_close_streaming(message_id).await {
+            if cancel_marker_pushed {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "message_id": message_id,
+                            "error": format!("{err}"),
+                            "error_key": "lark.cancel_draft.close_failed_after_cancel_push",
+                        })),
+                    "Lark: cancel_draft close failed after cancel marker push; cleaning local runtime state"
+                );
+                self.evict_cardkit_runtime(message_id).await;
+                return Ok(());
+            }
+            return Err(err);
+        }
 
         Ok(())
     }
@@ -3335,18 +3458,6 @@ impl LarkChannel {
     async fn cardkit_create(&self, recipient: &str, placeholder: &str) -> anyhow::Result<String> {
         let token = self.get_tenant_access_token().await?;
         let url = self.cardkit_create_url();
-
-        ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({
-                    "url": url,
-                    "recipient": recipient,
-                    "placeholder_len": placeholder.len(),
-                })
-            ),
-            "Lark: cardkit_create sending request"
-        );
 
         // Build card JSON 2.0 with streaming_mode and update_multi enabled
         // Structure: {schema, config, body: {elements: [...]}}
@@ -3373,16 +3484,6 @@ impl LarkChannel {
             "data": card_json.to_string(),
         });
 
-        ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({
-                    "card_json_config": card_json.get("config"),
-                    "elements_count": card_json.get("elements").and_then(|e| e.as_array()).map(|a| a.len()).unwrap_or(0),
-                })),
-            "Lark: cardkit_create request body"
-        );
-
         let (status, response) = self.send_text_once(&url, &token, &body).await?;
         let code = extract_lark_response_code(&response).unwrap_or(0);
 
@@ -3404,7 +3505,20 @@ impl LarkChannel {
             .pointer("/data/card_id")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .ok_or_else(|| anyhow::anyhow!("no card_id in response"))?;
+            .ok_or_else(|| anyhow::Error::msg("no card_id in response"))?;
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "card_id": card_id,
+                    "recipient": recipient,
+                    "placeholder_len": placeholder.len(),
+                    "action": "cardkit_entity_created",
+                })
+            ),
+            "Lark: cardkit_create SUCCESS - new card entity created"
+        );
 
         Ok(card_id)
     }
@@ -3421,22 +3535,6 @@ impl LarkChannel {
     ) -> anyhow::Result<()> {
         let token = self.get_tenant_access_token().await?;
         let url = self.cardkit_element_content_url(card_id, element_id);
-
-        ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({
-                    "url": url,
-                    "card_id": card_id,
-                    "element_id": element_id,
-                    "sequence": sequence,
-                    "uuid": uuid,
-                    "content_len": content.len(),
-                    "content_preview": content.chars().take(50).collect::<String>(),
-                })
-            ),
-            "Lark: cardkit_push_content sending PUT request"
-        );
 
         // Direct API format: {uuid, content, sequence} (PUT /cardkit/v1/cards/:card_id/elements/:element_id/content)
         let body = serde_json::json!({
@@ -3541,61 +3639,135 @@ impl LarkChannel {
             "Lark: cardkit_close_streaming called"
         );
 
-        let mut streams = self.cardkit_streams.lock().await;
-        let state = match streams.remove(message_id) {
-            Some(s) => s,
-            None => {
-                // State already gone - silent return (no-op)
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"message_id": message_id})),
-                    "Lark: cardkit_close_streaming skipped - state not found"
-                );
-                return Ok(());
+        // Get sequence from state (don't remove yet - only remove on success)
+        let (card_id, sequence) = {
+            let streams = self.cardkit_streams.lock().await;
+            match streams.get(message_id) {
+                Some(s) => {
+                    let card_id = s.card_id.clone();
+                    let sequence = s.sequence.saturating_add(1);
+                    (card_id, sequence)
+                }
+                None => return Ok(()),
             }
         };
 
         let token = self.get_tenant_access_token().await?;
-        let url = self.cardkit_settings_url(&state.card_id);
+        let url = self.cardkit_settings_url(&card_id);
 
-        // Direct API format: {settings: JSON.stringify({...}), sequence} (PATCH /cardkit/v1/cards/:card_id/settings)
-        // Note: openclaw implementation uses {streaming_mode: false} directly, not {config: {streaming_mode: false}}
-        let settings_json = serde_json::json!({ "streaming_mode": false }).to_string();
+        // Direct API format: {settings: JSON.stringify({...}), sequence}
+        // Per Feishu CardKit docs, settings must wrap card config fields
+        // under `config`, even when only toggling streaming_mode.
+        let settings_json =
+            serde_json::json!({ "config": { "streaming_mode": false } }).to_string();
         let body = serde_json::json!({
             "settings": settings_json,
-            "sequence": state.sequence.saturating_add(1),
+            "sequence": sequence,
         });
 
-        // Use PATCH method for settings endpoint
-        let (_status, response) = self.cardkit_patch(&url, &token, &body).await?;
-        let json: serde_json::Value =
-            serde_json::from_str(&response).unwrap_or(serde_json::Value::Null);
-        let code = extract_lark_response_code(&json).unwrap_or(0);
+        let mut last_error: Option<anyhow::Error> = None;
+        for attempt in 1..=LARK_CARDKIT_CLOSE_STREAMING_MAX_ATTEMPTS {
+            match self.cardkit_patch(&url, &token, &body).await {
+                Ok((_status, response)) => {
+                    let json: serde_json::Value =
+                        serde_json::from_str(&response).unwrap_or(serde_json::Value::Null);
+                    let code = extract_lark_response_code(&json).unwrap_or(0);
+                    if code == 0 {
+                        self.evict_cardkit_runtime(message_id).await;
 
-        if code != 0 {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "card_id": &state.card_id,
-                        "code": code,
-                        "error_key": "lark.cardkit_close_streaming.soft_failure",
-                    })),
-                "Lark: cardkit_close_streaming failed (soft)"
-            );
-        }
-        Ok(())
-    }
+                        return Ok(());
+                    }
 
-    /// Bump sequence and rotate uuid after successful push.
-    async fn bump_cardkit_sequence(&self, message_id: &str) {
-        let mut streams = self.cardkit_streams.lock().await;
-        if let Some(state) = streams.get_mut(message_id) {
-            state.sequence = state.sequence.saturating_add(1);
-            state.current_uuid = Uuid::new_v4().to_string();
+                    last_error = Some(anyhow::Error::msg(format!(
+                        "cardkit_close_streaming failed with code {}",
+                        code
+                    )));
+                    if attempt == LARK_CARDKIT_CLOSE_STREAMING_MAX_ATTEMPTS {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "message_id": message_id,
+                                    "card_id": &card_id,
+                                    "code": code,
+                                    "sequence_used": sequence,
+                                    "attempt": attempt,
+                                    "max_attempts": LARK_CARDKIT_CLOSE_STREAMING_MAX_ATTEMPTS,
+                                    "error_key": "lark.cardkit_close_streaming.api_failure",
+                                    "consequence": "card_will_remain_in_streaming_mode_until_retry_or_cleanup",
+                                })),
+                            "Lark: cardkit_close_streaming attempt failed"
+                        );
+                    } else {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "message_id": message_id,
+                                    "card_id": &card_id,
+                                    "code": code,
+                                    "sequence_used": sequence,
+                                    "attempt": attempt,
+                                    "max_attempts": LARK_CARDKIT_CLOSE_STREAMING_MAX_ATTEMPTS,
+                                    "error_key": "lark.cardkit_close_streaming.api_failure",
+                                    "consequence": "card_will_remain_in_streaming_mode_until_retry_or_cleanup",
+                                })),
+                            "Lark: cardkit_close_streaming attempt failed"
+                        );
+                    }
+                }
+                Err(err) => {
+                    last_error = Some(err.into());
+                    if attempt == LARK_CARDKIT_CLOSE_STREAMING_MAX_ATTEMPTS {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "message_id": message_id,
+                                "card_id": &card_id,
+                                "sequence_used": sequence,
+                                "attempt": attempt,
+                                "max_attempts": LARK_CARDKIT_CLOSE_STREAMING_MAX_ATTEMPTS,
+                                "error_key": "lark.cardkit_close_streaming.transport_failure",
+                            })),
+                            "Lark: cardkit_close_streaming transport attempt failed"
+                        );
+                    } else {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "message_id": message_id,
+                                "card_id": &card_id,
+                                "sequence_used": sequence,
+                                "attempt": attempt,
+                                "max_attempts": LARK_CARDKIT_CLOSE_STREAMING_MAX_ATTEMPTS,
+                                "error_key": "lark.cardkit_close_streaming.transport_failure",
+                            })),
+                            "Lark: cardkit_close_streaming transport attempt failed"
+                        );
+                    }
+                }
+            }
+
+            if attempt < LARK_CARDKIT_CLOSE_STREAMING_MAX_ATTEMPTS {
+                tokio::time::sleep(LARK_CARDKIT_CLOSE_STREAMING_RETRY_DELAY).await;
+            }
         }
+
+        Err(last_error.unwrap_or_else(|| {
+            anyhow::Error::msg("cardkit_close_streaming failed after retry exhaustion")
+        }))
     }
 }
 
@@ -5757,6 +5929,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_draft_rate_limits_within_interval() {
+        use std::time::Duration as StdDuration;
         use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -5771,8 +5944,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let patch_mock = Mock::given(method("PATCH"))
-            .and(path_regex("/im/v1/messages/om_draft_rl"))
+        let put_mock = Mock::given(method("PUT"))
+            .and(path_regex(
+                "/cardkit/v1/cards/card_rl/elements/markdown_stream/content",
+            ))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({ "code": 0 })),
             )
@@ -5782,6 +5957,17 @@ mod tests {
 
         let mut ch = make_channel().with_streaming(StreamMode::Partial, 5_000);
         ch.api_base_override = Some(server.uri());
+        ch.cardkit_streams.lock().await.insert(
+            "om_draft_rl".to_string(),
+            LarkCardStreamState {
+                card_id: "card_rl".to_string(),
+                element_id: LARK_CARDKIT_STREAM_ELEMENT_ID.to_string(),
+                sequence: 1,
+                last_sent_content: "...".to_string(),
+                current_uuid: "uuid-rl".to_string(),
+                last_pushed_at: None,
+            },
+        );
 
         ch.update_draft("oc_chat1", "om_draft_rl", "first")
             .await
@@ -5789,8 +5975,274 @@ mod tests {
         ch.update_draft("oc_chat1", "om_draft_rl", "second")
             .await
             .expect("second update_draft ok");
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
 
-        drop(patch_mock);
+        drop(put_mock);
+    }
+
+    #[tokio::test]
+    async fn send_draft_uses_shared_cardkit_stream_element_id() {
+        use std::sync::Arc;
+        use std::sync::Mutex as StdMutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        #[derive(Clone)]
+        struct CreateCardResponder {
+            calls: Arc<AtomicUsize>,
+            seen_element_ids: Arc<StdMutex<Vec<String>>>,
+        }
+
+        impl Respond for CreateCardResponder {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body).expect("request body json");
+                let card_json_raw = body["data"].as_str().expect("card_json string");
+                let card_json: serde_json::Value =
+                    serde_json::from_str(card_json_raw).expect("card_json payload");
+                let element_id = card_json
+                    .pointer("/body/elements/0/element_id")
+                    .and_then(|v| v.as_str())
+                    .expect("cardkit create element_id")
+                    .to_string();
+                self.seen_element_ids
+                    .lock()
+                    .expect("element capture lock")
+                    .push(element_id);
+
+                let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "code": 0,
+                    "data": {
+                        "card_id": format!("card_send_{call_index}")
+                    }
+                }))
+            }
+        }
+
+        #[derive(Clone)]
+        struct SendCardResponder {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl Respond for SendCardResponder {
+            fn respond(&self, _request: &Request) -> ResponseTemplate {
+                let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "code": 0,
+                    "data": {
+                        "message_id": format!("om_send_{call_index}")
+                    }
+                }))
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "t-send-draft-ids",
+                "expire": 7200
+            })))
+            .mount(&server)
+            .await;
+
+        let seen_element_ids = Arc::new(StdMutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(path("/cardkit/v1/cards"))
+            .respond_with(CreateCardResponder {
+                calls: Arc::new(AtomicUsize::new(0)),
+                seen_element_ids: seen_element_ids.clone(),
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/im/v1/messages"))
+            .and(query_param("receive_id_type", "chat_id"))
+            .respond_with(SendCardResponder {
+                calls: Arc::new(AtomicUsize::new(0)),
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let mut ch = make_channel().with_streaming(StreamMode::Partial, 50);
+        ch.api_base_override = Some(server.uri());
+
+        let draft_one = ch
+            .send_draft(&SendMessage::new("first", "oc_test_chat_id"))
+            .await
+            .expect("first send_draft ok")
+            .expect("first send_draft should return card-backed message id");
+        let draft_two = ch
+            .send_draft(&SendMessage::new("second", "oc_test_chat_id"))
+            .await
+            .expect("second send_draft ok")
+            .expect("second send_draft should return card-backed message id");
+
+        let streams = ch.cardkit_streams.lock().await;
+        let element_one = streams
+            .get(&draft_one)
+            .expect("first draft state")
+            .element_id
+            .clone();
+        let element_two = streams
+            .get(&draft_two)
+            .expect("second draft state")
+            .element_id
+            .clone();
+        drop(streams);
+
+        assert_eq!(
+            element_one, LARK_CARDKIT_STREAM_ELEMENT_ID,
+            "draft state should keep using the documented shared CardKit markdown element_id"
+        );
+        assert_eq!(
+            element_two, LARK_CARDKIT_STREAM_ELEMENT_ID,
+            "all draft cards should reuse the shared markdown element_id unless the API requires otherwise"
+        );
+
+        let captured = seen_element_ids.lock().expect("element capture lock");
+        assert_eq!(
+            captured.as_slice(),
+            &[element_one, element_two],
+            "cardkit create payload and runtime state must agree on the shared element_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_update_after_send_draft_skips_duplicate_placeholder() {
+        use std::sync::Arc;
+        use std::sync::Mutex as StdMutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration as StdDuration;
+        use wiremock::matchers::{method, path, path_regex, query_param};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        #[derive(Clone)]
+        struct CreateCardResponder;
+
+        impl Respond for CreateCardResponder {
+            fn respond(&self, _request: &Request) -> ResponseTemplate {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "code": 0,
+                    "data": {
+                        "card_id": "card_refresh"
+                    }
+                }))
+            }
+        }
+
+        #[derive(Clone)]
+        struct SendCardResponder;
+
+        impl Respond for SendCardResponder {
+            fn respond(&self, _request: &Request) -> ResponseTemplate {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "code": 0,
+                    "data": {
+                        "message_id": "om_refresh"
+                    }
+                }))
+            }
+        }
+
+        #[derive(Clone)]
+        struct CaptureContentResponder {
+            contents: Arc<StdMutex<Vec<String>>>,
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl Respond for CaptureContentResponder {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body).expect("request body json");
+                let content = body["content"]
+                    .as_str()
+                    .expect("content string")
+                    .to_string();
+                self.contents
+                    .lock()
+                    .expect("content capture lock")
+                    .push(content);
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "code": 0
+                }))
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "t-refresh-placeholder",
+                "expire": 7200
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/cardkit/v1/cards"))
+            .respond_with(CreateCardResponder)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/im/v1/messages"))
+            .and(query_param("receive_id_type", "chat_id"))
+            .respond_with(SendCardResponder)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let captured_contents = Arc::new(StdMutex::new(Vec::new()));
+        let captured_calls = Arc::new(AtomicUsize::new(0));
+        let put_mock = Mock::given(method("PUT"))
+            .and(path_regex(
+                "/cardkit/v1/cards/card_refresh/elements/.*/content",
+            ))
+            .respond_with(CaptureContentResponder {
+                contents: captured_contents.clone(),
+                calls: captured_calls.clone(),
+            })
+            .expect(0)
+            .mount_as_scoped(&server)
+            .await;
+
+        let placeholder = "正在回答：天津有哪些美食\n\n🤔 思考中...";
+        let mut ch = make_channel().with_streaming(StreamMode::Partial, 50);
+        ch.api_base_override = Some(server.uri());
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new(placeholder, "oc_test_chat_id"))
+            .await
+            .expect("send_draft ok")
+            .expect("send_draft should return card-backed message id");
+
+        ch.update_draft("oc_test_chat_id", &draft_id, placeholder)
+            .await
+            .expect("duplicate placeholder update_draft ok");
+        tokio::time::sleep(StdDuration::from_millis(120)).await;
+
+        assert_eq!(
+            captured_calls.load(Ordering::SeqCst),
+            0,
+            "duplicate placeholder content should be skipped until there is a real content change"
+        );
+        let contents = captured_contents.lock().expect("content capture lock");
+        assert!(
+            contents.is_empty(),
+            "no duplicate placeholder PUT should be sent"
+        );
+
+        drop(put_mock);
     }
 
     #[tokio::test]
@@ -5810,8 +6262,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let patch_mock = Mock::given(method("PATCH"))
-            .and(path_regex("/im/v1/messages/om_draft_go"))
+        let put_mock = Mock::given(method("PUT"))
+            .and(path_regex(
+                "/cardkit/v1/cards/card_go/elements/markdown_stream/content",
+            ))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({ "code": 0 })),
             )
@@ -5821,6 +6275,17 @@ mod tests {
 
         let mut ch = make_channel().with_streaming(StreamMode::Partial, 50);
         ch.api_base_override = Some(server.uri());
+        ch.cardkit_streams.lock().await.insert(
+            "om_draft_go".to_string(),
+            LarkCardStreamState {
+                card_id: "card_go".to_string(),
+                element_id: LARK_CARDKIT_STREAM_ELEMENT_ID.to_string(),
+                sequence: 1,
+                last_sent_content: "...".to_string(),
+                current_uuid: "uuid-go".to_string(),
+                last_pushed_at: None,
+            },
+        );
 
         ch.update_draft("oc_chat1", "om_draft_go", "first")
             .await
@@ -5829,8 +6294,317 @@ mod tests {
         ch.update_draft("oc_chat1", "om_draft_go", "second")
             .await
             .expect("second update_draft ok");
+        tokio::time::sleep(StdDuration::from_millis(80)).await;
 
-        drop(patch_mock);
+        drop(put_mock);
+    }
+
+    #[tokio::test]
+    async fn cardkit_close_streaming_uses_card_id_url_and_retries_transient_failure() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        #[derive(Clone)]
+        struct CloseStreamingResponder {
+            expected_path: String,
+            attempts: Arc<AtomicUsize>,
+        }
+
+        impl Respond for CloseStreamingResponder {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                if request.url.path() != self.expected_path {
+                    return ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "code": 99992402 }));
+                }
+
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body).expect("request body json");
+                let settings = body["settings"].as_str().expect("settings string");
+                assert_eq!(
+                    settings, r#"{"config":{"streaming_mode":false}}"#,
+                    "close streaming must use the documented config-wrapped settings payload"
+                );
+
+                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({ "code": 230020 }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({ "code": 0 }))
+                }
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "t-close-retry",
+                "expire": 7200
+            })))
+            .mount(&server)
+            .await;
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("PATCH"))
+            .and(path_regex("/cardkit/v1/cards/.*/settings"))
+            .respond_with(CloseStreamingResponder {
+                expected_path: "/cardkit/v1/cards/card_123/settings".to_string(),
+                attempts: attempts.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let mut ch = make_channel().with_streaming(StreamMode::Partial, 50);
+        ch.api_base_override = Some(server.uri());
+        ch.cardkit_streams.lock().await.insert(
+            "om_close_me".to_string(),
+            LarkCardStreamState {
+                card_id: "card_123".to_string(),
+                element_id: LARK_CARDKIT_STREAM_ELEMENT_ID.to_string(),
+                sequence: 7,
+                last_sent_content: "hello".to_string(),
+                current_uuid: "uuid-close".to_string(),
+                last_pushed_at: None,
+            },
+        );
+
+        ch.cardkit_close_streaming("om_close_me")
+            .await
+            .expect("close streaming should retry and succeed");
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "close streaming should retry once after a transient non-zero code"
+        );
+        assert!(
+            !ch.cardkit_streams.lock().await.contains_key("om_close_me"),
+            "successful close should evict runtime state"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_draft_waits_for_in_flight_cardkit_updates() {
+        use std::time::{Duration as StdDuration, Instant as StdInstant};
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        #[derive(Clone)]
+        struct ContentResponder {
+            expected_path: String,
+        }
+
+        impl Respond for ContentResponder {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                assert_eq!(request.url.path(), self.expected_path);
+                let body = String::from_utf8_lossy(&request.body);
+                if body.contains("\"content\":\"slow-stream\"") {
+                    std::thread::sleep(StdDuration::from_millis(200));
+                }
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "code": 0 }))
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "t-finalize-wait",
+                "expire": 7200
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path_regex("/cardkit/v1/cards/.*/elements/.*/content"))
+            .respond_with(ContentResponder {
+                expected_path: "/cardkit/v1/cards/card_wait/elements/markdown_stream/content"
+                    .to_string(),
+            })
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PATCH"))
+            .and(path_regex("/cardkit/v1/cards/.*/settings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0
+            })))
+            .mount(&server)
+            .await;
+
+        let mut ch = make_channel().with_streaming(StreamMode::Partial, 50);
+        ch.api_base_override = Some(server.uri());
+        ch.cardkit_streams.lock().await.insert(
+            "om_wait_me".to_string(),
+            LarkCardStreamState {
+                card_id: "card_wait".to_string(),
+                element_id: LARK_CARDKIT_STREAM_ELEMENT_ID.to_string(),
+                sequence: 1,
+                last_sent_content: "...".to_string(),
+                current_uuid: "uuid-wait".to_string(),
+                last_pushed_at: None,
+            },
+        );
+
+        ch.update_draft("oc_chat1", "om_wait_me", "slow-stream")
+            .await
+            .expect("update_draft ok");
+
+        let started = StdInstant::now();
+        ch.finalize_draft("oc_chat1", "om_wait_me", "final-body")
+            .await
+            .expect("finalize_draft ok");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= StdDuration::from_millis(180),
+            "finalize_draft must wait for the in-flight async update before final PUT/close; elapsed={elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_draft_does_not_fail_after_final_content_when_close_exhausts_retries() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "t-final-soft-close",
+                "expire": 7200
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path_regex("/cardkit/v1/cards/.*/elements/.*/content"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PATCH"))
+            .and(path_regex("/cardkit/v1/cards/.*/settings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 99992402
+            })))
+            .mount(&server)
+            .await;
+
+        let mut ch = make_channel().with_streaming(StreamMode::Partial, 50);
+        ch.api_base_override = Some(server.uri());
+        ch.cardkit_streams.lock().await.insert(
+            "om_soft_close".to_string(),
+            LarkCardStreamState {
+                card_id: "card_soft".to_string(),
+                element_id: LARK_CARDKIT_STREAM_ELEMENT_ID.to_string(),
+                sequence: 4,
+                last_sent_content: "old".to_string(),
+                current_uuid: "uuid-soft".to_string(),
+                last_pushed_at: None,
+            },
+        );
+
+        ch.finalize_draft("oc_chat1", "om_soft_close", "final-body")
+            .await
+            .expect("once final content is on-card, close failure must stay local");
+        assert!(
+            !ch.cardkit_streams
+                .lock()
+                .await
+                .contains_key("om_soft_close"),
+            "finalize_draft should not leak runtime state after exhausting close retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_draft_rotates_uuid_before_overlapping_async_pushes() {
+        use std::sync::Arc;
+        use std::sync::Mutex as StdMutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration as StdDuration;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        #[derive(Clone)]
+        struct CaptureUuidResponder {
+            uuids: Arc<StdMutex<Vec<String>>>,
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl Respond for CaptureUuidResponder {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body).expect("request body json");
+                let uuid = body["uuid"].as_str().expect("uuid string").to_string();
+                self.uuids.lock().expect("uuid capture lock").push(uuid);
+
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    std::thread::sleep(StdDuration::from_millis(200));
+                }
+
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "code": 0 }))
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "t-uuid-rotate",
+                "expire": 7200
+            })))
+            .mount(&server)
+            .await;
+
+        let seen_uuids = Arc::new(StdMutex::new(Vec::new()));
+        Mock::given(method("PUT"))
+            .and(path_regex("/cardkit/v1/cards/.*/elements/.*/content"))
+            .respond_with(CaptureUuidResponder {
+                uuids: seen_uuids.clone(),
+                calls: Arc::new(AtomicUsize::new(0)),
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let mut ch = make_channel().with_streaming(StreamMode::Partial, 50);
+        ch.api_base_override = Some(server.uri());
+        ch.cardkit_streams.lock().await.insert(
+            "om_uuid_overlap".to_string(),
+            LarkCardStreamState {
+                card_id: "card_uuid".to_string(),
+                element_id: LARK_CARDKIT_STREAM_ELEMENT_ID.to_string(),
+                sequence: 1,
+                last_sent_content: "...".to_string(),
+                current_uuid: "uuid-initial".to_string(),
+                last_pushed_at: None,
+            },
+        );
+
+        ch.update_draft("oc_chat1", "om_uuid_overlap", "first")
+            .await
+            .expect("first update_draft ok");
+        tokio::time::sleep(StdDuration::from_millis(80)).await;
+        ch.update_draft("oc_chat1", "om_uuid_overlap", "second")
+            .await
+            .expect("second update_draft ok");
+        tokio::time::sleep(StdDuration::from_millis(350)).await;
+
+        let uuids = seen_uuids.lock().expect("uuid capture lock");
+        assert_eq!(uuids.len(), 2, "expected two overlapping content pushes");
+        assert_ne!(
+            uuids[0], uuids[1],
+            "each CardKit content push must reserve a fresh uuid before releasing streaming state"
+        );
     }
 
     #[test]

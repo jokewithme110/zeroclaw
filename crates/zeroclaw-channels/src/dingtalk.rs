@@ -5,8 +5,9 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
@@ -81,6 +82,7 @@ macro_rules! dingtalk_debug {
 
 /// DingTalk channel — connects via Stream Mode WebSocket for real-time messages.
 /// Replies are sent through per-message session webhook URLs.
+#[derive(Clone)]
 pub struct DingTalkChannel {
     client_id: String,
     client_secret: String,
@@ -128,6 +130,14 @@ pub struct DingTalkChannel {
     /// AI Card Template ID for streaming responses.
     /// Must be created in DingTalk developer console first.
     ai_card_template_id: Option<String>,
+    /// Per-card in-flight streamingUpdate PUT tracking. See [`InFlightTracker`].
+    /// Keyed by `message_id` (the DingTalk card instance id).
+    streaming_in_flight: Arc<Mutex<HashMap<String, Arc<InFlightTracker>>>>,
+    /// Cached DingTalk access token. Hit on every `streaming_update_card`
+    /// PUT, so the cache must be shared across all PUTs for a given
+    /// channel. Without this, every streaming chunk pays a token-fetch
+    /// round-trip on top of the PUT round-trip, doubling latency.
+    access_token_cache: Arc<RwLock<Option<TokenCacheEntry>>>,
 }
 
 /// AI card instance information for tracking active streaming sessions.
@@ -146,9 +156,24 @@ struct UploadCacheEntry {
     expires_at: u64,
 }
 
-/// Token cache entry with expiration time.
-/// DingTalk access tokens are valid for 7200 seconds (2 hours).
-/// We refresh 60 seconds early to avoid boundary issues.
+/// Per-card tracker for in-flight streamingUpdate PUT tasks.
+/// `update_draft` spawns one PUT per (throttle) chunk and increments the
+/// counter; the spawned task decrements on completion and fires the notify.
+/// `finalize_draft` waits until the counter drains to zero before sending
+/// its `isFinalize=true` PUT. This guarantees the final body lands at
+/// DingTalk strictly after every streamed chunk (no out-of-order overwrite
+/// → "last chunk missing" symptom), without forcing `update_draft` itself
+/// to await the PUT round-trip — caller latency stays at ~0.
+struct InFlightTracker {
+    count: AtomicUsize,
+    notify: Notify,
+}
+
+/// Cached DingTalk access token with expiration time.
+/// Tokens are valid for 7200 seconds (2 hours); we refresh 60 seconds
+/// early to avoid boundary issues. Caching is critical for streaming
+/// throughput: every `streaming_update_card` PUT would otherwise pay a
+/// ~30-100ms token-fetch round-trip on top of the PUT round-trip.
 #[derive(Clone)]
 struct TokenCacheEntry {
     token: String,
@@ -166,206 +191,6 @@ impl TokenCacheEntry {
 
     fn is_expired(&self) -> bool {
         Instant::now() >= self.expires_at
-    }
-}
-
-/// Lightweight async handle for making DingTalk API calls.
-/// Contains only the minimal state needed for HTTP requests,
-/// used for async API calls without blocking the main channel.
-#[derive(Clone)]
-pub struct DingTalkChannelAsync {
-    client_id: String,
-    client_secret: String,
-    proxy_url: Option<String>,
-    /// Access token cache (2 hour validity)
-    token_cache: Arc<RwLock<Option<TokenCacheEntry>>>,
-}
-
-impl DingTalkChannelAsync {
-    /// Build an HTTP client with the same proxy configuration as the main channel.
-    fn http_client(&self) -> reqwest::Client {
-        zeroclaw_config::schema::build_channel_proxy_client(
-            "channel.dingtalk.async",
-            self.proxy_url.as_deref(),
-        )
-    }
-
-    /// Get access token for API calls with caching.
-    /// Tokens are cached for 2 hours (7200 seconds) per DingTalk's specification.
-    /// Uses double-checked locking to handle concurrent requests efficiently.
-    async fn get_access_token(&self) -> anyhow::Result<String> {
-        // Fast path: check cache with read lock
-        {
-            let cache = self.token_cache.read().await;
-            if let Some(entry) = cache.as_ref() {
-                if !entry.is_expired() {
-                    let remaining_secs = entry.expires_at.duration_since(Instant::now()).as_secs();
-                    dingtalk_debug!(
-                        ::serde_json::json!({
-                            "remaining_secs": remaining_secs,
-                        }),
-                        "DingTalk: using cached access token"
-                    );
-                    return Ok(entry.token.clone());
-                }
-            }
-        }
-
-        // Slow path: acquire write lock and fetch new token
-        // Use double-checked locking to avoid duplicate requests
-        {
-            // Re-check cache after acquiring write lock
-            let cache = self.token_cache.read().await;
-            if let Some(entry) = cache.as_ref() {
-                if !entry.is_expired() {
-                    let remaining_secs = entry.expires_at.duration_since(Instant::now()).as_secs();
-                    dingtalk_debug!(
-                        ::serde_json::json!({
-                            "remaining_secs": remaining_secs,
-                        }),
-                        "DingTalk: using cached access token (after re-check)"
-                    );
-                    return Ok(entry.token.clone());
-                }
-            }
-        }
-
-        // Cache miss or expired: fetch new token
-        dingtalk_info!("DingTalk: fetching new access token");
-
-        let mut last_error = None;
-        for attempt in 1..=DINGTALK_OUTBOUND_MAX_ATTEMPTS {
-            match self.request_access_token_once().await {
-                Ok(token) => {
-                    // Update cache
-                    {
-                        let mut cache = self.token_cache.write().await;
-                        // Final check to avoid overwriting valid token from concurrent request
-                        if let Some(entry) = cache.as_ref() {
-                            if !entry.is_expired() {
-                                return Ok(entry.token.clone());
-                            }
-                        }
-                        *cache = Some(TokenCacheEntry::new(token.clone()));
-                    }
-
-                    if attempt > 1 {
-                        dingtalk_info!(
-                            ::serde_json::json!({
-                                "attempt": attempt,
-                            }),
-                            "DingTalk: access token request recovered after retry"
-                        );
-                    }
-                    return Ok(token);
-                }
-                Err(error) => {
-                    if attempt >= DINGTALK_OUTBOUND_MAX_ATTEMPTS {
-                        return Err(error);
-                    }
-
-                    dingtalk_warn!(
-                        ::serde_json::json!({
-                            "attempt": attempt,
-                            "max_attempts": DINGTALK_OUTBOUND_MAX_ATTEMPTS,
-                            "error": error.to_string(),
-                        }),
-                        "DingTalk: access token request failed, retrying"
-                    );
-                    last_error = Some(error);
-                    tokio::time::sleep(DINGTALK_OUTBOUND_RETRY_DELAY).await;
-                }
-            }
-        }
-
-        Err(last_error
-            .unwrap_or_else(|| anyhow::Error::msg("DingTalk: access token retry exhausted")))
-    }
-
-    /// Request access token once (single attempt).
-    async fn request_access_token_once(&self) -> anyhow::Result<String> {
-        let body = serde_json::json!({
-            "appKey": self.client_id,
-            "appSecret": self.client_secret,
-        });
-
-        let resp = self
-            .http_client()
-            .post("https://api.dingtalk.com/v1.0/oauth2/accessToken")
-            .json(&body)
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(anyhow::anyhow!(
-                "DingTalk access token request failed with status {}: {}",
-                status,
-                resp.text().await.unwrap_or_default()
-            ));
-        }
-
-        #[derive(Deserialize)]
-        struct TokenResponse {
-            #[serde(rename = "accessToken")]
-            access_token: String,
-        }
-
-        let token_resp: TokenResponse = resp.json().await?;
-        Ok(token_resp.access_token)
-    }
-
-    /// Update an AI card via streamingUpdate API.
-    /// This is the async version used for background updates.
-    async fn streaming_update_card(
-        &self,
-        card_instance_id: &str,
-        content: &str,
-        is_final: bool,
-    ) -> anyhow::Result<()> {
-        let token = self.get_access_token().await?;
-
-        // Each update carries a unique GUID per the official SDK.
-        let guid = Uuid::new_v4().to_string();
-
-        let body = serde_json::json!({
-            "outTrackId": card_instance_id,
-            "guid": guid,
-            "key": "content",
-            "content": content,
-            "isFull": true,
-            "isFinalize": is_final,
-            "isError": false,
-        });
-
-        let resp = self
-            .http_client()
-            .put("https://api.dingtalk.com/v1.0/card/streaming")
-            .header("x-acs-dingtalk-access-token", &token)
-            .json(&body)
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let error_text = resp.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!(
-                "DingTalk streamingUpdate failed with status {}: {}",
-                status,
-                error_text
-            ));
-        }
-
-        dingtalk_debug!(
-            ::serde_json::json!({
-                "out_track_id": card_instance_id,
-                "content_bytes": content.len(),
-                "is_final": is_final,
-            }),
-            "DingTalk: streamingUpdate card success"
-        );
-
-        Ok(())
     }
 }
 
@@ -412,6 +237,8 @@ impl DingTalkChannel {
             pending_streaming_text: Arc::new(Mutex::new(HashMap::new())),
             card_instances: Arc::new(RwLock::new(HashMap::new())),
             ai_card_template_id: None,
+            access_token_cache: Arc::new(RwLock::new(None)),
+            streaming_in_flight: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -461,18 +288,6 @@ impl DingTalkChannel {
         // 50ms still leaves 6x headroom.
         self.streaming_update_interval_ms = update_interval_ms;
         self
-    }
-
-    /// Create a lightweight clone for async API calls.
-    /// This clones only the necessary fields for making HTTP requests,
-    /// avoiding the overhead of cloning the entire channel state.
-    fn clone_for_async_call(&self) -> DingTalkChannelAsync {
-        DingTalkChannelAsync {
-            client_id: self.client_id.clone(),
-            client_secret: self.client_secret.clone(),
-            proxy_url: self.proxy_url.clone(),
-            token_cache: Arc::new(RwLock::new(None)),
-        }
     }
 
     /// Check if streaming mode is enabled.
@@ -1325,22 +1140,33 @@ impl Channel for DingTalkChannel {
             "DingTalk: update_draft flush"
         );
 
-        // Spawn the API call asynchronously to avoid blocking the caller.
-        // This allows the orchestrator to continue processing LLM tokens
-        // without waiting for the DingTalk API response (~350ms).
-        let self_arc = Arc::new(self.clone_for_async_call());
-        let message_id = message_id.to_string();
+        // Spawn the PUT asynchronously so the caller (orchestrator) is
+        // not blocked on the PUT round-trip (~200-280ms in the observed
+        // trace). Order vs. `finalize_draft` is preserved by the
+        // in-flight tracker: every spawned task increments the counter
+        // and decrements + notifies on completion; `finalize_draft`
+        // drains the counter before sending its own `isFinalize=true`
+        // PUT, so the final body always lands at DingTalk strictly
+        // after every streamed chunk.
+        let tracker = self.inc_streaming_in_flight(message_id).await;
+        let self_clone = self.clone();
+        let message_id_owned = message_id.to_string();
+        let to_send_owned = to_send.clone();
         zeroclaw_spawn::spawn!(async move {
-            if let Err(error) = self_arc
-                .streaming_update_card(&message_id, &to_send, false)
-                .await
-            {
+            let result = self_clone
+                .streaming_update_card(&message_id_owned, &to_send_owned, false)
+                .await;
+            // Decrement + wake finalize waiter LAST (via RAII guard) so
+            // any error path here still drains.
+            tracker.count.fetch_sub(1, Ordering::SeqCst);
+            tracker.notify.notify_waiters();
+            if let Err(error) = result {
                 dingtalk_warn!(
                     ::serde_json::json!({
-                        "out_track_id": message_id,
+                        "out_track_id": message_id_owned,
                         "error": error.to_string(),
                     }),
-                    "DingTalk: update_draft streaming call failed (async)"
+                    "DingTalk: update_draft streaming call failed"
                 );
             }
         });
@@ -1359,6 +1185,15 @@ impl Channel for DingTalkChannel {
         if message_id.is_empty() || !self.supports_streaming() {
             return Ok(());
         }
+        // Drain any in-flight streamingUpdate PUTs spawned by prior
+        // `update_draft` calls. After this returns, every chunk PUT
+        // has reached DingTalk, so the `isFinalize=true` PUT below
+        // lands strictly after them and locks the card with the final
+        // body. Without this wait, an in-flight PUT could land AFTER
+        // the finalize PUT and overwrite the final body with stale
+        // content (the "last chunk missing" symptom).
+        self.wait_streaming_in_flight_drained(message_id).await;
+
         // Drop the per-card throttle slot AND the pending buffer so the
         // next message on this handle starts from a clean state. The
         // final text is supplied by the orchestrator (`text` arg) and
@@ -1383,6 +1218,12 @@ impl Channel for DingTalkChannel {
                 "DingTalk: finalize_draft streaming call failed"
             );
         }
+        // Drop the tracker slot so the map does not leak entries
+        // across streams. Safe to do now: every prior task has
+        // decremented (drained above) and no new task can spawn
+        // because `last_streaming_edit` and `pending_streaming_text`
+        // for this message_id are also evicted above.
+        self.prune_streaming_in_flight(message_id).await;
         Ok(())
     }
 
@@ -1394,6 +1235,11 @@ impl Channel for DingTalkChannel {
         if message_id.is_empty() || !self.supports_streaming() {
             return Ok(());
         }
+        // Drain any in-flight streamingUpdate PUTs first, so the
+        // cancel marker below lands strictly after them and the card
+        // does not flicker back to a streamed chunk afterwards.
+        self.wait_streaming_in_flight_drained(message_id).await;
+
         let result = self
             .streaming_update_card(message_id, "[回答已取消]", true)
             .await;
@@ -1411,6 +1257,7 @@ impl Channel for DingTalkChannel {
                 "DingTalk: cancel_draft streaming call failed"
             );
         }
+        self.prune_streaming_in_flight(message_id).await;
         Ok(())
     }
 
@@ -1551,6 +1398,63 @@ impl DingTalkChannel {
 
     /// Upload cache TTL (1 hour).
     const UPLOAD_CACHE_TTL: u64 = 3600;
+
+    /// Get-or-create the in-flight tracker for `message_id` and bump its
+    /// count by one. The returned `Arc<InFlightTracker>` must be kept
+    /// alive by the spawned task; it decrements the count on completion
+    /// (and wakes any `finalize_draft` waiter).
+    async fn inc_streaming_in_flight(&self, message_id: &str) -> Arc<InFlightTracker> {
+        let mut map = self.streaming_in_flight.lock().await;
+        let tracker = map
+            .entry(message_id.to_string())
+            .or_insert_with(|| {
+                Arc::new(InFlightTracker {
+                    count: AtomicUsize::new(0),
+                    notify: Notify::new(),
+                })
+            })
+            .clone();
+        tracker.count.fetch_add(1, Ordering::SeqCst);
+        tracker
+    }
+
+    /// Drop the per-card tracker slot when the count has reached zero.
+    /// Called by `finalize_draft` / `cancel_draft` after draining so the
+    /// map does not leak entries across streams.
+    async fn prune_streaming_in_flight(&self, message_id: &str) {
+        let mut map = self.streaming_in_flight.lock().await;
+        if let Some(tracker) = map.get(message_id)
+            && tracker.count.load(Ordering::SeqCst) == 0
+        {
+            map.remove(message_id);
+        }
+    }
+
+    /// Wait until every spawned streamingUpdate PUT for `message_id` has
+    /// completed. Returns immediately if there is nothing in flight. Uses
+    /// `notify_waiters` semantics: each `notified().await` consumes one
+    /// permit, so we re-check the counter in a loop to drain all tasks.
+    async fn wait_streaming_in_flight_drained(&self, message_id: &str) {
+        // Take a snapshot of the tracker so subsequent spawns on the same
+        // message_id (after finalize) don't get registered against the
+        // tracker we are about to wait on. New spawns get a fresh tracker.
+        let tracker = {
+            let map = self.streaming_in_flight.lock().await;
+            map.get(message_id).cloned()
+        };
+        let Some(tracker) = tracker else {
+            return;
+        };
+        loop {
+            if tracker.count.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            // `notified()` returns a future that resolves on the NEXT
+            // `notify_waiters()` call. Loop + re-check handles the case
+            // where multiple tasks decrement in quick succession.
+            tracker.notify.notified().await;
+        }
+    }
 
     /// Configure workspace directory for saving downloaded/uploaded images.
     pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
@@ -1856,12 +1760,48 @@ impl DingTalkChannel {
     }
 
     /// Get access token for DingTalk API calls.
+    /// Cached for 7200 seconds per DingTalk's specification; uses
+    /// double-checked locking to keep concurrent streaming PUTs off the
+    /// token-fetch round-trip after the first warm-up.
     async fn get_access_token(&self) -> anyhow::Result<String> {
+        // Fast path: cache hit.
+        {
+            let cache = self.access_token_cache.read().await;
+            if let Some(entry) = cache.as_ref()
+                && !entry.is_expired()
+            {
+                let remaining_secs = entry.expires_at.duration_since(Instant::now()).as_secs();
+                dingtalk_debug!(
+                    ::serde_json::json!({
+                        "remaining_secs": remaining_secs,
+                    }),
+                    "DingTalk: using cached access token"
+                );
+                return Ok(entry.token.clone());
+            }
+        }
+
+        // Slow path: cache miss or expired — fetch a new token.
+        dingtalk_info!("DingTalk: fetching new access token");
+
         let mut last_error = None;
 
         for attempt in 1..=DINGTALK_OUTBOUND_MAX_ATTEMPTS {
             match self.request_access_token_once().await {
                 Ok(token) => {
+                    // Update cache. Re-check inside the write lock to
+                    // avoid clobbering a token another concurrent
+                    // caller just installed.
+                    {
+                        let mut cache = self.access_token_cache.write().await;
+                        if let Some(entry) = cache.as_ref()
+                            && !entry.is_expired()
+                        {
+                            return Ok(entry.token.clone());
+                        }
+                        *cache = Some(TokenCacheEntry::new(token.clone()));
+                    }
+
                     if attempt > 1 {
                         dingtalk_info!(
                             ::serde_json::json!({
