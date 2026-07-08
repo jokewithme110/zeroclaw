@@ -518,13 +518,13 @@ async fn check_binary_arch(path: &Path) -> Result<()> {
     let binary_arch = detect_arch_from_header(&header);
     let host_arch = host_architecture();
 
-    if let (Some(bin), Some(host)) = (binary_arch, host_arch) {
-        if bin != host {
-            bail!(
-                "architecture mismatch: downloaded binary is {bin} but this host is {host} — \
-                 the release asset may be mispackaged"
-            );
-        }
+    if let (Some(bin), Some(host)) = (binary_arch, host_arch)
+        && bin != host
+    {
+        bail!(
+            "architecture mismatch: downloaded binary is {bin} but this host is {host} — \
+             the release asset may be mispackaged"
+        );
     }
 
     Ok(())

@@ -111,20 +111,19 @@ async fn run_command(
     trace: Option<&NodeTraceCtx<'_>>,
 ) -> Result<RunResult, Value> {
     let mut argv = params.command;
-    if argv.is_empty() {
-        if let Some(raw) = params
+    if argv.is_empty()
+        && let Some(raw) = params
             .raw_command
             .as_ref()
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
-        {
-            let (shell, args) = shell_exec();
-            let mut full = Vec::with_capacity(args.len() + 2);
-            full.push(shell.to_string());
-            full.extend(args.iter().map(|s| s.to_string()));
-            full.push(raw.to_string());
-            argv = full;
-        }
+    {
+        let (shell, args) = shell_exec();
+        let mut full = Vec::with_capacity(args.len() + 2);
+        full.push(shell.to_string());
+        full.extend(args.iter().map(|s| s.to_string()));
+        full.push(raw.to_string());
+        argv = full;
     }
     if argv.is_empty() {
         if let Some(ctx) = trace {
@@ -153,19 +152,19 @@ async fn run_command(
         .and_then(|v| v.as_object())
         .map(|o| o.len())
         .unwrap_or(0);
-    if let Some(ref cwd) = params.cwd {
-        if !cwd.trim().is_empty() {
-            cmd.current_dir(cwd);
-        }
+    if let Some(ref cwd) = params.cwd
+        && !cwd.trim().is_empty()
+    {
+        cmd.current_dir(cwd);
     }
-    if let Some(ref env) = params.env {
-        if let Some(obj) = env.as_object() {
-            for (k, v) in obj {
-                if let Some(s) = v.as_str() {
-                    cmd.env(k, s);
-                } else {
-                    cmd.env(k, v.to_string());
-                }
+    if let Some(ref env) = params.env
+        && let Some(obj) = env.as_object()
+    {
+        for (k, v) in obj {
+            if let Some(s) = v.as_str() {
+                cmd.env(k, s);
+            } else {
+                cmd.env(k, v.to_string());
             }
         }
     }

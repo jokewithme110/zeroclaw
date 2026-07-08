@@ -260,18 +260,18 @@ async fn compressor_with_memory_saves_summary() {
         .await;
 
     // Check if compression happened (it should with threshold_ratio=0.01)
-    if let Ok(compressed) = result {
-        if compressed.compressed {
-            // Verify the summary was saved to memory
-            let entries = mem
-                .recall("multiplication", 10, None, None, None)
-                .await
-                .unwrap();
-            assert!(
-                !entries.is_empty(),
-                "Compression summary should have been saved to memory"
-            );
-        }
+    if let Ok(compressed) = result
+        && compressed.compressed
+    {
+        // Verify the summary was saved to memory
+        let entries = mem
+            .recall("multiplication", 10, None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            !entries.is_empty(),
+            "Compression summary should have been saved to memory"
+        );
     }
     // Even if compression didn't trigger, the test validates the wiring
 }

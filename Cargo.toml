@@ -11,7 +11,7 @@ version = "0.8.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zeroclaw-labs/zeroclaw"
-rust-version = "1.87"
+rust-version = "1.91"
 
 [workspace.dependencies]
 zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.8.0" }
@@ -396,7 +396,7 @@ metrics = ["observability-prometheus"]
 ci-all = [
     "agent-runtime",
     "channels-full",
-    "channel-nostr", "channel-matrix", "whatsapp-web",
+    "channel-nostr", "whatsapp-web",
     "observability-prometheus", "observability-otel",
     "hardware", "peripheral-rpi",
     "sandbox-landlock", "sandbox-bubblewrap",

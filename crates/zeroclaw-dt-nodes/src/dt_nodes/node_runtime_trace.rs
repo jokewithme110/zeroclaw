@@ -163,10 +163,10 @@ pub fn system_run_executed(
         "timed_out": timed_out,
         "truncated": truncated,
     });
-    if let Some(c) = cwd {
-        if let Value::Object(ref mut m) = payload {
-            m.insert("cwd".into(), json!(c));
-        }
+    if let Some(c) = cwd
+        && let Value::Object(ref mut m) = payload
+    {
+        m.insert("cwd".into(), json!(c));
     }
     if ok {
         zeroclaw_log::record!(

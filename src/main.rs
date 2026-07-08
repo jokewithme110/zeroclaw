@@ -3698,11 +3698,11 @@ async fn main() -> Result<()> {
                                 t("cli-pairing-enabled", "🔐 Gateway pairing is enabled.")
                             );
                             println!();
-                            if let Some(message) = message.as_deref() {
-                                if rotating {
-                                    println!("  ✅ {message}");
-                                    println!();
-                                }
+                            if let Some(message) = message.as_deref()
+                                && rotating
+                            {
+                                println!("  ✅ {message}");
+                                println!();
                             }
                             println!("  ┌──────────────┐");
                             println!("  │  {code}  │");
@@ -3990,27 +3990,28 @@ async fn main() -> Result<()> {
             };
 
             // Start scheduled cleanup task if enabled
-            if let Some(ref mgr) = temp_file_manager {
-                if mgr.scheduled_cleanup_enabled() && mgr.is_enabled() {
-                    let cancel_token = tokio_util::sync::CancellationToken::new();
-                    let mgr_clone = Arc::clone(mgr);
-                    zeroclaw_spawn::spawn!(async move {
-                        if let Err(e) = mgr_clone.start_scheduled_cleanup(cancel_token).await {
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Fail
-                                )
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({
-                                    "error": e.to_string()
-                                })),
-                                "Scheduled cleanup task failed"
-                            );
-                        }
-                    });
-                }
+            if let Some(ref mgr) = temp_file_manager
+                && mgr.scheduled_cleanup_enabled()
+                && mgr.is_enabled()
+            {
+                let cancel_token = tokio_util::sync::CancellationToken::new();
+                let mgr_clone = Arc::clone(mgr);
+                zeroclaw_spawn::spawn!(async move {
+                    if let Err(e) = mgr_clone.start_scheduled_cleanup(cancel_token).await {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "error": e.to_string()
+                            })),
+                            "Scheduled cleanup task failed"
+                        );
+                    }
+                });
             }
 
             // Reload loop. `daemon::run` returns DaemonExit::Shutdown on
@@ -4795,12 +4796,12 @@ async fn main() -> Result<()> {
                 }
 
                 // 2. Same directory as the current executable
-                if found.is_none() {
-                    if let Ok(exe) = std::env::current_exe() {
-                        let sibling = exe.with_file_name("zeroclaw-desktop");
-                        if sibling.is_file() {
-                            found = Some(sibling);
-                        }
+                if found.is_none()
+                    && let Ok(exe) = std::env::current_exe()
+                {
+                    let sibling = exe.with_file_name("zeroclaw-desktop");
+                    if sibling.is_file() {
+                        found = Some(sibling);
                     }
                 }
 
@@ -4808,38 +4809,37 @@ async fn main() -> Result<()> {
                 //    Uses directories::UserDirs so HOME (Unix) and USERPROFILE (Windows)
                 //    are both resolved correctly. On Windows the binary is .exe — try
                 //    both names since which::which (step 4) only catches PATH entries.
-                if found.is_none() {
-                    if let Some(home) =
+                if found.is_none()
+                    && let Some(home) =
                         directories::UserDirs::new().map(|u| u.home_dir().to_path_buf())
-                    {
-                        let bin_names: &[&str] = if cfg!(windows) {
-                            &["zeroclaw-desktop.exe", "zeroclaw-desktop"]
-                        } else {
-                            &["zeroclaw-desktop"]
-                        };
-                        // .cargo/bin works the same on Windows; .local/bin is XDG (Unix only).
-                        let dirs: &[&str] = if cfg!(windows) {
-                            &[".cargo/bin"]
-                        } else {
-                            &[".cargo/bin", ".local/bin"]
-                        };
-                        'outer: for dir in dirs {
-                            for name in bin_names {
-                                let candidate = home.join(dir).join(name);
-                                if candidate.is_file() {
-                                    found = Some(candidate);
-                                    break 'outer;
-                                }
+                {
+                    let bin_names: &[&str] = if cfg!(windows) {
+                        &["zeroclaw-desktop.exe", "zeroclaw-desktop"]
+                    } else {
+                        &["zeroclaw-desktop"]
+                    };
+                    // .cargo/bin works the same on Windows; .local/bin is XDG (Unix only).
+                    let dirs: &[&str] = if cfg!(windows) {
+                        &[".cargo/bin"]
+                    } else {
+                        &[".cargo/bin", ".local/bin"]
+                    };
+                    'outer: for dir in dirs {
+                        for name in bin_names {
+                            let candidate = home.join(dir).join(name);
+                            if candidate.is_file() {
+                                found = Some(candidate);
+                                break 'outer;
                             }
                         }
                     }
                 }
 
                 // 4. Fallback to PATH lookup
-                if found.is_none() {
-                    if let Ok(path) = which::which("zeroclaw-desktop") {
-                        found = Some(path);
-                    }
+                if found.is_none()
+                    && let Ok(path) = which::which("zeroclaw-desktop")
+                {
+                    found = Some(path);
                 }
 
                 found
@@ -4995,10 +4995,10 @@ async fn main() -> Result<()> {
                     if secrets && !entry.is_secret {
                         continue;
                     }
-                    if let Some(ref f) = filter {
-                        if !entry.name.starts_with(f.as_str()) {
-                            continue;
-                        }
+                    if let Some(ref f) = filter
+                        && !entry.name.starts_with(f.as_str())
+                    {
+                        continue;
                     }
                     if entry.category != current_category {
                         if !current_category.is_empty() {

@@ -264,7 +264,7 @@ channel-webhook = []
 channel-whatsapp-cloud = []
 channel-voice-call = []
 channel-acp-server = []
-channel-matrix = ["dep:matrix-sdk", "dep:mime_guess"]
+channel-matrix = []
 voice-wake = ["dep:cpal"]
 
 [dev-dependencies]

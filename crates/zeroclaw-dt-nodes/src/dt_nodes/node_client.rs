@@ -51,10 +51,10 @@ pub async fn run_loop(
                 return Err(e.into());
             }
         };
-        if let Some(token) = &identity.token {
-            if let Ok(value) = HeaderValue::from_str(token) {
-                request.headers_mut().insert("X-Node-Control-Token", value);
-            }
+        if let Some(token) = &identity.token
+            && let Ok(value) = HeaderValue::from_str(token)
+        {
+            request.headers_mut().insert("X-Node-Control-Token", value);
         }
         let connect_fut = connect_async_tls_with_config(request, None, false, None);
         let ws_stream: WsStream = select! {
@@ -171,17 +171,16 @@ pub async fn run_loop(
                             );
                             break Err(Error::msg(format!("failed to send connect frame: {e}")));
                         }
-                    } else if frame_type == "event" && event == "node.invoke.request" {
-                        if let Err(e) = handle_invoke_request(
+                    } else if frame_type == "event" && event == "node.invoke.request"
+                        && let Err(e) = handle_invoke_request(
                             &mut sink,
                             identity,
                             &parsed,
                             workspace_dir.as_deref(),
                         )
                         .await
-                        {
-                            break Err(e);
-                        }
+                    {
+                        break Err(e);
                     }
                 }
             }
