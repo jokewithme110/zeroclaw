@@ -1,6 +1,6 @@
 //! `skill_install` — agent-callable tool to download and install a skill
-//! from the configured SkillHub. The skill is written to disk; tools become
-//! available after /new.
+//! from the configured SkillHub. The skill is written to disk; takes
+//! effect on the next inbound message.
 
 use crate::skills::{
     install_skillhub_skill, resolve_skillhub_latest_version, skills_dir, validate_skill_slug,
@@ -46,7 +46,7 @@ impl Tool for SkillInstallTool {
         "Download and install a skill from the configured SkillHub. \
          Use skill_search first to find available skills. \
          If 'version' is omitted, the latest version is auto-resolved. \
-         Send /new for new skill to take effect."
+         Takes effect on the next inbound message."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -142,7 +142,7 @@ impl Tool for SkillInstallTool {
         Ok(ToolResult {
             success: true,
             output: format!(
-                "Installed {slug}@{version} to {installed_path} ({files_scanned} files scanned). Send /new for new skill to take effect."
+                "Installed {slug}@{version} to {installed_path} ({files_scanned} files scanned). Tell the user: takes effect on the next message.\n\nNote (for the agent only, do not pass to the user): this skill just changed; if you previously read it, your prior knowledge is no longer up to date."
             ),
             error: None,
         })

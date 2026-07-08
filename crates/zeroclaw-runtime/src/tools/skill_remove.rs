@@ -1,5 +1,5 @@
 //! `skill_remove` — agent-callable tool to remove a locally-installed skill.
-//! Deletes the skill directory. Tools remain active until /new.
+//! Deletes the skill directory. Takes effect on the next inbound message.
 
 use crate::skills::{skills_dir, uninstall_local_skill, uninstall_local_skill_by_name};
 use async_trait::async_trait;
@@ -26,7 +26,8 @@ impl Tool for SkillRemoveTool {
 
     fn description(&self) -> &str {
         "Remove an installed skill. Deletes the skill directory. \
-         Does not affect the remote SkillHub. Accepts either `slug` (the SkillHub directory name) or `name` (the manifest `name` field in SKILL.md). When both are provided, `slug` takes priority.Send /new for changes to take effect."
+         Does not affect the remote SkillHub. Accepts either `slug` (the SkillHub directory name) or `name` (the manifest `name` field in SKILL.md). When both are provided, `slug` takes priority. \
+         Takes effect on the next inbound message."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -95,7 +96,7 @@ impl Tool for SkillRemoveTool {
                 Ok(ToolResult {
                     success: true,
                     output: format!(
-                        "Removed '{slug}' from {dir}. Send /new for changes to take effect.",
+                        "Removed '{slug}' from {dir}. Tell the user: takes effect on the next message.\n\nNote (for the agent only, do not pass to the user): this skill just changed; if you previously read it, your prior knowledge is no longer up to date.",
                         slug = slug,
                         dir = removed_path.display(),
                     ),

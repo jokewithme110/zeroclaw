@@ -7,7 +7,7 @@ use crate::tools::skillhub_client::{
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::attribution::{Attributable, Role, ToolKind};
@@ -212,12 +212,23 @@ impl SkillSearchTool {
             } else {
                 String::new()
             };
+            // Slug comes from `_meta.json` (only SkillHub-installed skills
+            // carry it). When the file is missing or has no slug field we
+            // omit the segment so the LLM doesn't see a misleading value.
+            let slug_note = skill
+                .location
+                .as_deref()
+                .and_then(|p| p.parent())
+                .and_then(read_slug_from_meta_json)
+                .map(|s| format!(" (slug: {s})"))
+                .unwrap_or_default();
             out.push_str(&format!(
-                "[{}] {} v{} — {}{}\n",
+                "[{}] {} v{} — {}{}{}\n",
                 i + 1,
                 skill.name,
                 skill.version,
                 skill.description,
+                slug_note,
                 tools_note,
             ));
         }
@@ -236,6 +247,20 @@ impl Attributable for SkillSearchTool {
     fn alias(&self) -> &str {
         "skill_search"
     }
+}
+
+/// Read the `slug` field from `<dir>/_meta.json`.
+///
+/// SkillHub writes `_meta.json` next to SKILL.md when installing; manually
+/// deployed skills don't carry the file. Returns `None` for both "file
+/// missing" and "field absent" so callers can render the slug
+/// segment without a separate fallback chain.
+fn read_slug_from_meta_json(dir: &Path) -> Option<String> {
+    std::fs::read_to_string(dir.join("_meta.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.get("slug")?.as_str().map(String::from))
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]

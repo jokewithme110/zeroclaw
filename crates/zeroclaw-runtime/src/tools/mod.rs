@@ -190,9 +190,12 @@ use zeroclaw_memory::Memory;
 pub type PerToolChannelHandle =
     Arc<RwLock<HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>>>;
 
-/// Shared tool registry. Wrapped in `tokio::sync::RwLock` so PR2's
-/// skill-management tools (`skill_install` / `skill_remove`) can hot-load
-/// new tools at runtime without restarting the agent.
+/// Shared tool registry. The `tokio::sync::RwLock` allows future hot-reload
+/// (e.g. dynamic MCP re-registration) to mutate the registry without
+/// restarting the agent. As of this writing `skill_install` / `skill_remove`
+/// only write to disk; they take effect on the next inbound message via
+/// the channel orchestrator re-reading `load_skills_for_agent_from_config`,
+/// not via this registry.
 ///
 /// **Why `tokio::sync::RwLock` instead of `parking_lot` / `std::sync`?**
 /// `parking_lot::RwLockReadGuard` is `!Send` (intended for sync code).
@@ -1460,7 +1463,8 @@ pub fn all_tools_with_runtime(
 
     // ── Skill management tools ──
     // Registered when `[skills].enable_agent_skill_management` is true.
-    // Skills are installed to disk; tools become available after agent restart.
+    // Skills are installed to disk; the channel orchestrator re-reads them
+    // on every inbound message, so they take effect without /new.
     if config.skills.enable_agent_skill_management {
         tool_arcs.push(Arc::new(SkillSearchTool::new(
             config.clone(),

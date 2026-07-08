@@ -464,13 +464,6 @@ struct ChannelRuntimeContext {
     tools_registry: zeroclaw_runtime::tools::ToolRegistry,
     observer: Arc<dyn Observer>,
     system_prompt: Arc<String>,
-    /// Cached `## Available Skills` segment string, refreshed by `/new`
-    /// (and by the first-ever message of a fresh process) so every
-    /// subsequent turn keeps the up-to-date skills list instead of
-    /// dropping back to the bare base prompt. `None` means "no `/new`
-    /// has run and the sender already has history" — in that case the
-    /// original behavior applies: read `system_prompt` as-is.
-    refreshed_skills_segment: Arc<Mutex<Option<Arc<String>>>>,
     model: Arc<String>,
     temperature: Option<f64>,
     auto_save_memory: bool,
@@ -1733,23 +1726,24 @@ fn replace_available_skills_section(base_prompt: &str, refreshed_skills: &str) -
     format!("{base_prompt}\n\n{refreshed_skills}")
 }
 
-/// Load the on-disk skills for this agent and format them as the
-/// `## Available Skills` segment string (no surrounding prompt — just
-/// the section body that `replace_available_skills_section` expects).
-///
-/// Inputs are all process-level (workspace / agent alias / prompt
-/// config), so the result is stable for the lifetime of the context —
-/// the cache layer just memoizes the I/O.
-fn compute_refreshed_skills_segment(ctx: &ChannelRuntimeContext) -> String {
-    zeroclaw_runtime::skills::skills_to_prompt_with_mode(
-        &zeroclaw_runtime::skills::load_skills_for_agent(
-            ctx.workspace_dir.as_ref(),
-            ctx.prompt_config.as_ref(),
-            &ctx.agent_alias,
-        ),
-        ctx.workspace_dir.as_ref(),
-        ctx.prompt_config.skills.prompt_injection_mode,
-    )
+/// Build the per-turn system prompt by splicing the on-disk skills
+/// (filtered by this agent's `skill_bundles`) into the cached base
+/// prompt. Re-read on every inbound message so installs/removals
+/// take effect immediately; cost is dominated by the skill-directory
+/// walk and is on the order of tens of milliseconds.
+fn build_system_prompt_with_disk_skills(ctx: &ChannelRuntimeContext) -> String {
+    let snapshot = runtime_defaults_snapshot(ctx);
+    let skills = zeroclaw_runtime::skills::load_skills_for_agent_from_config(
+        snapshot.config.as_ref(),
+        &ctx.agent_alias,
+    );
+    let workspace_dir = snapshot.config.agent_workspace_dir(&ctx.agent_alias);
+    let new_skills_segment = zeroclaw_runtime::skills::skills_to_prompt_with_mode(
+        &skills,
+        workspace_dir.as_path(),
+        snapshot.config.skills.prompt_injection_mode,
+    );
+    replace_available_skills_section(ctx.system_prompt.as_str(), &new_skills_segment)
 }
 
 fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
@@ -2615,16 +2609,6 @@ async fn handle_runtime_command_if_needed(
                 );
             }
             mark_sender_for_new_session(ctx, &sender_key);
-            // Refresh only the `## Available Skills` segment and cache
-            // it. The next message would otherwise hit
-            // `Some(cached) => replace_available_skills_section(...)` and
-            // pick up this post-`/new` value; without the cache, a
-            // turn-2+ message would drop back to the bare base prompt
-            // and lose the skills list.
-            let refreshed = compute_refreshed_skills_segment(ctx);
-            *ctx.refreshed_skills_segment
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(refreshed));
             "Conversation history cleared. Starting fresh.".to_string()
         }
     };
@@ -4147,8 +4131,9 @@ async fn process_channel_message_body(
 
     let force_fresh_session = take_pending_new_session(ctx.as_ref(), &history_key);
     if force_fresh_session {
-        // `/new` should make the next user turn completely fresh even if
-        // older cached turns reappear before this message starts.
+        // `/new` resets the sender's conversation history and persisted
+        // session before the next turn; the system prompt is rebuilt
+        // from disk on every message regardless.
         clear_sender_history(ctx.as_ref(), &history_key);
     }
 
@@ -4170,16 +4155,6 @@ async fn process_channel_message_body(
             }
         }
     }
-
-    let had_prior_history = if force_fresh_session {
-        false
-    } else {
-        ctx.conversation_histories
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .peek(&history_key)
-            .is_some_and(|turns| !turns.is_empty())
-    };
 
     // Preserve the dated user turn before the LLM call so interrupted requests
     // keep the same temporal context as CLI turns. Keep history compact so
@@ -4284,42 +4259,10 @@ async fn process_channel_message_body(
         format!("{sender_memory}\n{group_memory}")
     };
 
-    // Resolve the base system prompt for this turn:
-    //   - Cache hit (a prior `/new` or the first-ever message in this
-    //     process populated `refreshed_skills_segment`): splice the
-    //     cached `## Available Skills` segment into `system_prompt` so
-    //     turn 2+ keeps the up-to-date skills list instead of falling
-    //     back to the bare base prompt.
-    //   - First-ever message of a fresh process (no cache, no prior
-    //     history): compute the skills segment, cache it, splice in.
-    //   - Otherwise (no cache and the sender already has history): the
-    //     pre-cache original behavior — use `system_prompt` as-is.
-    //
     // Memory context is injected into the system prompt (not the user
     // message) so it doesn't pollute session history and is re-fetched
     // each turn.
-    let base_system_prompt = {
-        let cached_skills = ctx
-            .refreshed_skills_segment
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .map(|s| s.as_str().to_string());
-        match cached_skills {
-            Some(skills) => replace_available_skills_section(ctx.system_prompt.as_str(), &skills),
-            None if !had_prior_history => {
-                // First turn of the session (or first turn after a
-                // process restart) — compute the skills segment and
-                // remember it.
-                let refreshed = compute_refreshed_skills_segment(ctx.as_ref());
-                *ctx.refreshed_skills_segment
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(refreshed.clone()));
-                replace_available_skills_section(ctx.system_prompt.as_str(), &refreshed)
-            }
-            None => ctx.system_prompt.as_str().to_string(),
-        }
-    };
+    let base_system_prompt = build_system_prompt_with_disk_skills(ctx.as_ref());
     let mut system_prompt =
         build_channel_system_prompt_for_message(&base_system_prompt, &msg, target_channel.as_ref());
     if !memory_context.is_empty() {
@@ -9364,11 +9307,11 @@ pub async fn start_channels(
             ));
             tool_descs.push((
                 "skill_install",
-                "Download and install a skill from the configured SkillHub into the local skills directory, then hot-load its tools into the running agent (no restart required). Use skill_search first to find available slugs.",
+                "Download and install a skill from the configured SkillHub into the local skills directory. Use skill_search first to find available slugs. Takes effect on the next inbound message.",
             ));
             tool_descs.push((
                 "skill_remove",
-                "Uninstall a locally-installed skill: delete its directory and hot-unload its tools from the running agent. Does not affect the remote SkillHub.",
+                "Uninstall a locally-installed skill by deleting its directory. Does not affect the remote SkillHub. Accepts either `slug` (the SkillHub directory name) or `name` (the manifest `name` field in SKILL.md); slug takes priority. Takes effect on the next inbound message.",
             ));
         }
 
@@ -9647,7 +9590,6 @@ pub async fn start_channels(
             tools_registry: Arc::clone(&tools_registry),
             observer: Arc::clone(&observer),
             system_prompt: Arc::new(system_prompt),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new(model.clone()),
             temperature,
             auto_save_memory: config.memory.auto_save,
@@ -10755,7 +10697,6 @@ temperature = 0.3
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new(String::new()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -11402,7 +11343,6 @@ temperature = 0.3
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new(model.to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -11879,7 +11819,6 @@ api_key = "anthropic-key"
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -12017,7 +11956,6 @@ api_key = "anthropic-key"
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -12188,7 +12126,6 @@ api_key = "anthropic-key"
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -12303,7 +12240,6 @@ api_key = "anthropic-key"
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -12781,7 +12717,6 @@ api_key = "anthropic-key"
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -13481,7 +13416,6 @@ BTC is currently around $65,000 based on latest tool output."#
             )]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -13598,7 +13532,6 @@ BTC is currently around $65,000 based on latest tool output."#
             )]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -13736,7 +13669,6 @@ BTC is currently around $65,000 based on latest tool output."#
             )]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -13852,7 +13784,6 @@ BTC is currently around $65,000 based on latest tool output."#
             )]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -14007,7 +13938,6 @@ BTC is currently around $65,000 based on latest tool output."#
             )]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -14133,7 +14063,6 @@ BTC is currently around $65,000 based on latest tool output."#
             )]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -14274,7 +14203,6 @@ BTC is currently around $65,000 based on latest tool output."#
             )]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -14398,7 +14326,6 @@ BTC is currently around $65,000 based on latest tool output."#
             )]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -14507,7 +14434,6 @@ BTC is currently around $65,000 based on latest tool output."#
             )]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -14634,7 +14560,6 @@ BTC is currently around $65,000 based on latest tool output."#
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("default-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -14778,7 +14703,6 @@ BTC is currently around $65,000 based on latest tool output."#
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("default-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -14985,7 +14909,6 @@ BTC is currently around $65,000 based on latest tool output."#
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("default-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -15089,7 +15012,6 @@ BTC is currently around $65,000 based on latest tool output."#
             )]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -15203,7 +15125,6 @@ BTC is currently around $65,000 based on latest tool output."#
             )]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -15574,7 +15495,6 @@ BTC is currently around $65,000 based on latest tool output."#
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -15715,7 +15635,6 @@ BTC is currently around $65,000 based on latest tool output."#
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -15866,7 +15785,6 @@ BTC is currently around $65,000 based on latest tool output."#
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -16027,7 +15945,6 @@ BTC is currently around $65,000 based on latest tool output."#
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -16164,7 +16081,6 @@ BTC is currently around $65,000 based on latest tool output."#
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -16290,7 +16206,6 @@ BTC is currently around $65,000 based on latest tool output."#
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -16397,7 +16312,6 @@ BTC is currently around $65,000 based on latest tool output."#
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -17740,7 +17654,6 @@ BTC is currently around $65,000 based on latest tool output."#
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -17858,17 +17771,23 @@ BTC is currently around $65,000 based on latest tool output."#
         let workspace = make_workspace();
         let mut config = Config {
             data_dir: workspace.path().to_path_buf(),
+            // Pin install_root so `agent_workspace_dir("test-agent")`
+            // resolves inside the temp workspace — mirrors production
+            // where the orchestrator resolves the per-agent workspace
+            // via the canonical helper.
+            config_path: workspace.path().join("config.toml"),
             ..Default::default()
         };
         config.skills.open_skills_enabled = false;
 
+        let agent_workspace = config.agent_workspace_dir("test-agent");
         let initial_skills =
-            zeroclaw_runtime::skills::load_skills_with_config(workspace.path(), &config);
+            zeroclaw_runtime::skills::load_skills_with_config(&agent_workspace, &config);
         assert!(initial_skills.is_empty());
 
         let default_identity = zeroclaw_config::schema::IdentityConfig::default();
         let initial_system_prompt = build_system_prompt_with_mode(
-            workspace.path(),
+            &agent_workspace,
             "test-model",
             &[],
             &initial_skills,
@@ -17907,7 +17826,6 @@ BTC is currently around $65,000 based on latest tool output."#
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new(initial_system_prompt),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -17981,7 +17899,7 @@ BTC is currently around $65,000 based on latest tool output."#
         )
         .await;
 
-        let skill_dir = workspace.path().join("skills").join("refresh-test");
+        let skill_dir = agent_workspace.join("skills").join("refresh-test");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
             skill_dir.join("SKILL.md"),
@@ -17989,11 +17907,11 @@ BTC is currently around $65,000 based on latest tool output."#
         )
         .unwrap();
         let refreshed_skills =
-            zeroclaw_runtime::skills::load_skills_with_config(workspace.path(), &config);
+            zeroclaw_runtime::skills::load_skills_with_config(&agent_workspace, &config);
         assert_eq!(refreshed_skills.len(), 1);
         assert_eq!(refreshed_skills[0].name, "refresh-test");
         assert!(
-            compute_refreshed_skills_segment(runtime_ctx.as_ref())
+            build_system_prompt_with_disk_skills(runtime_ctx.as_ref())
                 .contains("<name>refresh-test</name>"),
             "fresh-session prompt should pick up skills added after startup"
         );
@@ -18114,7 +18032,6 @@ BTC is currently around $65,000 based on latest tool output."#
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -18252,7 +18169,6 @@ BTC is currently around $65,000 based on latest tool output."#
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -18399,7 +18315,6 @@ BTC is currently around $65,000 based on latest tool output."#
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -19548,7 +19463,6 @@ This is an example JSON object for profile settings."#;
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -19664,7 +19578,6 @@ This is an example JSON object for profile settings."#;
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -19820,7 +19733,6 @@ This is an example JSON object for profile settings."#;
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -19969,7 +19881,6 @@ This is an example JSON object for profile settings."#;
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -20234,7 +20145,6 @@ This is an example JSON object for profile settings."#;
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("default-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -20381,7 +20291,6 @@ This is an example JSON object for profile settings."#;
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("default-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -20520,7 +20429,6 @@ This is an example JSON object for profile settings."#;
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("default-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -20679,7 +20587,6 @@ This is an example JSON object for profile settings."#;
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("default-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -21076,7 +20983,6 @@ This is an example JSON object for profile settings."#;
             tools_registry: zeroclaw_runtime::tools::empty_tool_registry(),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
-            refreshed_skills_segment: Arc::new(Mutex::new(None)),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
