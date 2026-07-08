@@ -93,6 +93,7 @@ pub use crate::wecom_ws::WeComWsChannel;
 #[cfg(feature = "channel-whatsapp-cloud")]
 pub use crate::whatsapp::WhatsAppChannel;
 pub use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::plugin::PluginRegistry;
 // Local channel types (in misc, not zeroclaw-channels)
 pub use crate::cli::CliChannel;
 pub use crate::link_enricher;
@@ -6964,8 +6965,13 @@ fn classify_health_result(
     }
 }
 
+/// Marker prefix a dynamic channel factory's error carries when it self-reports
+/// `enabled = false` (return code 10, see `zeroclaw-loader` channel-factory mapping).
+/// The orchestrator treats this as a non-error skip rather than a failure.
+const DYNAMIC_DISABLED_MARKER: &str = "channel_disabled:";
+
 struct ConfiguredChannel {
-    display_name: &'static str,
+    display_name: String,
     /// ZeroClaw channel alias (the `<alias>` half of `[channels.<type>.<alias>]`).
     /// `Some` for every aliased channel built in `collect_configured_channels`;
     /// `None` for singleton channels with no alias concept (e.g. Notion).
@@ -7134,7 +7140,7 @@ fn collect_configured_channels(
             Arc::new(move || cfg_arc.read().channel_external_peers("telegram", &alias))
         };
         channels.push(ConfiguredChannel {
-            display_name: "Telegram",
+            display_name: "Telegram".to_string(),
             alias: Some(alias.clone()),
             channel: crate::paced_channel::PacedChannel::wrap(
                 Arc::new(
@@ -7220,7 +7226,7 @@ fn collect_configured_channels(
             }
         }
         channels.push(ConfiguredChannel {
-            display_name: "Discord",
+            display_name: "Discord".to_string(),
             alias: Some(alias.clone()),
             channel: crate::paced_channel::PacedChannel::wrap(Arc::new(discord_ch), dc),
         });
@@ -7251,7 +7257,7 @@ fn collect_configured_channels(
             Arc::new(move || cfg_arc.read().channel_external_peers("slack", &alias))
         };
         channels.push(ConfiguredChannel {
-            display_name: "Slack",
+            display_name: "Slack".to_string(),
             alias: Some(alias.clone()),
             channel: crate::paced_channel::PacedChannel::wrap(
                 Arc::new(
@@ -7303,7 +7309,7 @@ fn collect_configured_channels(
             Arc::new(move || cfg_arc.read().channel_external_peers("mattermost", &alias))
         };
         channels.push(ConfiguredChannel {
-            display_name: "Mattermost",
+            display_name: "Mattermost".to_string(),
             alias: Some(alias.clone()),
             channel: crate::paced_channel::PacedChannel::wrap(
                 Arc::new(
@@ -7354,7 +7360,7 @@ fn collect_configured_channels(
             Arc::new(move || cfg_arc.read().channel_external_peers("imessage", &alias))
         };
         channels.push(ConfiguredChannel {
-            display_name: "iMessage",
+            display_name: "iMessage".to_string(),
             alias: Some(alias.clone()),
             channel: crate::paced_channel::PacedChannel::wrap(
                 Arc::new(IMessageChannel::new(alias.clone(), peer_resolver)),
@@ -7396,7 +7402,7 @@ fn collect_configured_channels(
             continue;
         }
         channels.push(ConfiguredChannel {
-            display_name: "BotService",
+            display_name: "BotService".to_string(),
             alias: Some(alias.clone()),
             channel: Arc::new(BotServiceChannel::new(bs.clone())),
         });
@@ -7404,7 +7410,7 @@ fn collect_configured_channels(
 
     for (alias, wc) in &config.channels.webchat {
         channels.push(ConfiguredChannel {
-            display_name: "Webchat",
+            display_name: "Webchat".to_string(),
             alias: Some(alias.clone()),
             channel: Arc::new(WebchatChannel::new(
                 wc.port,
@@ -7441,7 +7447,7 @@ fn collect_configured_channels(
                     .with_workspace_dir(config.channel_workspace_dir(&format!("matrix.{alias}")))
                     .with_ack_reactions(ack);
                 channels.push(ConfiguredChannel {
-                    display_name: "Matrix",
+                    display_name: "Matrix".to_string(),
                     alias: Some(alias.clone()),
                     channel: crate::paced_channel::PacedChannel::wrap(Arc::new(channel), mx),
                 });
@@ -7485,7 +7491,7 @@ fn collect_configured_channels(
             Arc::new(move || cfg_arc.read().channel_external_peers("signal", &alias))
         };
         channels.push(ConfiguredChannel {
-            display_name: "Signal",
+            display_name: "Signal".to_string(),
             alias: Some(alias.clone()),
             channel: crate::paced_channel::PacedChannel::wrap(
                 Arc::new(
@@ -7557,7 +7563,7 @@ fn collect_configured_channels(
                     .with_group_mention_patterns(wa.group_mention_patterns.clone())
                     .with_approval_timeout_secs(wa.approval_timeout_secs);
                     channels.push(ConfiguredChannel {
-                        display_name: "WhatsApp",
+                        display_name: "WhatsApp".to_string(),
                         alias: Some(alias.clone()),
                         channel: crate::paced_channel::PacedChannel::wrap(Arc::new(channel), wa),
                     });
@@ -7598,7 +7604,7 @@ fn collect_configured_channels(
                         Arc::new(move || cfg_arc.read().channel_external_peers("whatsapp", &alias))
                     };
                     channels.push(ConfiguredChannel {
-                        display_name: "WhatsApp",
+                        display_name: "WhatsApp".to_string(),
                         alias: Some(alias.clone()),
                         channel: crate::paced_channel::PacedChannel::wrap(
                             Arc::new(
@@ -7658,7 +7664,7 @@ fn collect_configured_channels(
             Arc::new(move || cfg_arc.read().channel_external_peers("linq", &alias))
         };
         channels.push(ConfiguredChannel {
-            display_name: "Linq",
+            display_name: "Linq".to_string(),
             alias: Some(alias.clone()),
             channel: Arc::new(LinqChannel::new(
                 lq.api_token.clone(),
@@ -7703,7 +7709,7 @@ fn collect_configured_channels(
         )
         .with_transcription(config.transcription.clone());
         channels.push(ConfiguredChannel {
-            display_name: "WATI",
+            display_name: "WATI".to_string(),
             alias: Some(alias.clone()),
             channel: Arc::new(wati_channel),
         });
@@ -7738,7 +7744,7 @@ fn collect_configured_channels(
             })
         };
         channels.push(ConfiguredChannel {
-            display_name: "Nextcloud Talk",
+            display_name: "Nextcloud Talk".to_string(),
             alias: Some(alias.clone()),
             channel: Arc::new(NextcloudTalkChannel::new_with_proxy(
                 nc.base_url.clone(),
@@ -7776,7 +7782,7 @@ fn collect_configured_channels(
             Arc::new(move || cfg_arc.read().channel_external_peers("email", &alias))
         };
         channels.push(ConfiguredChannel {
-            display_name: "Email",
+            display_name: "Email".to_string(),
             alias: Some(alias.clone()),
             channel: Arc::new(EmailChannel::new(
                 email_cfg.clone(),
@@ -7800,7 +7806,7 @@ fn collect_configured_channels(
             Arc::new(move || cfg_arc.read().channel_external_peers("gmail_push", &alias))
         };
         channels.push(ConfiguredChannel {
-            display_name: "Gmail Push",
+            display_name: "Gmail Push".to_string(),
             alias: Some(alias.clone()),
             channel: Arc::new(GmailPushChannel::new(
                 gp_cfg.clone(),
@@ -7835,7 +7841,7 @@ fn collect_configured_channels(
             Arc::new(move || cfg_arc.read().channel_external_peers("irc", &alias))
         };
         channels.push(ConfiguredChannel {
-            display_name: "IRC",
+            display_name: "IRC".to_string(),
             alias: Some(alias.clone()),
             channel: Arc::new(IrcChannel::new(crate::irc::IrcChannelConfig {
                 server: irc.server.clone(),
@@ -7880,7 +7886,7 @@ fn collect_configured_channels(
         };
 
         channels.push(ConfiguredChannel {
-            display_name: "AMQP",
+            display_name: "AMQP".to_string(),
             alias: Some(alias.clone()),
             channel: Arc::new(AmqpChannel::new(crate::amqp::AmqpChannelConfig {
                 amqp_url: amqp.amqp_url.clone(),
@@ -7925,7 +7931,7 @@ fn collect_configured_channels(
             Arc::new(move || cfg_arc.read().channel_external_peers("twitch", &alias))
         };
         channels.push(ConfiguredChannel {
-            display_name: "Twitch",
+            display_name: "Twitch".to_string(),
             alias: Some(alias.clone()),
             channel: Arc::new(TwitchChannel::new(
                 tw.bot_username.clone(),
@@ -7968,7 +7974,7 @@ fn collect_configured_channels(
         // use_feishu flag.
         let channel_ref = format!("lark.{alias}");
         channels.push(ConfiguredChannel {
-            display_name,
+            display_name: display_name.to_string(),
             alias: Some(alias.clone()),
             channel: Arc::new(
                 LarkChannel::from_config(lk, alias.clone(), peer_resolver)
@@ -8009,7 +8015,7 @@ fn collect_configured_channels(
             Arc::new(move || cfg_arc.read().channel_external_peers("line", &alias))
         };
         channels.push(ConfiguredChannel {
-            display_name: "LINE",
+            display_name: "LINE".to_string(),
             alias: Some(alias.clone()),
             channel: Arc::new(
                 LineChannel::from_config(ln, alias.clone(), peer_resolver)
@@ -8065,7 +8071,7 @@ fn collect_configured_channels(
         // these are two views of the **same** allocation, not a copy.
         ict_live_for_mirror.push((format!("ict.{alias}"), Arc::clone(&ict_channel)));
         channels.push(ConfiguredChannel {
-            display_name: "ICT",
+            display_name: "ICT".to_string(),
             alias: Some(alias.clone()),
             channel: ict_channel,
         });
@@ -8122,7 +8128,7 @@ fn collect_configured_channels(
             dingtalk_channel = dingtalk_channel.with_ai_card_template(template_id.clone());
         }
         channels.push(ConfiguredChannel {
-            display_name: "DingTalk",
+            display_name: "DingTalk".to_string(),
             alias: Some(alias.clone()),
             channel: Arc::new(dingtalk_channel),
         });
@@ -8153,7 +8159,7 @@ fn collect_configured_channels(
             Arc::new(move || cfg_arc.read().channel_external_peers("qq", &alias))
         };
         channels.push(ConfiguredChannel {
-            display_name: "QQ",
+            display_name: "QQ".to_string(),
             alias: Some(alias.clone()),
             channel: Arc::new(
                 QQChannel::new(
@@ -8198,7 +8204,7 @@ fn collect_configured_channels(
             Arc::new(move || cfg_arc.read().channel_external_peers("twitter", &alias))
         };
         channels.push(ConfiguredChannel {
-            display_name: "X/Twitter",
+            display_name: "X/Twitter".to_string(),
             alias: Some(alias.clone()),
             channel: Arc::new(TwitterChannel::new(
                 tw.bearer_token.clone(),
@@ -8233,7 +8239,7 @@ fn collect_configured_channels(
             Arc::new(move || cfg_arc.read().channel_external_peers("mochat", &alias))
         };
         channels.push(ConfiguredChannel {
-            display_name: "Mochat",
+            display_name: "Mochat".to_string(),
             alias: Some(alias.clone()),
             channel: Arc::new(MochatChannel::new(
                 mc.api_url.clone(),
@@ -8270,7 +8276,7 @@ fn collect_configured_channels(
             Arc::new(move || cfg_arc.read().channel_external_peers("wecom", &alias))
         };
         channels.push(ConfiguredChannel {
-            display_name: "WeCom",
+            display_name: "WeCom".to_string(),
             alias: Some(alias.clone()),
             channel: Arc::new(
                 WeComChannel::new(wc.webhook_key.clone(), alias.clone(), peer_resolver)
@@ -8330,7 +8336,7 @@ fn collect_configured_channels(
             &config.channel_workspace_dir(&format!("wecom_ws.{alias}")),
         ) {
             Ok(channel) => channels.push(ConfiguredChannel {
-                display_name: "WeCom WebSocket",
+                display_name: "WeCom WebSocket".to_string(),
                 alias: Some(alias.clone()),
                 channel: Arc::new(channel.with_file_persisted_hook(make_file_persisted_hook(
                     config_arc,
@@ -8385,7 +8391,7 @@ fn collect_configured_channels(
         ) {
             Ok(channel) => {
                 channels.push(ConfiguredChannel {
-                    display_name: "WeChat",
+                    display_name: "WeChat".to_string(),
                     alias: Some(alias.clone()),
                     channel: Arc::new(
                         channel
@@ -8428,7 +8434,7 @@ fn collect_configured_channels(
             continue;
         }
         channels.push(ConfiguredChannel {
-            display_name: "ClawdTalk",
+            display_name: "ClawdTalk".to_string(),
             alias: Some(alias.clone()),
             channel: Arc::new(ClawdTalkChannel::new(alias.clone(), ct.clone())),
         });
@@ -8459,7 +8465,7 @@ fn collect_configured_channels(
             );
         } else {
             channels.push(ConfiguredChannel {
-                display_name: "Notion",
+                display_name: "Notion".to_string(),
                 alias: None,
                 channel: Arc::new(NotionChannel::new(
                     "notion",
@@ -8496,7 +8502,7 @@ fn collect_configured_channels(
             continue;
         }
         channels.push(ConfiguredChannel {
-            display_name: "Reddit",
+            display_name: "Reddit".to_string(),
             alias: Some(alias.clone()),
             channel: Arc::new(RedditChannel::new(
                 alias.clone(),
@@ -8529,7 +8535,7 @@ fn collect_configured_channels(
             continue;
         }
         channels.push(ConfiguredChannel {
-            display_name: "Bluesky",
+            display_name: "Bluesky".to_string(),
             alias: Some(alias.clone()),
             channel: Arc::new(BlueskyChannel::new(
                 alias.clone(),
@@ -8559,7 +8565,7 @@ fn collect_configured_channels(
             continue;
         }
         channels.push(ConfiguredChannel {
-            display_name: "VoiceWake",
+            display_name: "VoiceWake".to_string(),
             alias: Some(alias.clone()),
             channel: Arc::new(VoiceWakeChannel::new(
                 alias.clone(),
@@ -8589,7 +8595,7 @@ fn collect_configured_channels(
             continue;
         }
         channels.push(ConfiguredChannel {
-            display_name: "Voice Call",
+            display_name: "Voice Call".to_string(),
             alias: Some(alias.clone()),
             channel: Arc::new(VoiceCallChannel::new(alias.clone(), vc.clone())),
         });
@@ -8615,7 +8621,7 @@ fn collect_configured_channels(
             continue;
         }
         channels.push(ConfiguredChannel {
-            display_name: "Webhook",
+            display_name: "Webhook".to_string(),
             alias: Some(alias.clone()),
             channel: crate::paced_channel::PacedChannel::wrap(
                 Arc::new(WebhookChannel::new(
@@ -8644,6 +8650,70 @@ fn collect_configured_channels(
             "Webhook channel is configured but this build was compiled without \
              `channel-webhook`; skipping Webhook."
         );
+    }
+
+    // ── Dynamic channels: discovered from plugin.toml, host knows nothing about them ──
+    // Config lives in [channels.<name>] but lands in the `extra` flatten map for
+    // any name without a typed field. Each plugin's factory self-checks `enabled`.
+    //
+    // No-repeat (two layers):
+    //   1) Discipline: names with a typed field (qq, telegram, …) are never
+    //      re-implemented as dynamic plugins.
+    //   2) Code guard: serde never mirrors a typed field into `extra`
+    //      (verified by tests/flatten_probe.rs), so `extra.get(name)` is None
+    //      for any typed name → the loop skips it. No double-init.
+    if let Some(registries) = zeroclaw_api::plugin::runtime::registries() {
+        for name in registries.channels.list_registered() {
+            // Second-layer guard: skip any name absent from the `extra` map.
+            let Some(mut assembly) = config.channels.extra.get(&name).cloned() else {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "dynamic channel '{name}': registered factory but no \
+                     [channels.{name}] config in extra; skipping"
+                );
+                continue;
+            };
+
+            // Flat assembly (QQ style): inject global workspace_dir at top level.
+            if let Some(obj) = assembly.as_object_mut() {
+                obj.entry("workspace_dir".to_string()).or_insert_with(|| {
+                    serde_json::Value::String(config.data_dir.to_string_lossy().into_owned())
+                });
+            }
+
+            match registries.channels.get(&name, &assembly) {
+                Ok(ch) => channels.push(ConfiguredChannel {
+                    display_name: ch.name().to_string(),
+                    alias: None,
+                    channel: Arc::from(ch),
+                }),
+                Err(e) => {
+                    if e.to_string().contains(DYNAMIC_DISABLED_MARKER) {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                            "dynamic channel '{name}' disabled (enabled = false)"
+                        );
+                    } else {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                            "dynamic channel '{name}': failed to instantiate: {e}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     channels
@@ -8687,7 +8757,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 Arc::new(move || cfg_arc.read().channel_external_peers("nostr", &alias))
             };
             channels.push(ConfiguredChannel {
-                display_name: "Nostr",
+                display_name: "Nostr".to_string(),
                 alias: Some(alias.clone()),
                 channel: Arc::new(
                     NostrChannel::new(&private_key, relays, alias, peer_resolver).await?,
@@ -9421,7 +9491,7 @@ pub async fn start_channels(
                     Arc::new(move || cfg_arc.read().channel_external_peers("nostr", &alias))
                 };
                 configured_channels.push(ConfiguredChannel {
-                    display_name: "Nostr",
+                    display_name: "Nostr".to_string(),
                     alias: Some(alias.clone()),
                     channel: Arc::new(
                         NostrChannel::new(

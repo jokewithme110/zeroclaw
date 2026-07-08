@@ -11513,6 +11513,23 @@ pub struct ChannelsConfig {
     /// as a single concatenated message. `0` disables debouncing. Default: `0`.
     #[serde(default)]
     pub debounce_ms: u64,
+
+    /// Catch-all for dynamic channels the host doesn't statically know about.
+    ///
+    /// Populated via `#[serde(flatten)]` — any `[channels.<name>]` section whose
+    /// name has no typed field lands here. Dynamic plugins read their config from
+    /// this map at instantiation time. The host never accesses these by field
+    /// name, so adding a new dynamic channel needs no host code change.
+    ///
+    /// Non-repeat rule: a channel name backed by a typed field (qq, telegram, …)
+    /// is NOT re-implemented as a dynamic plugin. serde never mirrors a typed
+    /// field into `extra` (verified by `tests/flatten_probe.rs`), and the
+    /// instantiation loop skips any name absent from `extra`, so no double-init.
+    ///
+    /// NOTE: `enabled` is NOT auto-backfilled for keys here (backfill relies on
+    /// the typed-field property table). Users must set `enabled = true` explicitly.
+    #[serde(default, flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 // ── Temporary File Cleanup Configuration ─────────────────────────
@@ -11906,6 +11923,14 @@ impl ChannelsConfig {
             || self.mqtt.values().any(|c| c.enabled)
             || self.amqp.values().any(|c| c.enabled)
             || !self.webchat.is_empty()
+            // Dynamic plugin channels (config in the `extra` flatten map, no
+            // typed field). A dynamic channel counts as supervised only when
+            // its config explicitly sets `enabled = true` — mirroring the
+            // precise-enabled check above so an all-disabled `extra` does not
+            // start the supervisor (regression: `all_disabled_channels_not_supervised`).
+            || self.extra.values().any(|v| {
+                v.get("enabled").is_some_and(|e| e.as_bool() == Some(true))
+            })
     }
 }
 
@@ -11971,6 +11996,7 @@ impl Default for ChannelsConfig {
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
             debounce_ms: 0,
+            extra: std::collections::HashMap::new(),
         }
     }
 }
@@ -20095,6 +20121,7 @@ auto_save = true
                 session_backend: default_session_backend(),
                 session_ttl_hours: 0,
                 debounce_ms: 0,
+                extra: std::collections::HashMap::new(),
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -21638,6 +21665,7 @@ allowed_users = ["@u:matrix.org"]
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
             debounce_ms: 0,
+            extra: std::collections::HashMap::new(),
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -22104,6 +22132,7 @@ allowed_numbers = ["+1", "+2"]
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
             debounce_ms: 0,
+            extra: std::collections::HashMap::new(),
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();

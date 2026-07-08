@@ -143,6 +143,18 @@ macro_rules! impl_trampoline {
                         let rc = unsafe {
                             factory(json.as_ptr(), json.len(), &mut out as *mut *mut c_void)
                         };
+                        // Return code 10 is the agreed "plugin self-disabled"
+                        // signal (e.g. a dynamic channel with `enabled = false`).
+                        // Surface it with a stable marker prefix so callers can
+                        // treat it as a non-error skip. Other non-zero codes are
+                        // hard errors.
+                        if rc == 10 {
+                            ::anyhow::bail!(
+                                "channel_disabled: plugin factory '{}' ({}) self-reported disabled (enabled = false)",
+                                captured_name,
+                                $kind_label
+                            );
+                        }
                         ::anyhow::ensure!(
                             rc == 0,
                             "plugin factory '{}' ({}): returned error code {rc}",
