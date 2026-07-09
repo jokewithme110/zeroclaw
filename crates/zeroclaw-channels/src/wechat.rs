@@ -534,57 +534,11 @@ fn build_base_info() -> serde_json::Value {
     })
 }
 
-/// Filter markdown, aligning with openclaw-weixin's `StreamingMarkdownFilter`.
-///
-/// Preserved: code fences, tables, bold (`**`), italic (`*`, `_`), H1-H4 headings.
-/// Stripped: H5/H6, blockquotes, lists, inline code, strikethrough.
-/// Removed: images. Links become plain text.
-fn markdown_to_plain_text(text: &str) -> String {
-    // Remove images: ![alt](url)
-    let image_re = regex::Regex::new(r"!\[[^\]]*\]\([^)]*\)").unwrap();
-    let mut result = image_re.replace_all(text, "").into_owned();
-
-    // Links to text: [text](url) -> text
-    let link_re = regex::Regex::new(r"\[([^\]]+)\]\([^)]*\)").unwrap();
-    result = link_re.replace_all(&result, "$1").into_owned();
-
-    // H5/H6 only: ##### ######
-    let h5_h6_re = regex::Regex::new(r"(?m)^\s{0,3}#{5,6}\s+").unwrap();
-    result = h5_h6_re.replace_all(&result, "").into_owned();
-
-    // Blockquotes: >
-    let blockquote_re = regex::Regex::new(r"(?m)^>\s?").unwrap();
-    result = blockquote_re.replace_all(&result, "").into_owned();
-
-    // Lists: -, *, +
-    let bullet_re = regex::Regex::new(r"(?m)^\s*[-*+]\s+").unwrap();
-    result = bullet_re.replace_all(&result, "").into_owned();
-
-    // Strikethrough: ~~text~~
-    let strike_re = regex::Regex::new(r"~~([^~]+)~~").unwrap();
-    result = strike_re.replace_all(&result, "$1").into_owned();
-
-    // Inline code: `code`
-    let inline_code_re = regex::Regex::new(r"`([^`]+)`").unwrap();
-    result = inline_code_re.replace_all(&result, "$1").into_owned();
-
-    // Bold3: ***text***, ___text___
-    let bold3_re = regex::Regex::new(r"\*\*\*([^*]+)\*\*\*").unwrap();
-    result = bold3_re.replace_all(&result, "$1").into_owned();
-    let ubold3_re = regex::Regex::new(r"___([^_]+)___").unwrap();
-    result = ubold3_re.replace_all(&result, "$1").into_owned();
-
-    // Italic: *text*, _text_
-    let italic_star_re = regex::Regex::new(r"\*([^*]+)\*").unwrap();
-    result = italic_star_re.replace_all(&result, "$1").into_owned();
-    let italic_under_re = regex::Regex::new(r"_([^_]+)_").unwrap();
-    result = italic_under_re.replace_all(&result, "$1").into_owned();
-
-    // Bold: **text**
-    let bold_re = regex::Regex::new(r"\*\*([^*]+)\*\*").unwrap();
-    result = bold_re.replace_all(&result, "$1").into_owned();
-
-    // Normalize newlines
+/// Prepare text for WeChat iLink Bot API.
+/// We send the text content as-is, allowing any formatting to pass through.
+fn prepare_wechat_text(text: &str) -> String {
+    // Normalize excessive newlines
+    let mut result = text.to_string();
     while result.contains("\n\n\n") {
         result = result.replace("\n\n\n", "\n\n");
     }
@@ -1904,7 +1858,7 @@ impl WeChatChannel {
             to,
             vec![serde_json::json!({
                 "type": ITEM_TYPE_TEXT,
-                "text_item": { "text": markdown_to_plain_text(text) }
+                "text_item": { "text": prepare_wechat_text(text) }
             })],
             context_token,
         )
@@ -2718,12 +2672,9 @@ mod tests {
     }
 
     #[test]
-    fn markdown_to_plain_text_strips_common_formatting() {
-        let input = "# Title\n**bold** [link](https://example.com)\n\n```rust\nlet x = 1;\n```";
-        assert_eq!(
-            markdown_to_plain_text(input),
-            "Title\nbold link\n\nlet x = 1;"
-        );
+    fn prepare_wechat_text_normalizes_newlines() {
+        let input = "Line1\n\n\nLine2\n\n\n\nLine3";
+        assert_eq!(prepare_wechat_text(input), "Line1\n\nLine2\n\nLine3");
     }
 
     #[test]
