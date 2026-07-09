@@ -7962,6 +7962,10 @@ fn collect_configured_channels(
             Arc::new(move || cfg_arc.read().channel_external_peers("lark", &alias))
         };
         let display_name = if lk.use_feishu { "Feishu" } else { "Lark" };
+        // Channel ref for workspace dir resolution: always use "lark.{alias}"
+        // since the config block is [channels.lark.{alias}], regardless of
+        // use_feishu flag.
+        let channel_ref = format!("lark.{alias}");
         channels.push(ConfiguredChannel {
             display_name,
             alias: Some(alias.clone()),
@@ -7974,7 +7978,8 @@ fn collect_configured_channels(
                     .with_file_persisted_hook(make_file_persisted_hook(
                         config_arc,
                         config.channel_workspace_dir(&format!("lark.{alias}")),
-                    )),
+                    ))
+                    .with_workspace_dir(config.channel_workspace_dir(&channel_ref)),
             ),
         });
     }

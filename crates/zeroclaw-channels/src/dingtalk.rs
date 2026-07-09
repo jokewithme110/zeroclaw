@@ -23,6 +23,7 @@ const DINGTALK_STREAM_STALL_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 const DINGTALK_USER_BATCH_SEND_URL: &str =
     "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend";
 const DINGTALK_GROUP_SEND_URL: &str = "https://api.dingtalk.com/v1.0/robot/groupMessages/send";
+const DINGTALK_MEDIA_UPLOAD_URL: &str = "https://oapi.dingtalk.com/media/upload";
 type DingTalkWsStream = zeroclaw_config::schema::ProxiedWsStream;
 macro_rules! dingtalk_info {
     ($message:expr) => {
@@ -147,6 +148,7 @@ struct DingTalkCardInstance {
     card_instance_id: String,
     created_at: Instant,
     recipient: String,
+    webhook_url: Option<String>,
 }
 
 /// Cached upload entry to avoid re-uploading the same image.
@@ -326,7 +328,12 @@ impl DingTalkChannel {
     /// `cardData.cardParamMap` and the space model is selected by whether
     /// the recipient is a single chat or a group.
     /// Docs: https://open.dingtalk.com/document/orgapp/interface-for-creating-a-card-instance
-    async fn send_ai_card(&self, recipient: &str, initial_content: &str) -> anyhow::Result<String> {
+    async fn send_ai_card(
+        &self,
+        recipient: &str,
+        initial_content: &str,
+        webhook_url: Option<String>,
+    ) -> anyhow::Result<String> {
         let template_id = self.ai_card_template_id.as_ref().ok_or_else(|| {
             anyhow::Error::msg(
                 "AI card template ID not configured. Use with_ai_card_template() to set it.",
@@ -421,6 +428,7 @@ impl DingTalkChannel {
                     card_instance_id: card_id.clone(),
                     created_at: Instant::now(),
                     recipient: recipient.to_string(),
+                    webhook_url,
                 },
             );
         }
@@ -1044,7 +1052,17 @@ impl Channel for DingTalkChannel {
         if !self.supports_streaming() {
             return Ok(None);
         }
-        match self.send_ai_card(&message.recipient, "正在思考中…").await {
+
+        // Get webhook URL before creating the card
+        let webhook_url = {
+            let webhooks = self.session_webhooks.read().await;
+            webhooks.get(&message.recipient).cloned()
+        };
+
+        match self
+            .send_ai_card(&message.recipient, "正在思考中…", webhook_url)
+            .await
+        {
             Ok(card_id) => {
                 dingtalk_info!(
                     ::serde_json::json!({
@@ -1096,6 +1114,27 @@ impl Channel for DingTalkChannel {
         if message_id.is_empty() || !self.supports_streaming() {
             return Ok(());
         }
+
+        // Check for media markers and filter them out for streaming
+        let text_to_use =
+            if text.contains("[IMAGE:") || text.contains("[DOCUMENT:") || text.contains("[FILE:") {
+                let filtered = Self::filter_media_markers(text);
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "reason": "media_markers_filtered_for_streaming",
+                            "message_id": message_id,
+                            "original_len": text.len(),
+                            "filtered_len": filtered.len(),
+                        })),
+                    "DingTalk: update_draft filtering media markers for clean streaming"
+                );
+                filtered
+            } else {
+                text.to_string()
+            };
+
         let interval_ms = self.streaming_update_interval_ms;
 
         // Determine whether we are inside the throttle window.
@@ -1113,7 +1152,7 @@ impl Channel for DingTalkChannel {
             // the window. Overwrite (not append) — the orchestrator
             // already passes the full accumulated text.
             let mut cache = self.pending_streaming_text.lock().await;
-            cache.insert(message_id.to_string(), text.to_string());
+            cache.insert(message_id.to_string(), text_to_use.clone());
             return Ok(());
         }
 
@@ -1121,7 +1160,9 @@ impl Channel for DingTalkChannel {
         // (or the just-arrived `text` if no cache exists) and flush.
         let to_send = {
             let mut cache = self.pending_streaming_text.lock().await;
-            cache.remove(message_id).unwrap_or_else(|| text.to_string())
+            cache
+                .remove(message_id)
+                .unwrap_or_else(|| text_to_use.clone())
         };
 
         // Reset the throttle timer BEFORE making the API call.
@@ -1185,6 +1226,225 @@ impl Channel for DingTalkChannel {
         if message_id.is_empty() || !self.supports_streaming() {
             return Ok(());
         }
+
+        // Check for media markers in text
+        if text.contains("[IMAGE:") || text.contains("[DOCUMENT:") || text.contains("[FILE:") {
+            dingtalk_info!(
+                ::serde_json::json!({
+                    "message_id": message_id,
+                    "reason": "media_markers_detected",
+                }),
+                "DingTalk: finalize_draft detected media markers, sending filtered text and media files"
+            );
+
+            // Drain any in-flight streamingUpdate PUTs
+            self.wait_streaming_in_flight_drained(message_id).await;
+
+            // Update card with filtered text and finalize it
+            let filtered_text = Self::filter_media_markers(text);
+            // If filtered text is empty, use a default message so the card isn't blank
+            let final_text = if filtered_text.is_empty() {
+                "正在发送文件...".to_string()
+            } else {
+                filtered_text
+            };
+            dingtalk_info!(
+                ::serde_json::json!({
+                    "message_id": message_id,
+                    "final_text_len": final_text.len(),
+                }),
+                "DingTalk: finalize_draft pushing text to card"
+            );
+            if let Err(error) = self
+                .streaming_update_card(message_id, &final_text, true)
+                .await
+            {
+                dingtalk_warn!(
+                    ::serde_json::json!({
+                        "out_track_id": message_id,
+                        "error": error.to_string(),
+                    }),
+                    "DingTalk: finalize_draft failed to push text"
+                );
+            }
+
+            // Parse and send media files separately
+            let (_text_part, image_paths) = Self::parse_image_markers(text);
+            let (_doc_text, doc_paths) = Self::parse_document_markers(text);
+            let (_file_text, file_paths) = Self::parse_file_markers(text);
+
+            // Combine document and file paths
+            let all_file_paths: Vec<String> = doc_paths.into_iter().chain(file_paths).collect();
+
+            // Get the webhook URL from card instance
+            // Note: message_id here is the card_id (out_track_id), not the chat message_id
+            let webhook_url = {
+                let instances = self.card_instances.read().await;
+                instances
+                    .get(message_id)
+                    .and_then(|instance| instance.webhook_url.clone())
+            };
+
+            // Get reply target for fallback - use the recipient parameter
+            let reply_target = self.reply_target_for_recipient(_recipient).await;
+
+            if let Some(webhook) = webhook_url {
+                dingtalk_info!(
+                    ::serde_json::json!({
+                        "message_id": message_id,
+                        "image_count": image_paths.len(),
+                        "file_count": all_file_paths.len(),
+                    }),
+                    "DingTalk: finalize_draft sending media files via webhook"
+                );
+
+                // Send image messages
+                for image_path in image_paths {
+                    match self.send_image_attachment(&webhook, &image_path).await {
+                        Ok(()) => {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "message_id": message_id,
+                                    "path": image_path,
+                                })),
+                                "DingTalk: finalize_draft sent image successfully"
+                            );
+                        }
+                        Err(err) => {
+                            dingtalk_warn!(
+                                ::serde_json::json!({
+                                    "message_id": message_id,
+                                    "path": image_path,
+                                    "error": format!("{err}"),
+                                }),
+                                "DingTalk: finalize_draft failed to send image via webhook, trying fallback"
+                            );
+                            // Fallback to reply target API
+                            if let Err(fallback_err) = self
+                                .send_image_via_reply_target(
+                                    reply_target.as_ref(),
+                                    _recipient,
+                                    &image_path,
+                                )
+                                .await
+                            {
+                                dingtalk_warn!(
+                                    ::serde_json::json!({
+                                        "message_id": message_id,
+                                        "path": image_path,
+                                        "error": format!("{fallback_err}"),
+                                    }),
+                                    "DingTalk: finalize_draft fallback image send failed"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Send document/file messages
+                for file_path in all_file_paths.iter() {
+                    match self.send_file_attachment(&webhook, file_path).await {
+                        Ok(()) => {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "message_id": message_id,
+                                    "path": file_path,
+                                })),
+                                "DingTalk: finalize_draft sent file successfully"
+                            );
+                        }
+                        Err(err) => {
+                            dingtalk_warn!(
+                                ::serde_json::json!({
+                                    "message_id": message_id,
+                                    "path": file_path,
+                                    "error": format!("{err}"),
+                                }),
+                                "DingTalk: finalize_draft failed to send file via webhook, trying fallback"
+                            );
+                            // Fallback to reply target API
+                            if let Err(fallback_err) = self
+                                .send_file_via_reply_target(
+                                    reply_target.as_ref(),
+                                    _recipient,
+                                    file_path,
+                                )
+                                .await
+                            {
+                                dingtalk_warn!(
+                                    ::serde_json::json!({
+                                        "message_id": message_id,
+                                        "path": file_path,
+                                        "error": format!("{fallback_err}"),
+                                    }),
+                                    "DingTalk: finalize_draft fallback file send failed"
+                                );
+                            }
+                        }
+                    }
+                }
+            } else {
+                dingtalk_info!(
+                    ::serde_json::json!({
+                        "message_id": message_id,
+                        "image_count": image_paths.len(),
+                        "file_count": all_file_paths.len(),
+                    }),
+                    "DingTalk: finalize_draft sending media files via reply target API (no webhook)"
+                );
+
+                // No webhook URL - use reply target API directly (like non-streaming send)
+                for image_path in image_paths {
+                    if let Err(err) = self
+                        .send_image_via_reply_target(reply_target.as_ref(), _recipient, &image_path)
+                        .await
+                    {
+                        dingtalk_warn!(
+                            ::serde_json::json!({
+                                "message_id": message_id,
+                                "path": image_path,
+                                "error": format!("{err}"),
+                            }),
+                            "DingTalk: finalize_draft failed to send image via reply target"
+                        );
+                    }
+                }
+
+                // Send document/file messages
+                for file_path in all_file_paths.iter() {
+                    if let Err(err) = self
+                        .send_file_via_reply_target(reply_target.as_ref(), _recipient, file_path)
+                        .await
+                    {
+                        dingtalk_warn!(
+                            ::serde_json::json!({
+                                "message_id": message_id,
+                                "path": file_path,
+                                "error": format!("{err}"),
+                            }),
+                            "DingTalk: finalize_draft failed to send file via reply target"
+                        );
+                    }
+                }
+            }
+
+            // Clean up state
+            self.last_streaming_edit.lock().await.remove(message_id);
+            self.pending_streaming_text.lock().await.remove(message_id);
+            return Ok(());
+        }
+
+        // No media markers - normal flow
         // Drain any in-flight streamingUpdate PUTs spawned by prior
         // `update_draft` calls. After this returns, every chunk PUT
         // has reached DingTalk, so the `isFinalize=true` PUT below
@@ -1264,12 +1524,28 @@ impl Channel for DingTalkChannel {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         // Parse [IMAGE:...] markers from content
         let (text_content, image_paths) = Self::parse_image_markers(&message.content);
+        // Parse [DOCUMENT:...] markers from content
+        let (_doc_text, doc_paths) = Self::parse_document_markers(&message.content);
+        // Parse [FILE:...] markers from content
+        let (_file_text, file_paths) = Self::parse_file_markers(&message.content);
+
+        // Combine document and file paths
+        let all_file_paths: Vec<String> = doc_paths.into_iter().chain(file_paths).collect();
+        let all_file_paths_count = all_file_paths.len();
+
+        // Fully clean text by removing all marker types
+        let fully_cleaned_text = {
+            let after_doc = Self::parse_document_markers(&text_content).0;
+            Self::parse_file_markers(&after_doc).0
+        };
+
         let reply_target = self.reply_target_for_recipient(&message.recipient).await;
         let mut webhook_url = {
             let webhooks = self.session_webhooks.read().await;
             webhooks.get(&message.recipient).cloned()
         };
 
+        // Send images first
         for image_path in &image_paths {
             if let Some(current_webhook) = webhook_url.as_deref() {
                 if let Err(error) = self
@@ -1316,12 +1592,39 @@ impl Channel for DingTalkChannel {
             }
         }
 
-        if !text_content.trim().is_empty() {
+        // Send files (PDF/Word/Excel/etc)
+        for file_path in &all_file_paths {
+            if let Err(error) = self
+                .send_file_via_reply_target(reply_target.as_ref(), &message.recipient, file_path)
+                .await
+            {
+                dingtalk_warn!(
+                    ::serde_json::json!({
+                        "file_path": file_path,
+                        "error": error.to_string(),
+                    }),
+                    "DingTalk: failed to send file, falling back to text"
+                );
+                // Fallback to text message with file path
+                let fallback = format!("[Document: {}]", file_path);
+                let _ = self
+                    .send_text_via_reply_target(
+                        reply_target.as_ref(),
+                        &message.recipient,
+                        &fallback,
+                        None,
+                    )
+                    .await;
+            }
+        }
+
+        // Send text content (if any remains after extracting images and files)
+        if !fully_cleaned_text.trim().is_empty() {
             if let Some(current_webhook) = webhook_url.as_deref() {
                 if let Err(error) = self
                     .send_markdown_via_webhook(
                         current_webhook,
-                        &text_content,
+                        &fully_cleaned_text,
                         message.subject.as_deref(),
                     )
                     .await
@@ -1336,7 +1639,7 @@ impl Channel for DingTalkChannel {
                     self.send_text_via_reply_target(
                         reply_target.as_ref(),
                         &message.recipient,
-                        &text_content,
+                        &fully_cleaned_text,
                         message.subject.as_deref(),
                     )
                     .await?;
@@ -1345,16 +1648,19 @@ impl Channel for DingTalkChannel {
                 self.send_text_via_reply_target(
                     reply_target.as_ref(),
                     &message.recipient,
-                    &text_content,
+                    &fully_cleaned_text,
                     message.subject.as_deref(),
                 )
                 .await?;
             }
         }
 
-        if image_paths.is_empty() && text_content.trim().is_empty() {
+        if image_paths.is_empty()
+            && all_file_paths_count == 0
+            && fully_cleaned_text.trim().is_empty()
+        {
             anyhow::bail!(
-                "DingTalk: message for recipient {} has no text or image content to send",
+                "DingTalk: message for recipient {} has no text, image, or file content to send",
                 message.recipient
             );
         }
@@ -1472,7 +1778,7 @@ impl DingTalkChannel {
         self
     }
 
-    fn existing_local_image_path(image_path: &str) -> Option<&Path> {
+    fn existing_local_image_path(image_path: &str) -> Option<&'static Path> {
         let path = Path::new(image_path);
         if !path.exists() {
             dingtalk_warn!(
@@ -1484,7 +1790,127 @@ impl DingTalkChannel {
             return None;
         }
 
-        Some(path)
+        // Safety: We're leaking the Box to get a &'static Path.
+        // This is fine because the path is only used temporarily during the call.
+        Some(Box::leak(path.to_path_buf().into_boxed_path()))
+    }
+
+    fn existing_local_file_path(file_path: &str) -> Option<&'static Path> {
+        let path = Path::new(file_path);
+        if !path.exists() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "file_path": file_path,
+                    })),
+                "DingTalk: file not found"
+            );
+            return None;
+        }
+
+        // Safety: We're leaking the Box to get a &'static Path.
+        // This is fine because the path is only used temporarily during the call.
+        Some(Box::leak(path.to_path_buf().into_boxed_path()))
+    }
+
+    /// Filter out media markers from text for clean streaming display.
+    /// Returns text with [IMAGE:...], [DOCUMENT:...], [FILE:...] removed.
+    fn filter_media_markers(content: &str) -> String {
+        let mut result = content.to_string();
+
+        // Remove [IMAGE:...] markers
+        let re_image = Regex::new(r"\[IMAGE:[^\]]+\]").unwrap();
+        result = re_image.replace_all(&result, "").to_string();
+
+        // Remove [DOCUMENT:...] markers
+        let re_doc = Regex::new(r"\[DOCUMENT:[^\]]+\]").unwrap();
+        result = re_doc.replace_all(&result, "").to_string();
+
+        // Remove [FILE:...] markers
+        let re_file = Regex::new(r"\[FILE:[^\]]+\]").unwrap();
+        result = re_file.replace_all(&result, "").to_string();
+
+        // Clean up extra newlines that may result from marker removal
+        let re_newlines = Regex::new(r"\n{3,}").unwrap();
+        result = re_newlines.replace_all(&result, "\n\n").to_string();
+
+        result.trim().to_string()
+    }
+
+    /// Parse [IMAGE:...] markers from content and return (text, image_paths).
+    fn parse_image_markers(content: &str) -> (String, Vec<String>) {
+        let mut text = String::new();
+        let mut image_paths = Vec::new();
+        let mut last_end = 0;
+
+        let re = Regex::new(r"\[IMAGE:([^\]]+)\]").unwrap();
+
+        for cap in re.captures_iter(content) {
+            let full_match = cap.get(0).unwrap();
+            let path = cap.get(1).unwrap().as_str();
+
+            text.push_str(&content[last_end..full_match.start()]);
+
+            if path.starts_with('/') {
+                image_paths.push(path.to_string());
+            }
+
+            last_end = full_match.end();
+        }
+
+        text.push_str(&content[last_end..]);
+        (text, image_paths)
+    }
+
+    /// Parse [DOCUMENT:...] markers from content and return (text, doc_paths).
+    fn parse_document_markers(content: &str) -> (String, Vec<String>) {
+        let mut text = String::new();
+        let mut doc_paths = Vec::new();
+        let mut last_end = 0;
+
+        let re = Regex::new(r"\[DOCUMENT:([^\]]+)\]").unwrap();
+
+        for cap in re.captures_iter(content) {
+            let full_match = cap.get(0).unwrap();
+            let path = cap.get(1).unwrap().as_str();
+
+            text.push_str(&content[last_end..full_match.start()]);
+
+            if path.starts_with('/') {
+                doc_paths.push(path.to_string());
+            }
+
+            last_end = full_match.end();
+        }
+
+        text.push_str(&content[last_end..]);
+        (text, doc_paths)
+    }
+
+    /// Parse [FILE:...] markers from content and return (text, file_paths).
+    fn parse_file_markers(content: &str) -> (String, Vec<String>) {
+        let mut text = String::new();
+        let mut file_paths = Vec::new();
+        let mut last_end = 0;
+
+        let re = Regex::new(r"\[FILE:([^\]]+)\]").unwrap();
+
+        for cap in re.captures_iter(content) {
+            let full_match = cap.get(0).unwrap();
+            let path = cap.get(1).unwrap().as_str();
+
+            text.push_str(&content[last_end..full_match.start()]);
+
+            if path.starts_with('/') {
+                file_paths.push(path.to_string());
+            }
+
+            last_end = full_match.end();
+        }
+
+        text.push_str(&content[last_end..]);
+        (text, file_paths)
     }
 
     fn build_text_msg_param(
@@ -1653,6 +2079,147 @@ impl DingTalkChannel {
         None
     }
 
+    /// Download file using downloadCode API (with retry).
+    async fn download_file_by_code(&self, download_code: &str, file_name: &str) -> Option<String> {
+        const MAX_RETRIES: u32 = 2;
+        const RETRY_DELAY: Duration = Duration::from_millis(500);
+
+        // Get access token
+        let token = match self.get_access_token().await {
+            Ok(t) => t,
+            Err(e) => {
+                dingtalk_warn!(
+                    ::serde_json::json!({
+                        "error": e.to_string(),
+                    }),
+                    "DingTalk: failed to get access token"
+                );
+                return None;
+            }
+        };
+
+        // Build request body
+        let body = serde_json::json!({
+            "downloadCode": download_code,
+            "robotCode": self.robot_code()
+        });
+
+        // Send POST request with retry
+        let url = "https://api.dingtalk.com/v1.0/robot/messageFiles/download";
+
+        for attempt in 0..=MAX_RETRIES {
+            let resp = match self
+                .http_client()
+                .post(url)
+                .header("x-acs-dingtalk-access-token", &token)
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    if attempt < MAX_RETRIES {
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        continue;
+                    }
+                    dingtalk_warn!(
+                        ::serde_json::json!({
+                            "error": e.to_string(),
+                        }),
+                        "DingTalk: download request failed"
+                    );
+                    return None;
+                }
+            };
+
+            if !resp.status().is_success() {
+                if attempt < MAX_RETRIES {
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                }
+                dingtalk_warn!(
+                    ::serde_json::json!({
+                        "status": resp.status().to_string(),
+                    }),
+                    "DingTalk: download failed with status"
+                );
+                return None;
+            }
+
+            // Parse response
+            let result: serde_json::Value = match resp.json().await {
+                Ok(r) => r,
+                Err(e) => {
+                    if attempt < MAX_RETRIES {
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        continue;
+                    }
+                    dingtalk_warn!(
+                        ::serde_json::json!({
+                            "error": e.to_string(),
+                        }),
+                        "DingTalk: response parse failed"
+                    );
+                    return None;
+                }
+            };
+
+            let download_url = match result.get("downloadUrl").and_then(|v| v.as_str()) {
+                Some(u) => u,
+                None => {
+                    dingtalk_warn!("DingTalk: no downloadUrl in response");
+                    return None;
+                }
+            };
+
+            // Download from URL
+            let download_resp = match self.http_client().get(download_url).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    if attempt < MAX_RETRIES {
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        continue;
+                    }
+                    dingtalk_warn!(
+                        ::serde_json::json!({
+                            "error": e.to_string(),
+                        }),
+                        "DingTalk: file download failed"
+                    );
+                    return None;
+                }
+            };
+
+            if !download_resp.status().is_success() {
+                if attempt < MAX_RETRIES {
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                }
+                dingtalk_warn!(
+                    ::serde_json::json!({
+                        "status": download_resp.status().to_string(),
+                    }),
+                    "DingTalk: file download failed with status"
+                );
+                return None;
+            }
+
+            // Process response
+            return self
+                .process_file_download_response(download_resp, file_name, download_code)
+                .await;
+        }
+
+        dingtalk_warn!(
+            ::serde_json::json!({
+                "max_retries": MAX_RETRIES,
+            }),
+            "DingTalk: download failed after retries"
+        );
+        None
+    }
+
     /// Process image download response and save to workspace.
     async fn process_image_download_response(
         &self,
@@ -1733,30 +2300,74 @@ impl DingTalkChannel {
         None
     }
 
-    /// Parse [IMAGE:/path] markers from content, return (text, image_paths).
-    fn parse_image_markers(content: &str) -> (String, Vec<String>) {
-        let mut text = String::new();
-        let mut image_paths = Vec::new();
-        let mut last_end = 0;
-
-        let re = Regex::new(r"\[IMAGE:([^\]]+)\]").unwrap();
-
-        for cap in re.captures_iter(content) {
-            let full_match = cap.get(0).unwrap();
-            let path = cap.get(1).unwrap().as_str();
-
-            text.push_str(&content[last_end..full_match.start()]);
-
-            // Only collect local file paths (not data: URLs or placeholders)
-            if path.starts_with('/') {
-                image_paths.push(path.to_string());
+    /// Process file download response and save to workspace.
+    async fn process_file_download_response(
+        &self,
+        resp: reqwest::Response,
+        file_name: &str,
+        _file_key: &str,
+    ) -> Option<String> {
+        // Read bytes
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                dingtalk_warn!(
+                    ::serde_json::json!({
+                        "error": e.to_string(),
+                    }),
+                    "DingTalk: failed to read file bytes"
+                );
+                return None;
             }
+        };
 
-            last_end = full_match.end();
+        // Validate size
+        if bytes.is_empty() {
+            dingtalk_warn!("DingTalk: downloaded file is empty");
+            return None;
+        }
+        if bytes.len() > Self::FILE_MAX_BYTES {
+            dingtalk_warn!(
+                ::serde_json::json!({
+                    "size_bytes": bytes.len(),
+                }),
+                "DingTalk: downloaded file too large"
+            );
+            return None;
         }
 
-        text.push_str(&content[last_end..]);
-        (text, image_paths)
+        // Save to workspace
+        if let Some(ref workspace) = self.workspace_dir {
+            let dir = workspace.join("dingtalk_files");
+
+            if tokio::fs::create_dir_all(&dir).await.is_ok() {
+                // Generate unique filename
+                let stem = std::path::Path::new(file_name)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("file");
+                let ext = std::path::Path::new(file_name)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("dat");
+                let unique = &uuid::Uuid::new_v4().to_string()[..8];
+                let safe_filename = format!("{stem}_{unique}.{ext}");
+                let path = dir.join(&safe_filename);
+
+                if tokio::fs::write(&path, &bytes).await.is_ok() {
+                    dingtalk_info!(
+                        ::serde_json::json!({
+                            "path": path.display().to_string(),
+                        }),
+                        "DingTalk: file saved"
+                    );
+                    self.on_file_persisted(&path);
+                    return Some(format!("[DOCUMENT:{}]", path.display()));
+                }
+            }
+        }
+
+        None
     }
 
     /// Get access token for DingTalk API calls.
@@ -1980,6 +2591,67 @@ impl DingTalkChannel {
         }
 
         Err(last_error.unwrap_or_else(|| anyhow::Error::msg("DingTalk: webhook retry exhausted")))
+    }
+
+    async fn send_webhook_request(
+        &self,
+        webhook_url: &str,
+        body: &serde_json::Value,
+        payload_kind: &'static str,
+    ) -> anyhow::Result<()> {
+        let mut last_error = None;
+
+        for attempt in 1..=DINGTALK_OUTBOUND_MAX_ATTEMPTS {
+            match self
+                .send_webhook_request_once(webhook_url, body, payload_kind)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    if attempt >= DINGTALK_OUTBOUND_MAX_ATTEMPTS {
+                        return Err(error);
+                    }
+                    dingtalk_warn!(
+                        ::serde_json::json!({
+                            "attempt": attempt,
+                            "max_attempts": DINGTALK_OUTBOUND_MAX_ATTEMPTS,
+                            "payload_kind": payload_kind,
+                            "webhook_url": webhook_url,
+                            "error": error.to_string(),
+                        }),
+                        "DingTalk: webhook reply failed, retrying"
+                    );
+                    last_error = Some(error);
+                    tokio::time::sleep(DINGTALK_OUTBOUND_RETRY_DELAY).await;
+                }
+            }
+        }
+
+        Err(last_error.unwrap())
+    }
+
+    async fn send_webhook_request_once(
+        &self,
+        webhook_url: &str,
+        body: &serde_json::Value,
+        payload_kind: &'static str,
+    ) -> anyhow::Result<()> {
+        let resp = self
+            .http_client()
+            .post(webhook_url)
+            .json(body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let response_body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!(
+                "DingTalk webhook {payload_kind} reply failed ({status}): {response_body}"
+            );
+        }
+
+        Self::ensure_webhook_response_ok(payload_kind, &response_body)
     }
 
     async fn send_webhook_markdown_once(
@@ -2211,6 +2883,341 @@ impl DingTalkChannel {
             .unwrap_or_else(|| anyhow::Error::msg("DingTalk: upload failed after retries")))
     }
 
+    /// Maximum file upload size (20 MB for documents).
+    const FILE_MAX_BYTES: usize = 20 * 1024 * 1024;
+
+    /// Upload a local file to DingTalk and return (media_id, access_token).
+    ///
+    /// Uses the official DingTalk OpenAPI endpoint
+    /// `https://oapi.dingtalk.com/media/upload?access_token=...&type=file`
+    /// (multipart form with the `media` field). Returns a `media_id` that can
+    /// be used as `msgParam.mediaId` in a `sampleFile` proactive message.
+    async fn upload_file(&self, file_path: &Path) -> anyhow::Result<(String, String)> {
+        const MAX_RETRIES: u32 = 2;
+        const RETRY_DELAY: Duration = Duration::from_millis(500);
+
+        let file_path_str = file_path.display().to_string();
+        let file_name = file_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        // Reuse the upload cache to avoid re-uploading the same file.
+        {
+            let cache = self.upload_cache.read().await;
+            if let Some(entry) = cache.get(&file_path_str) {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                if now < entry.expires_at && !entry.media_id.is_empty() {
+                    return Ok((entry.media_id.clone(), String::new()));
+                }
+            }
+        }
+
+        let file_bytes = match tokio::fs::read(file_path).await {
+            Ok(b) => b,
+            Err(e) => anyhow::bail!("DingTalk: file read failed: {}", e),
+        };
+        if file_bytes.is_empty() {
+            anyhow::bail!("DingTalk: file is empty: {}", file_path.display());
+        }
+        if file_bytes.len() > Self::FILE_MAX_BYTES {
+            anyhow::bail!(
+                "DingTalk: file too large: {} bytes exceeds {} bytes limit",
+                file_bytes.len(),
+                Self::FILE_MAX_BYTES
+            );
+        }
+
+        // Map common document extensions to a sensible MIME type so the
+        // DingTalk media server can preview the file correctly.
+        let mime = match file_path.extension().and_then(|e| e.to_str()) {
+            Some("pdf") => "application/pdf",
+            Some("doc") => "application/msword",
+            Some("docx") => {
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            }
+            Some("xls") => "application/vnd.ms-excel",
+            Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            Some("ppt") => "application/vnd.ms-powerpoint",
+            Some("pptx") => {
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            }
+            Some("txt") => "text/plain",
+            Some("csv") => "text/csv",
+            Some("zip") => "application/zip",
+            _ => "application/octet-stream",
+        };
+
+        let mut last_error: Option<anyhow::Error> = None;
+        for attempt in 0..=MAX_RETRIES {
+            let token = match self.get_access_token().await {
+                Ok(t) => t,
+                Err(e) => {
+                    last_error = Some(e);
+                    if attempt < MAX_RETRIES {
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        continue;
+                    }
+                    return Err(last_error.unwrap());
+                }
+            };
+
+            let form = reqwest::multipart::Form::new().part(
+                "media",
+                reqwest::multipart::Part::bytes(file_bytes.clone())
+                    .file_name(file_name.clone())
+                    .mime_str(mime)?,
+            );
+
+            let url = format!(
+                "{}?access_token={}&type=file",
+                DINGTALK_MEDIA_UPLOAD_URL, token
+            );
+            let resp = match self.http_client().post(&url).multipart(form).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    last_error = Some(anyhow::Error::msg(format!("Request failed: {e}")));
+                    if attempt < MAX_RETRIES {
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        continue;
+                    }
+                    return Err(last_error.unwrap());
+                }
+            };
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let err = resp.text().await.unwrap_or_default();
+                last_error = Some(anyhow::Error::msg(format!(
+                    "Upload failed ({status}): {err}"
+                )));
+                if attempt < MAX_RETRIES {
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                }
+                return Err(last_error.unwrap());
+            }
+
+            #[derive(Deserialize)]
+            struct UploadResp {
+                errcode: i32,
+                errmsg: String,
+                media_id: Option<String>,
+            }
+
+            let upload_resp: UploadResp = match resp.json().await {
+                Ok(r) => r,
+                Err(e) => {
+                    last_error = Some(anyhow::Error::msg(format!("Parse failed: {e}")));
+                    if attempt < MAX_RETRIES {
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        continue;
+                    }
+                    return Err(last_error.unwrap());
+                }
+            };
+
+            if upload_resp.errcode != 0 {
+                last_error = Some(anyhow::Error::msg(format!(
+                    "Upload failed: errcode={}, errmsg={}",
+                    upload_resp.errcode, upload_resp.errmsg
+                )));
+                if attempt < MAX_RETRIES {
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                }
+                return Err(last_error.unwrap());
+            }
+
+            let media_id = upload_resp
+                .media_id
+                .ok_or_else(|| anyhow::Error::msg("DingTalk: no media_id in upload response"))?;
+
+            {
+                let mut cache = self.upload_cache.write().await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                cache.insert(
+                    file_path_str.clone(),
+                    UploadCacheEntry {
+                        media_id: media_id.clone(),
+                        photo_url: String::new(), // Not used for files
+                        expires_at: now + Self::UPLOAD_CACHE_TTL,
+                    },
+                );
+            }
+
+            dingtalk_info!(
+                ::serde_json::json!({
+                    "media_id": media_id,
+                    "file_name": file_name,
+                }),
+                "DingTalk: file uploaded successfully"
+            );
+            return Ok((media_id, token));
+        }
+
+        Err(last_error
+            .unwrap_or_else(|| anyhow::Error::msg("DingTalk: upload failed after retries")))
+    }
+
+    /// Send file via DingTalk proactive API.
+    ///
+    /// Uploads the local file via `oapi.dingtalk.com/media/upload`
+    /// and then delivers it as a `sampleFile` message. Falls back to a
+    /// short text notice if the upload fails.
+    async fn send_file_via_api(&self, recipient: &str, file_path: &str) -> anyhow::Result<()> {
+        let path = Path::new(file_path);
+        if !path.exists() {
+            dingtalk_warn!(
+                ::serde_json::json!({
+                    "file_path": file_path,
+                }),
+                "DingTalk: file not found"
+            );
+            return Ok(());
+        }
+
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+
+        // Upload the file via the official media upload API to obtain a
+        // media_id; on failure, fall back to a short text notice so the
+        // caller is never left without a response.
+        let (media_id, _token) = match self.upload_file(path).await {
+            Ok(v) => v,
+            Err(error) => {
+                dingtalk_warn!(
+                    ::serde_json::json!({
+                        "file_path": file_path,
+                        "file_name": file_name,
+                        "error": error.to_string(),
+                    }),
+                    "DingTalk: file upload failed, falling back to text"
+                );
+                let text = format!("文件: {file_name}");
+                let msg_param = serde_json::to_string(&serde_json::json!({
+                    "content": text,
+                }))?;
+                let body = serde_json::json!({
+                    "robotCode": self.robot_code(),
+                    "userIds": [recipient],
+                    "msgKey": "sampleText",
+                    "msgParam": msg_param,
+                });
+                return self
+                    .send_proactive_request(DINGTALK_USER_BATCH_SEND_URL, "text", recipient, &body)
+                    .await;
+            }
+        };
+
+        // Deliver the file as a sampleFile proactive message.
+        let msg_param = serde_json::to_string(&serde_json::json!({
+            "mediaId": media_id,
+            "fileName": file_name,
+        }))?;
+        let body = serde_json::json!({
+            "robotCode": self.robot_code(),
+            "userIds": [recipient],
+            "msgKey": "sampleFile",
+            "msgParam": msg_param,
+        });
+
+        self.send_proactive_request(DINGTALK_USER_BATCH_SEND_URL, "file", recipient, &body)
+            .await
+    }
+
+    async fn send_file_via_group_api(&self, group_id: &str, file_path: &str) -> anyhow::Result<()> {
+        let path = Path::new(file_path);
+        if !path.exists() {
+            dingtalk_warn!(
+                ::serde_json::json!({
+                    "file_path": file_path,
+                }),
+                "DingTalk: file not found"
+            );
+            return Ok(());
+        }
+
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+
+        // Upload the file via the official media upload API to obtain a
+        // media_id; on failure, fall back to a short text notice.
+        let (media_id, _token) = match self.upload_file(path).await {
+            Ok(v) => v,
+            Err(error) => {
+                dingtalk_warn!(
+                    ::serde_json::json!({
+                        "file_path": file_path,
+                        "file_name": file_name,
+                        "error": error.to_string(),
+                    }),
+                    "DingTalk: file upload failed, falling back to text"
+                );
+                let text = format!("文件: {file_name}");
+                let msg_param = serde_json::to_string(&serde_json::json!({
+                    "content": text,
+                }))?;
+                let body = serde_json::json!({
+                    "robotCode": self.robot_code(),
+                    "openConversationId": group_id,
+                    "conversationId": group_id,
+                    "msgKey": "sampleText",
+                    "msgParam": msg_param,
+                });
+                return self
+                    .send_proactive_request(DINGTALK_GROUP_SEND_URL, "group_text", group_id, &body)
+                    .await;
+            }
+        };
+
+        // Deliver the file as a sampleFile proactive message to the group.
+        let msg_param = serde_json::to_string(&serde_json::json!({
+            "mediaId": media_id,
+            "fileName": file_name,
+        }))?;
+        let body = serde_json::json!({
+            "robotCode": self.robot_code(),
+            "openConversationId": group_id,
+            "conversationId": group_id,
+            "msgKey": "sampleFile",
+            "msgParam": msg_param,
+        });
+
+        self.send_proactive_request(DINGTALK_GROUP_SEND_URL, "group_file", group_id, &body)
+            .await
+    }
+
+    async fn send_file_via_reply_target(
+        &self,
+        reply_target: Option<&DingTalkReplyTarget>,
+        recipient: &str,
+        file_path: &str,
+    ) -> anyhow::Result<()> {
+        match reply_target {
+            Some(DingTalkReplyTarget::User(user_id)) => {
+                self.send_file_via_api(user_id, file_path).await
+            }
+            Some(DingTalkReplyTarget::Group(group_id)) => {
+                self.send_file_via_group_api(group_id, file_path).await
+            }
+            None => self.send_file_via_api(recipient, file_path).await,
+        }
+    }
+
     /// Send image via DingTalk webhook using markdown with image URL.
     async fn send_image_via_webhook(
         &self,
@@ -2238,7 +3245,7 @@ impl DingTalkChannel {
         image_path: &str,
     ) -> anyhow::Result<()> {
         let Some(path) = Self::existing_local_image_path(image_path) else {
-            return Ok(());
+            anyhow::bail!("Image file not found: {}", image_path);
         };
 
         // Upload image to DingTalk
@@ -2247,6 +3254,32 @@ impl DingTalkChannel {
         // Send image via webhook
         self.send_image_via_webhook(webhook_url, &media_id, &photo_url)
             .await
+    }
+
+    /// Send a single file attachment: upload and send via webhook.
+    async fn send_file_attachment(&self, webhook_url: &str, file_path: &str) -> anyhow::Result<()> {
+        let Some(path) = Self::existing_local_file_path(file_path) else {
+            anyhow::bail!("File not found: {}", file_path);
+        };
+
+        // Upload file to DingTalk
+        let (media_id, _token) = self.upload_file(path).await?;
+
+        // Send file via webhook (as markdown with download link)
+        self.send_file_via_webhook(webhook_url, &media_id).await
+    }
+
+    /// Send a file via webhook using DingTalk's file message type.
+    async fn send_file_via_webhook(&self, webhook_url: &str, media_id: &str) -> anyhow::Result<()> {
+        // Send as file message type - DingTalk webhook supports this format
+        let body = serde_json::json!({
+            "msgtype": "file",
+            "file": {
+                "media_id": media_id
+            }
+        });
+
+        self.send_webhook_request(webhook_url, &body, "file").await
     }
 
     /// Send text via DingTalk's proactive robot API.
@@ -2463,13 +3496,49 @@ impl DingTalkIncomingImageRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct DingTalkIncomingFileRef {
+    download_code: String,
+    file_name: String,
+}
+
+impl DingTalkIncomingFileRef {
+    const DEFAULT_FILE_NAME: &str = "file";
+
+    fn from_download_fields(download_code: Option<&str>, file_name: Option<&str>) -> Option<Self> {
+        let download_code = download_code?.trim();
+        if download_code.is_empty() {
+            return None;
+        }
+
+        let file_name = file_name
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(Self::DEFAULT_FILE_NAME);
+
+        Some(Self {
+            download_code: download_code.to_string(),
+            file_name: file_name.to_string(),
+        })
+    }
+
+    fn from_content_map(map: &serde_json::Map<String, serde_json::Value>) -> Option<Self> {
+        Self::from_download_fields(
+            map.get("downloadCode").and_then(|value| value.as_str()),
+            map.get("fileName").and_then(|value| value.as_str()),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum DingTalkIncomingPart {
     Text(String),
     Image(DingTalkIncomingImageRef),
+    File(DingTalkIncomingFileRef),
 }
 
 impl DingTalkChannel {
     const IMAGE_DOWNLOAD_FAILURE_MARKER: &str = "[IMAGE:download failed]";
+    const FILE_DOWNLOAD_FAILURE_MARKER: &str = "[DOCUMENT:download failed]";
 
     fn normalize_embedded_json(value: &serde_json::Value) -> serde_json::Value {
         if let Some(raw) = value.as_str()
@@ -2501,6 +3570,10 @@ impl DingTalkChannel {
 
                 if let Some(image_ref) = DingTalkIncomingImageRef::from_content_map(map) {
                     out.push(DingTalkIncomingPart::Image(image_ref));
+                }
+
+                if let Some(file_ref) = DingTalkIncomingFileRef::from_content_map(map) {
+                    out.push(DingTalkIncomingPart::File(file_ref));
                 }
 
                 if let Some(rich_text) = map.get("richText") {
@@ -2553,6 +3626,10 @@ impl DingTalkChannel {
         Self::IMAGE_DOWNLOAD_FAILURE_MARKER.to_string()
     }
 
+    fn file_download_failure_marker() -> String {
+        Self::FILE_DOWNLOAD_FAILURE_MARKER.to_string()
+    }
+
     async fn download_incoming_image_marker(
         &self,
         image_ref: &DingTalkIncomingImageRef,
@@ -2576,6 +3653,29 @@ impl DingTalkChannel {
         }
     }
 
+    async fn download_incoming_file_marker(
+        &self,
+        file_ref: &DingTalkIncomingFileRef,
+        source: &'static str,
+    ) -> Option<String> {
+        match self
+            .download_file_by_code(&file_ref.download_code, &file_ref.file_name)
+            .await
+        {
+            Some(marker) => Some(marker),
+            None => {
+                dingtalk_warn!(
+                    ::serde_json::json!({
+                        "download_code": file_ref.download_code,
+                        "source": source,
+                    }),
+                    "DingTalk: failed to download incoming file"
+                );
+                None
+            }
+        }
+    }
+
     /// Handle incoming picture message: download and return [IMAGE:path] marker.
     async fn handle_picture_message(&self, data: &serde_json::Value) -> Option<String> {
         let Some(image_ref) = Self::extract_picture_reference(data) else {
@@ -2590,6 +3690,28 @@ impl DingTalkChannel {
         )
     }
 
+    /// Extract file reference from message data.
+    fn extract_file_reference(data: &serde_json::Value) -> Option<DingTalkIncomingFileRef> {
+        let content = Self::normalized_content(data)?;
+        content
+            .as_object()
+            .and_then(DingTalkIncomingFileRef::from_content_map)
+    }
+
+    /// Handle incoming file message: download and return [DOCUMENT:path] marker.
+    async fn handle_file_message(&self, data: &serde_json::Value) -> Option<String> {
+        let Some(file_ref) = Self::extract_file_reference(data) else {
+            dingtalk_warn!("DingTalk: file message missing downloadCode");
+            return Some(Self::file_download_failure_marker());
+        };
+
+        Some(
+            self.download_incoming_file_marker(&file_ref, "file")
+                .await
+                .unwrap_or_else(Self::file_download_failure_marker),
+        )
+    }
+
     async fn extract_incoming_message_content(
         &self,
         msg_type: &str,
@@ -2599,6 +3721,7 @@ impl DingTalkChannel {
             value if value.eq_ignore_ascii_case("picture") => {
                 self.handle_picture_message(data).await
             }
+            value if value.eq_ignore_ascii_case("file") => self.handle_file_message(data).await,
             value if value.eq_ignore_ascii_case("richText") => {
                 let parts = Self::extract_rich_text_parts(data);
                 self.render_incoming_parts(parts).await
@@ -2648,6 +3771,15 @@ impl DingTalkChannel {
                         .await
                         .unwrap_or_else(|| {
                             format!("[IMAGE:{} | download failed]", image_ref.download_code)
+                        });
+                    rendered_parts.push(marker);
+                }
+                DingTalkIncomingPart::File(file_ref) => {
+                    let marker = self
+                        .download_incoming_file_marker(&file_ref, "rich_text")
+                        .await
+                        .unwrap_or_else(|| {
+                            format!("[DOCUMENT:{} | download failed]", file_ref.download_code)
                         });
                     rendered_parts.push(marker);
                 }
@@ -2864,7 +3996,6 @@ client_secret = "secret"
                     {
                         "type": "picture",
                         "pictureDownloadCode": "pic-001",
-                        "downloadCode": "img-001",
                         "fileName": "photo.jpg"
                     },
                     { "text": "last line" }
@@ -2878,7 +4009,7 @@ client_secret = "secret"
             vec![
                 DingTalkIncomingPart::Text("first line".to_string()),
                 DingTalkIncomingPart::Image(DingTalkIncomingImageRef {
-                    download_code: "img-001".to_string(),
+                    download_code: "pic-001".to_string(),
                     file_name: "photo.jpg".to_string(),
                 }),
                 DingTalkIncomingPart::Text("last line".to_string()),
@@ -2997,6 +4128,7 @@ client_secret = "secret"
                     card_instance_id: "test_card_1".to_string(),
                     created_at: Instant::now(),
                     recipient: "user1".to_string(),
+                    webhook_url: None,
                 },
             );
         }

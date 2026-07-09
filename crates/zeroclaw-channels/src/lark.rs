@@ -1913,17 +1913,23 @@ impl LarkChannel {
             return None;
         }
 
-        // If the content is image-like, return as image marker
-        if content_type.starts_with("image/")
+        // Save file to workspace directory first
+        let file_path: Option<std::path::PathBuf> = if content_type.starts_with("image/")
             && bytes.len() <= LARK_IMAGE_MAX_BYTES
             && let Some(mime) = lark_detect_image_mime(Some(&content_type), &bytes)
             && LARK_SUPPORTED_IMAGE_MIMES.contains(&mime.as_str())
         {
-            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            return Some(format!("[IMAGE:data:{mime};base64,{encoded}]"));
-        }
+            self.persist_downloaded_image(&bytes, &mime)
+                .await
+                .map(|path_str| {
+                    let path = path_str.trim_start_matches("[IMAGE:").trim_end_matches(']');
+                    std::path::PathBuf::from(path)
+                })
+        } else {
+            self.persist_downloaded_file(&bytes, file_name).await
+        };
 
-        // If the file looks like text, inline it
+        // If the file looks like text, inline it with content preview
         if bytes.len() <= LARK_FILE_MAX_BYTES
             && !bytes.contains(&0)
             && (content_type.starts_with("text/")
@@ -1937,13 +1943,51 @@ impl LarkChannel {
             let text = String::from_utf8_lossy(&bytes);
             let truncated = lark_inline_text_file_preview(text);
             let ext = file_name.rsplit('.').next().unwrap_or("text");
-            return Some(format!("[FILE:{file_name}]\n```{ext}\n{truncated}\n```"));
+
+            if let Some(path) = &file_path {
+                return Some(format!(
+                    "[FILE:{}]\n```{ext}\n{truncated}\n```",
+                    path.display()
+                ));
+            } else {
+                return Some(format!("[FILE:{file_name}]\n```{ext}\n{truncated}\n```"));
+            }
         }
 
-        Some(format!(
-            "[ATTACHMENT:{file_name} | mime={content_type} | size={} bytes]",
-            bytes.len()
-        ))
+        // Return document/image marker with file path if saved, otherwise with metadata
+        if let Some(path) = &file_path {
+            let path_str = path.display().to_string();
+            if path_str.contains("lark_files/image_") {
+                Some(format!("[IMAGE:{}]", path_str))
+            } else {
+                Some(format!("[DOCUMENT:{}]", path_str))
+            }
+        } else {
+            // Fallback: file was not saved to disk
+            if content_type.starts_with("image/") {
+                if bytes.len() <= LARK_IMAGE_MAX_BYTES {
+                    if let Some(mime) = lark_detect_image_mime(Some(&content_type), &bytes) {
+                        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        Some(format!("[IMAGE:data:{mime};base64,{encoded}]"))
+                    } else {
+                        Some(format!(
+                            "[ATTACHMENT:{file_name} | mime={content_type} | size={} bytes]",
+                            bytes.len()
+                        ))
+                    }
+                } else {
+                    Some(format!(
+                        "[ATTACHMENT:{file_name} | size={} bytes | too large]",
+                        bytes.len()
+                    ))
+                }
+            } else {
+                Some(format!(
+                    "[ATTACHMENT:{file_name} | mime={content_type} | size={} bytes]",
+                    bytes.len()
+                ))
+            }
+        }
     }
 
     async fn fetch_bot_open_id_with_token(
@@ -2658,6 +2702,20 @@ impl Channel for LarkChannel {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         // Parse [IMAGE:...] markers from content
         let (text_content, image_paths) = Self::parse_image_markers(&message.content);
+        // Parse [DOCUMENT:...] markers from content
+        let (_doc_cleaned_text, doc_paths) = Self::parse_document_markers(&message.content);
+        // Parse [FILE:...] markers from content
+        let (_file_cleaned_text, file_paths) = Self::parse_file_markers(&message.content);
+
+        // Combine document and file paths
+        let all_file_paths: Vec<String> = doc_paths.into_iter().chain(file_paths).collect();
+
+        // Use the most cleaned text (remove all markers)
+        // Start with image-cleaned text, then remove document markers, then file markers
+        let fully_cleaned_text = {
+            let after_doc = Self::parse_document_markers(&text_content).0;
+            Self::parse_file_markers(&after_doc).0
+        };
 
         // Send images first
         for image_path in &image_paths {
@@ -2675,9 +2733,25 @@ impl Channel for LarkChannel {
             }
         }
 
-        // Send text content (if any remains after extracting images)
-        if !text_content.trim().is_empty() {
-            self.send_text_message(&message.recipient, &text_content)
+        // Send files (PDF/Word/Excel/etc)
+        for file_path in &all_file_paths {
+            if let Err(e) = self.send_file_message(&message.recipient, file_path).await {
+                lark_warn!(
+                    ::serde_json::json!({
+                        "file_path": file_path,
+                        "error": e.to_string(),
+                    }),
+                    "Lark: failed to send file, falling back to text"
+                );
+                // Fallback to text message with file path
+                let fallback = format!("[Document: {}]", file_path);
+                let _ = self.send_text_message(&message.recipient, &fallback).await;
+            }
+        }
+
+        // Send text content (if any remains after extracting images and files)
+        if !fully_cleaned_text.trim().is_empty() {
+            self.send_text_message(&message.recipient, &fully_cleaned_text)
                 .await?;
         }
 
@@ -2993,8 +3067,26 @@ impl Channel for LarkChannel {
 
     /// Open a streaming draft card using Cardkit path.
     /// Returns `Ok(None)` when streaming is disabled or cardkit_create fails.
+    /// Automatically downgrades to send() if media markers are detected.
     async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
         if matches!(self.stream_mode, StreamMode::Off) {
+            return Ok(None);
+        }
+
+        // Check for media markers and downgrade to non-streaming if found
+        if message.content.contains("[IMAGE:")
+            || message.content.contains("[DOCUMENT:")
+            || message.content.contains("[FILE:")
+        {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "reason": "media_markers_detected_in_content",
+                    })),
+                "Lark: send_draft downgrading to send() due to media markers"
+            );
+            self.send(message).await?;
             return Ok(None);
         }
 
@@ -3122,6 +3214,26 @@ impl Channel for LarkChannel {
 
         let interval_ms = self.draft_update_interval_ms.max(50); // 50ms floor for 50 RPS limit
 
+        // Check for media markers and filter them out for streaming
+        let text_to_use =
+            if text.contains("[IMAGE:") || text.contains("[DOCUMENT:") || text.contains("[FILE:") {
+                let filtered = Self::filter_media_markers(text);
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "reason": "media_markers_filtered_for_streaming",
+                            "message_id": message_id,
+                            "original_len": text.len(),
+                            "filtered_len": filtered.len(),
+                        })),
+                    "Lark: update_draft filtering media markers for clean streaming"
+                );
+                filtered
+            } else {
+                text.to_string()
+            };
+
         let mut streams = self.cardkit_streams.lock().await;
         let state = match streams.get_mut(message_id) {
             Some(s) => s,
@@ -3142,12 +3254,11 @@ impl Channel for LarkChannel {
         if !should_push {
             // Still in throttle window - cache the latest text for next PUSH
             // Don't advance last_pushed_at here (that would cause window drift)
-            state.last_sent_content = text.to_string();
             return Ok(());
         }
 
         // Short-circuit: same content as last push
-        if text == state.last_sent_content {
+        if text_to_use == state.last_sent_content {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -3164,7 +3275,6 @@ impl Channel for LarkChannel {
         let element_id = state.element_id.clone();
         let sequence = state.sequence;
         let uuid = state.current_uuid.clone();
-        let content = text.to_string();
 
         // Reserve the next sequence/uuid immediately before releasing the lock.
         // This prevents overlapping update_draft calls from reusing either.
@@ -3175,7 +3285,7 @@ impl Channel for LarkChannel {
         // This is critical: we want the next call to be allowed after
         // `interval_ms` from NOW, not after the API response returns.
         state.last_pushed_at = Some(Instant::now());
-        state.last_sent_content = content.clone();
+        state.last_sent_content = text_to_use.clone();
         let in_flight_permit = self.begin_cardkit_in_flight(message_id);
 
         // Release lock before spawning async call
@@ -3189,10 +3299,10 @@ impl Channel for LarkChannel {
         zeroclaw_spawn::spawn!(async move {
             let _in_flight_permit = in_flight_permit;
             let push_start = Instant::now();
-            let content_len = content.len();
+            let content_len = text_to_use.len();
 
             match self_arc
-                .cardkit_push_content(&card_id, &element_id, &content, sequence, &uuid)
+                .cardkit_push_content(&card_id, &element_id, &text_to_use, sequence, &uuid)
                 .await
             {
                 Ok(()) => {
@@ -3270,6 +3380,117 @@ impl Channel for LarkChannel {
                     .with_attrs(::serde_json::json!({"message_id": message_id})),
                 "Lark: finalize_draft skipped - empty message_id"
             );
+            return Ok(());
+        }
+
+        // Check for media markers in text
+        if text.contains("[IMAGE:") || text.contains("[DOCUMENT:") || text.contains("[FILE:") {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "reason": "media_markers_detected",
+                        "message_id": message_id,
+                    })),
+                "Lark: finalize_draft detected media markers, sending filtered text and media files"
+            );
+
+            // Wait for in-flight async pushes with timeout to avoid blocking indefinitely
+            use tokio::time::{Duration, timeout};
+            if timeout(
+                Duration::from_secs(5),
+                self.wait_cardkit_in_flight_drained(message_id),
+            )
+            .await
+            .is_err()
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "message_id": message_id,
+                            "timeout_secs": 5,
+                        })),
+                    "Lark: finalize_draft waiting for in-flight pushes timed out, proceeding anyway"
+                );
+            }
+            self.prune_cardkit_in_flight(message_id);
+
+            // Close streaming mode
+            let _ = self.cardkit_close_streaming(message_id).await;
+
+            // Parse and send media files separately
+            let (_text_part, image_paths) = LarkChannel::parse_image_markers(text);
+            let (_doc_text, doc_paths) = LarkChannel::parse_document_markers(text);
+            let (_file_text, file_paths) = LarkChannel::parse_file_markers(text);
+
+            // Send image messages
+            for image_path in image_paths {
+                match self.send_image_attachment(_recipient, &image_path).await {
+                    Ok(()) => {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "message_id": message_id,
+                                "path": image_path,
+                            })),
+                            "Lark: finalize_draft sent image successfully"
+                        );
+                    }
+                    Err(err) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "message_id": message_id,
+                                "path": image_path,
+                                "error": format!("{err}"),
+                            })),
+                            "Lark: finalize_draft failed to send image"
+                        );
+                    }
+                }
+            }
+
+            // Send document messages
+            for doc_path in doc_paths {
+                if let Err(err) = self.send_document_message(_recipient, &doc_path).await {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "message_id": message_id,
+                                "path": doc_path,
+                                "error": format!("{err}"),
+                            })),
+                        "Lark: finalize_draft failed to send document"
+                    );
+                }
+            }
+
+            // Send file messages
+            for file_path in file_paths {
+                if let Err(err) = self.send_file_message(_recipient, &file_path).await {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "message_id": message_id,
+                                "path": file_path,
+                                "error": format!("{err}"),
+                            })),
+                        "Lark: finalize_draft failed to send file"
+                    );
+                }
+            }
+
             return Ok(());
         }
 
@@ -3450,9 +3671,8 @@ impl Channel for LarkChannel {
     }
 }
 
+// Cardkit core methods - impl LarkChannel (not Channel trait)
 impl LarkChannel {
-    // Cardkit core methods
-
     /// POST /cardkit/v1/cards - Create a card entity with streaming_mode enabled.
     /// Returns the card_id for subsequent operations.
     async fn cardkit_create(&self, recipient: &str, placeholder: &str) -> anyhow::Result<String> {
@@ -3609,7 +3829,7 @@ impl LarkChannel {
                 anyhow::bail!("invalid card JSON: {}", code)
             }
             _ => {
-                // Other errors - soft fail with WARN
+                // Other errors - return error to caller
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -3620,9 +3840,13 @@ impl LarkChannel {
                             "status": status.as_u16(),
                             "error_key": "lark.cardkit.push_content_error",
                         })),
-                    "Lark: cardkit_push_content failed (soft)"
+                    "Lark: cardkit_push_content failed"
                 );
-                Ok(())
+                anyhow::bail!(
+                    "cardkit_push_content failed with code {}: {}",
+                    code,
+                    response
+                )
             }
         }
     }
@@ -3771,7 +3995,82 @@ impl LarkChannel {
     }
 }
 
+// Media marker parsing and filtering methods
 impl LarkChannel {
+    /// Filter out media markers from text for clean streaming display.
+    /// Returns text with [IMAGE:...], [DOCUMENT:...], [FILE:...] removed.
+    fn filter_media_markers(content: &str) -> String {
+        let mut result = content.to_string();
+
+        // Remove [IMAGE:...] markers
+        let re_image = regex::Regex::new(r"\[IMAGE:[^\]]+\]").unwrap();
+        result = re_image.replace_all(&result, "").to_string();
+
+        // Remove [DOCUMENT:...] markers
+        let re_doc = regex::Regex::new(r"\[DOCUMENT:[^\]]+\]").unwrap();
+        result = re_doc.replace_all(&result, "").to_string();
+
+        // Remove [FILE:...] markers
+        let re_file = regex::Regex::new(r"\[FILE:[^\]]+\]").unwrap();
+        result = re_file.replace_all(&result, "").to_string();
+
+        // Clean up extra newlines that may result from marker removal
+        let re_newlines = regex::Regex::new(r"\n{3,}").unwrap();
+        result = re_newlines.replace_all(&result, "\n\n").to_string();
+
+        result.trim().to_string()
+    }
+
+    /// Parse [DOCUMENT:...] markers from content and return (text, doc_paths).
+    fn parse_document_markers(content: &str) -> (String, Vec<String>) {
+        let mut text = String::new();
+        let mut doc_paths = Vec::new();
+        let mut last_end = 0;
+
+        let re = regex::Regex::new(r"\[DOCUMENT:([^\]]+)\]").unwrap();
+
+        for cap in re.captures_iter(content) {
+            let full_match = cap.get(0).unwrap();
+            let path = cap.get(1).unwrap().as_str();
+
+            text.push_str(&content[last_end..full_match.start()]);
+
+            if path.starts_with('/') {
+                doc_paths.push(path.to_string());
+            }
+
+            last_end = full_match.end();
+        }
+
+        text.push_str(&content[last_end..]);
+        (text, doc_paths)
+    }
+
+    /// Parse [FILE:...] markers from content and return (text, file_paths).
+    fn parse_file_markers(content: &str) -> (String, Vec<String>) {
+        let mut text = String::new();
+        let mut file_paths = Vec::new();
+        let mut last_end = 0;
+
+        let re = regex::Regex::new(r"\[FILE:([^\]]+)\]").unwrap();
+
+        for cap in re.captures_iter(content) {
+            let full_match = cap.get(0).unwrap();
+            let path = cap.get(1).unwrap().as_str();
+
+            text.push_str(&content[last_end..full_match.start()]);
+
+            if path.starts_with('/') {
+                file_paths.push(path.to_string());
+            }
+
+            last_end = full_match.end();
+        }
+
+        text.push_str(&content[last_end..]);
+        (text, file_paths)
+    }
+
     /// Parse [IMAGE:...] markers from content and return (text, image_paths).
     fn parse_image_markers(content: &str) -> (String, Vec<String>) {
         let mut text = String::new();
@@ -3797,7 +4096,7 @@ impl LarkChannel {
         (text, image_paths)
     }
 
-    fn existing_local_image_path(image_path: &str) -> Option<&Path> {
+    fn existing_local_image_path(image_path: &str) -> Option<&'static Path> {
         let path = Path::new(image_path);
         if !path.exists() {
             lark_warn!(
@@ -3809,7 +4108,27 @@ impl LarkChannel {
             return None;
         }
 
-        Some(path)
+        // Safety: We're leaking the Box to get a &'static Path.
+        // This is fine because the path is only used temporarily during the call.
+        Some(Box::leak(path.to_path_buf().into_boxed_path()))
+    }
+
+    fn existing_local_file_path(file_path: &str) -> Option<&'static Path> {
+        let path = Path::new(file_path);
+        if !path.exists() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "file_path": file_path,
+                    })),
+                "Lark: file not found"
+            );
+            return None;
+        }
+
+        // Safety: We're leaking the Box to get a &'static Path.
+        Some(Box::leak(path.to_path_buf().into_boxed_path()))
     }
 
     async fn persist_downloaded_image(&self, bytes: &[u8], mime: &str) -> Option<String> {
@@ -3838,6 +4157,69 @@ impl LarkChannel {
             "Lark: image saved"
         );
         Some(format!("[IMAGE:{}]", path.display()))
+    }
+
+    /// Persist a downloaded non-image file into the per-channel
+    /// `lark_files/` workspace directory.
+    async fn persist_downloaded_file(
+        &self,
+        bytes: &[u8],
+        file_name: &str,
+    ) -> Option<std::path::PathBuf> {
+        let workspace = self.workspace_dir.as_deref()?;
+        let dir = workspace.join("lark_files");
+
+        if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Save)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": dir.display().to_string(),
+                        "error": e.to_string(),
+                    })),
+                "Lark: failed to create lark_files directory for file"
+            );
+            return None;
+        }
+
+        let stem = std::path::Path::new(file_name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file");
+        let ext = std::path::Path::new(file_name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("dat");
+        let unique = &Uuid::new_v4().to_string()[..8];
+        let safe_filename = if ext.is_empty() {
+            format!("{stem}_{unique}")
+        } else {
+            format!("{stem}_{unique}.{ext}")
+        };
+        let path = dir.join(&safe_filename);
+
+        if let Err(e) = tokio::fs::write(&path, bytes).await {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Save)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": path.display().to_string(),
+                        "error": e.to_string(),
+                    })),
+                "Lark: failed to write file to disk"
+            );
+            return None;
+        }
+
+        lark_info!(
+            ::serde_json::json!({
+                "path": path.display().to_string(),
+            }),
+            "Lark: file saved"
+        );
+        Some(path)
     }
 
     /// Upload a local image to Feishu/Lark and return the image_key (with retry).
@@ -4012,6 +4394,236 @@ impl LarkChannel {
         Err(last_error.unwrap_or_else(|| anyhow::Error::msg("Lark: upload failed after retries")))
     }
 
+    /// Upload a local file to Feishu/Lark and return the file_key.
+    async fn upload_file(&self, file_path: &Path) -> anyhow::Result<String> {
+        const MAX_RETRIES: u32 = 2;
+        const RETRY_DELAY: Duration = Duration::from_millis(500);
+        const LARK_FILE_MAX_BYTES: usize = 50 * 1024 * 1024; // 50 MB for files
+
+        let file_path_str = file_path.display().to_string();
+        let file_name = file_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        // Check upload cache
+        {
+            let cache = self.upload_cache.read().await;
+            if let Some(entry) = cache.get(&file_path_str) {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                if now < entry.expires_at {
+                    return Ok(entry.image_key.clone());
+                }
+            }
+        }
+
+        let file_bytes = tokio::fs::read(file_path).await?;
+        if file_bytes.is_empty() {
+            anyhow::bail!("Lark: file is empty: {}", file_path.display());
+        }
+        if file_bytes.len() > LARK_FILE_MAX_BYTES {
+            anyhow::bail!(
+                "Lark: file too large: {} bytes exceeds {} bytes limit",
+                file_bytes.len(),
+                LARK_FILE_MAX_BYTES
+            );
+        }
+
+        // Detect MIME type from extension
+        let mime = match file_path.extension().and_then(|e| e.to_str()) {
+            Some("pdf") => "application/pdf",
+            Some("doc") => "application/msword",
+            Some("docx") => {
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            }
+            Some("xls") => "application/vnd.ms-excel",
+            Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            Some("ppt") => "application/vnd.ms-powerpoint",
+            Some("pptx") => {
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            }
+            Some("txt") => "text/plain",
+            Some("csv") => "text/csv",
+            Some("zip") => "application/zip",
+            _ => "application/octet-stream",
+        };
+
+        let mut last_error = None;
+        for attempt in 0..=MAX_RETRIES {
+            let token = match self.get_tenant_access_token().await {
+                Ok(t) => t,
+                Err(e) => {
+                    last_error = Some(e);
+                    if attempt < MAX_RETRIES {
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        continue;
+                    }
+                    return Err(last_error.unwrap());
+                }
+            };
+
+            let form = reqwest::multipart::Form::new()
+                .text("file_type", "stream")
+                .text("file_name", file_name.clone())
+                .part(
+                    "file",
+                    reqwest::multipart::Part::bytes(file_bytes.clone())
+                        .file_name(file_name.clone())
+                        .mime_str(mime)?,
+                );
+
+            let url = format!("{}/im/v1/files", self.api_base());
+            let resp = match self
+                .http_client()
+                .post(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .multipart(form)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    last_error = Some(anyhow::Error::msg(format!(
+                        "Lark: upload request failed: {e}"
+                    )));
+                    if attempt < MAX_RETRIES {
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        continue;
+                    }
+                    return Err(last_error.unwrap());
+                }
+            };
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let err = resp.text().await.unwrap_or_default();
+                last_error = Some(anyhow::Error::msg(format!(
+                    "Lark: upload file failed ({status}): {err}"
+                )));
+                if attempt < MAX_RETRIES {
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                }
+                return Err(last_error.unwrap());
+            }
+
+            #[derive(Debug, Deserialize)]
+            struct UploadResponse {
+                code: Option<i32>,
+                msg: Option<String>,
+                data: Option<UploadData>,
+            }
+
+            #[derive(Debug, Deserialize)]
+            struct UploadData {
+                file_key: Option<String>,
+            }
+
+            let upload_resp: UploadResponse = match resp.json().await {
+                Ok(r) => r,
+                Err(e) => {
+                    last_error = Some(anyhow::Error::msg(format!(
+                        "Lark: parse response failed: {e}"
+                    )));
+                    if attempt < MAX_RETRIES {
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        continue;
+                    }
+                    return Err(last_error.unwrap());
+                }
+            };
+
+            if upload_resp.code != Some(0) {
+                last_error = Some(anyhow::Error::msg(format!(
+                    "Lark: upload failed: code={:?}, msg={:?}",
+                    upload_resp.code, upload_resp.msg
+                )));
+                if attempt < MAX_RETRIES {
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                }
+                return Err(last_error.unwrap());
+            }
+
+            let file_key = upload_resp
+                .data
+                .and_then(|d| d.file_key)
+                .ok_or_else(|| anyhow::Error::msg("Lark: no file_key in upload response"))?;
+
+            // Cache the result
+            {
+                let mut cache = self.upload_cache.write().await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                cache.insert(
+                    file_path_str.clone(),
+                    UploadCacheEntry {
+                        image_key: file_key.clone(),
+                        expires_at: now + LARK_UPLOAD_CACHE_TTL,
+                    },
+                );
+            }
+
+            lark_info!(
+                ::serde_json::json!({
+                    "file_key": file_key.as_str(),
+                    "file_name": file_name,
+                }),
+                "Lark: file uploaded successfully"
+            );
+            return Ok(file_key);
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow::Error::msg("Lark: upload failed after retries")))
+    }
+
+    /// Send a file message to the specified recipient.
+    async fn send_file_message(&self, recipient: &str, file_path: &str) -> anyhow::Result<()> {
+        let path = Path::new(file_path);
+        if !path.exists() {
+            anyhow::bail!("File not found: {}", file_path);
+        }
+
+        // Extract filename before upload
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+
+        // Upload file
+        let file_key = self.upload_file(path).await?;
+
+        // Build file message content
+        let content = serde_json::json!({
+            "file_key": file_key,
+        });
+        let body = serde_json::json!({
+            "receive_id": recipient,
+            "msg_type": "file",
+            "content": content.to_string(),
+        });
+
+        let url = self.send_message_url();
+        self.send_api_message_with_retry(&url, &body, "file message")
+            .await?;
+
+        lark_info!(
+            ::serde_json::json!({
+                "recipient": recipient,
+                "file_name": file_name,
+            }),
+            "Lark: file message sent successfully"
+        );
+        Ok(())
+    }
+
     /// Send an image message to the specified recipient.
     async fn send_image_message(&self, recipient: &str, image_key: &str) -> anyhow::Result<()> {
         let url = self.send_message_url();
@@ -4037,10 +4649,46 @@ impl LarkChannel {
         Ok(())
     }
 
-    /// Send a single image attachment: upload and send.
+    /// Send a document message (file type).
+    async fn send_document_message(&self, recipient: &str, file_path: &str) -> anyhow::Result<()> {
+        let Some(path) = Self::existing_local_file_path(file_path) else {
+            anyhow::bail!("Document file not found: {}", file_path);
+        };
+
+        // Upload the file
+        let file_key = self.upload_file(path).await?;
+
+        // Send as document message
+        let url = self.send_message_url();
+        let content = serde_json::json!({
+            "file_key": file_key,
+        });
+        let body = serde_json::json!({
+            "receive_id": recipient,
+            "msg_type": "file",
+            "content": content.to_string(),
+        });
+
+        self.send_api_message_with_retry(&url, &body, "document message")
+            .await?;
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "recipient": recipient,
+                    "file_path": file_path,
+                })
+            ),
+            "Lark: document message sent successfully"
+        );
+        Ok(())
+    }
+
+    /// Send an image attachment message (convenience wrapper around send_image_message).
     async fn send_image_attachment(&self, recipient: &str, image_path: &str) -> anyhow::Result<()> {
         let Some(path) = Self::existing_local_image_path(image_path) else {
-            return Ok(());
+            anyhow::bail!("Image file not found: {}", image_path);
         };
 
         let image_key = self.upload_image(path).await?;
@@ -4215,6 +4863,7 @@ impl LarkChannel {
     }
 }
 
+// Approval handling methods
 impl LarkChannel {
     /// Wait for the user's approval click; on timeout, evict the pending entry
     /// and synthesize a `Deny` response. Never panics.
@@ -4533,6 +5182,7 @@ impl LarkChannel {
     }
 }
 
+// HTTP/WS listener methods
 impl LarkChannel {
     /// HTTP callback server (legacy — requires a public endpoint).
     /// Use `listen()` (WS long-connection) for new deployments.
