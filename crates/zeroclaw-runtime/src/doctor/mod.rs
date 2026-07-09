@@ -1357,10 +1357,24 @@ mod tests {
     fn environment_check_finds_git() {
         let mut items = Vec::new();
         check_environment(&mut items);
-        let git_item = items.iter().find(|i| i.message.starts_with("git:"));
-        // git should be available in any CI/dev environment
-        assert!(git_item.is_some());
-        assert_eq!(git_item.unwrap().severity, Severity::Ok);
+        // The git probe always emits exactly one item: `Ok` ("git: <version>")
+        // when git is in PATH, or a `Warn` when it is absent/broken. RPM
+        // buildroots (mock chroots) intentionally strip git during `%check`,
+        // so this must not assume git is present — only that the probe ran
+        // and classified it correctly.
+        let git_item = items
+            .iter()
+            .find(|i| i.message.starts_with("git"))
+            .expect("git probe should always emit an item");
+        match git_item.severity {
+            Severity::Ok => assert!(
+                git_item.message.starts_with("git:"),
+                "unexpected ok git message: {}",
+                git_item.message
+            ),
+            Severity::Warn => {}
+            other => panic!("unexpected git severity {other:?}: {}", git_item.message),
+        }
     }
 
     #[test]

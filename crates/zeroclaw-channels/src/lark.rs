@@ -5929,7 +5929,6 @@ mod tests {
 
     #[tokio::test]
     async fn update_draft_rate_limits_within_interval() {
-        use std::time::Duration as StdDuration;
         use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -5975,7 +5974,13 @@ mod tests {
         ch.update_draft("oc_chat1", "om_draft_rl", "second")
             .await
             .expect("second update_draft ok");
-        tokio::time::sleep(StdDuration::from_millis(50)).await;
+
+        // The PUT is fired from a detached background task (zeroclaw_spawn::spawn!
+        // == tokio::spawn). Don't race it with a fixed sleep — wait deterministically
+        // for the in-flight permit to drop, which happens only after the PUT lands.
+        // The token POST mock above has no `.expect(...)`, so a missed PUT (e.g. a
+        // real bug) would surface here as a hang rather than a flaky 0/1.
+        ch.wait_cardkit_in_flight_drained("om_draft_rl").await;
 
         drop(put_mock);
     }
