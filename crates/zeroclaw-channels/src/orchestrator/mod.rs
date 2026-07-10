@@ -20086,17 +20086,17 @@ This is an example JSON object for profile settings."#;
             },
             FriendlyErrorCase {
                 error: "500 Internal Server Error",
-                expected_any: &["temporarily unavailable", "暂时不可用"],
+                expected_any: &["server is temporarily down", "服务器暂时故障"],
                 forbidden_any: &["500", "Internal Server Error"],
             },
             FriendlyErrorCase {
                 error: "503 Service Unavailable",
-                expected_any: &["temporarily unavailable", "暂时不可用"],
+                expected_any: &["server is temporarily down", "服务器暂时故障"],
                 forbidden_any: &["503", "Service Unavailable"],
             },
             FriendlyErrorCase {
                 error: "504 Gateway Timeout",
-                expected_any: &["temporarily unavailable", "暂时不可用"],
+                expected_any: &["server is temporarily down", "服务器暂时故障"],
                 forbidden_any: &["504", "Gateway Timeout"],
             },
             FriendlyErrorCase {
