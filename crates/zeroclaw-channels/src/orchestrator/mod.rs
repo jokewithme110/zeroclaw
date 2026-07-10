@@ -1191,25 +1191,27 @@ fn supports_runtime_model_switch(channel_name: &str) -> bool {
     )
 }
 
-fn is_explicitly_addressed_channel_message(channel_name: &str, content: &str) -> bool {
-    channel_name == "qq"
-        || channel_name == "webchat"
-        || channel_name == "ict"
-        || channel_name == "dingtalk"
-        || channel_name == "lark"
-        || channel_name == "feishu"
-        || channel_name == "wechat"
-        || channel_name == "discord"
-        || channel_name == "telegram"
-        || channel_name == "slack"
-        || channel_name == "matrix"
-        || channel_name == "whatsapp"
-        || channel_name == "signal"
-        || channel_name == "mattermost"
-        || channel_name == "nextcloud_talk"
-        || channel_name == "wati"
-        || (channel_name == "wecom_ws"
-            && content.contains("[WeCom group message addressed to this bot via @"))
+fn is_explicitly_addressed_channel_message(channel_name: &str) -> bool {
+    matches!(
+        channel_name,
+        "wecom_ws"
+            | "qq"
+            | "webchat"
+            | "ict"
+            | "dingtalk"
+            | "lark"
+            | "feishu"
+            | "wechat"
+            | "discord"
+            | "telegram"
+            | "slack"
+            | "matrix"
+            | "whatsapp"
+            | "signal"
+            | "mattermost"
+            | "nextcloud_talk"
+            | "wati"
+    )
 }
 
 fn is_matrix_channel_name(channel_name: &str) -> bool {
@@ -4394,8 +4396,7 @@ async fn process_channel_message_body(
     }
 
     // ── Reply-intent precheck ────────────────────────────────────────
-    let explicit_channel_address =
-        is_explicitly_addressed_channel_message(&msg.channel, &msg.content);
+    let explicit_channel_address = is_explicitly_addressed_channel_message(&msg.channel);
     let classifier_intent = if explicit_channel_address {
         AssistantChannelOutcome::Reply(String::new())
     } else {
@@ -17313,21 +17314,10 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn explicit_wecom_group_address_bypasses_reply_intent_precheck() {
-        // WeCom: only messages with WeCom group marker are explicitly addressed
-        assert!(is_explicitly_addressed_channel_message(
-            "wecom_ws",
-            "[WeCom group message addressed to this bot via @danya]\n@danya say hi"
-        ));
-        assert!(!is_explicitly_addressed_channel_message(
-            "wecom_ws",
-            "@danya say hi"
-        ));
+    fn wecom_ws_bypasses_reply_intent_precheck_without_group_marker() {
+        assert!(is_explicitly_addressed_channel_message("wecom_ws"));
         // Telegram: all messages are considered explicitly addressed (bot only receives mentions)
-        assert!(is_explicitly_addressed_channel_message(
-            "telegram",
-            "any message content"
-        ));
+        assert!(is_explicitly_addressed_channel_message("telegram"));
     }
 
     #[test]
