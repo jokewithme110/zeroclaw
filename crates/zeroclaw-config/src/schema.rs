@@ -14310,6 +14310,17 @@ fn default_ict_expiration_time_secs() -> u64 {
     600
 }
 
+fn default_ict_stream_mode() -> StreamMode {
+    // Default `Off` to preserve the historical "whole reply in one frame"
+    // behavior. Operators opt into progressive streaming by setting
+    // `stream_mode = "partial"`; the channel then drives the runtime
+    // draft hook (`send_draft` / `update_draft` / `finalize_draft`) and
+    // emits an incremental `type=1` frame per delta plus a terminal
+    // `[DONE]` marker on the existing WebSocket connection. Wire
+    // protocol is unchanged either way.
+    StreamMode::Off
+}
+
 /// ICT WebSocket channel configuration.
 ///
 /// WSS connection credentials (`wss_url` / `username` / `password`) are **not**
@@ -14357,6 +14368,16 @@ pub struct IctConfig {
     /// next reconnect.
     #[serde(default = "default_ict_expiration_time_secs")]
     pub expiration_time_secs: u64,
+    /// Streaming mode for AI response delivery over the WebSocket:
+    /// `off` (default) sends the complete response as a single business
+    /// frame; `partial` opens a draft turn and emits incremental
+    /// `type=1` frames plus a terminal `[DONE]` marker via the runtime
+    /// draft hook, matching the historical `ictmsg` wire shape.
+    /// `multi_message` is not supported (ICT has no surface for
+    /// independent messages — falls back to `off`).
+    #[tab(Behavior)]
+    #[serde(default = "default_ict_stream_mode")]
+    pub stream_mode: StreamMode,
 }
 
 impl ChannelConfig for IctConfig {

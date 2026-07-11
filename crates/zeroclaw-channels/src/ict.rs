@@ -15,6 +15,7 @@ use tokio_tungstenite::tungstenite::http::header::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use zeroclaw_api::attribution::{Attributable, ChannelKind, Role};
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_config::schema::StreamMode;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -154,6 +155,11 @@ pub struct IctConfigSnapshot {
     pub app_secret: String,
     pub heartbeat_interval_secs: u64,
     pub expiration_time_secs: u64,
+    /// Streaming mode for the draft hook (`send_draft` /
+    /// `update_draft` / `finalize_draft`). Resolved on demand from the
+    /// global `Config`; never duplicated into any other runtime struct
+    /// (AGENTS.md single source of truth).
+    pub stream_mode: StreamMode,
 }
 
 /// Materialized view of a successful registration. This is the **runtime**
@@ -236,6 +242,21 @@ enum InboundKind {
     Other,
 }
 
+/// Per-draft turn state used by the progressive-streaming draft hook.
+///
+/// Created on `send_draft`, mutated by `update_draft`, drained on
+/// `finalize_draft` / `cancel_draft`. The correlation `request_id` is
+/// **not** duplicated from `IctChannel::session_routes` — we look it up
+/// fresh at frame-enqueue time. This struct only owns the
+/// `draft_id`-scoped bookkeeping (incremental `sent_length`, draft
+/// lifetime for cleanup) that has no other source of truth.
+#[derive(Debug)]
+struct IctDraftState {
+    session_id: String,
+    sent_length: usize,
+    last_activity: Instant,
+}
+
 pub struct IctChannel {
     alias: String,
     /// Resolves the registration-side config snapshot from the global
@@ -254,6 +275,13 @@ pub struct IctChannel {
     ws_tx: Arc<Mutex<Option<mpsc::Sender<IctOutbound>>>>,
     session_routes: Arc<Mutex<HashMap<String, String>>>,
     last_frame_at: Arc<Mutex<Option<Instant>>>,
+    /// In-flight draft turns opened by `send_draft` and not yet closed by
+    /// `finalize_draft` / `cancel_draft`. Keyed by the locally-minted
+    /// `draft_id` (an opaque client-side handle, not a platform id). Bounded
+    /// implicitly by the upstream `cleanup` task below; no per-session
+    /// duplicate of `request_id` — that resolves from `session_routes` on
+    /// every frame.
+    drafts: Arc<Mutex<HashMap<String, IctDraftState>>>,
     /// Shared HTTP client used for the registration `POST`. Kept on the
     /// channel so we can reuse its connection pool across the lifetime of
     /// the channel (re-registrations are infrequent).
@@ -282,6 +310,7 @@ impl IctChannel {
             ws_tx: Arc::new(Mutex::new(None)),
             session_routes: Arc::new(Mutex::new(HashMap::new())),
             last_frame_at: Arc::new(Mutex::new(None)),
+            drafts: Arc::new(Mutex::new(HashMap::new())),
             http_client,
         }
     }
@@ -818,6 +847,78 @@ impl IctChannel {
         let secs = heartbeat_interval_secs.clamp(1, ICT_RECONNECT_BUDGET_CAP_SECS);
         Duration::from_secs(secs)
     }
+
+    /// Compute and enqueue the UTF-8-safe incremental chunk for `text`
+    /// since the last `update_draft` call on this `message_id`. Returns
+    /// the resolved `session_id` for the envelope.
+    ///
+    /// Returns Ok even when there is no draft registered (idempotent
+    /// no-op) so the orchestrator's draft updater does not have to
+    /// special-case the race where finalize arrives before any
+    /// update_draft.
+    async fn enqueue_incremental_chunk(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> Result<String> {
+        let (session_id, new_text, request_id) = {
+            let mut drafts = self.drafts.lock().await;
+            let Some(state) = drafts.get_mut(message_id) else {
+                // Idempotent no-op: finalize-only turn or already-cancelled.
+                return Ok(recipient.to_string());
+            };
+            state.last_activity = Instant::now();
+
+            let sent_len = state.sent_length.min(text.len());
+            let new_text = if sent_len < text.len() {
+                let mut end = sent_len;
+                while end < text.len() && !text.is_char_boundary(end) {
+                    end += 1;
+                }
+                text[end..].to_string()
+            } else {
+                String::new()
+            };
+            // Always advance sent_length so the next call sees the full
+            // accumulated text and we do not re-send the tail.
+            state.sent_length = text.len();
+
+            let session_id = state.session_id.clone();
+            // Resolve the request_id from session_routes (canonical
+            // source). If a route has been retired (e.g. by cleanup)
+            // since send_draft, fall back to an empty string and let the
+            // frame-enqueue path handle that as a no-op.
+            let request_id = self
+                .session_routes
+                .lock()
+                .await
+                .get(&session_id)
+                .cloned()
+                .unwrap_or_default();
+            (session_id, new_text, request_id)
+        };
+
+        if new_text.is_empty() || request_id.is_empty() {
+            return Ok(session_id);
+        }
+
+        let ws_tx = self
+            .ws_tx
+            .lock()
+            .await
+            .clone()
+            .context("ICT channel is not connected")?;
+        ws_tx
+            .send(IctOutbound::Reply {
+                session_id: session_id.clone(),
+                request_id,
+                data: new_text,
+            })
+            .await
+            .context("failed to enqueue ICT incremental reply")?;
+        Ok(session_id)
+    }
 }
 
 fn sort_json_string(json_str: &str) -> String {
@@ -918,6 +1019,176 @@ impl Channel for IctChannel {
             ict_log_warn!("ICT [DONE] marker enqueue failed: {err:#}");
         }
 
+        Ok(())
+    }
+
+    fn supports_draft_updates(&self) -> bool {
+        // Resolved on every call so the runtime picks up an operator
+        // edit to `stream_mode` at the next reply boundary without
+        // restarting the daemon.
+        let snapshot = match (self.config_resolver)() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        snapshot.stream_mode != StreamMode::Off
+    }
+
+    fn supports_multi_message_streaming(&self) -> bool {
+        // ICT has no surface for independent messages — every business
+        // frame is one turn that the peer appends to. Reject multi_message
+        // to keep the runtime from spawning N fragmented sends.
+        false
+    }
+
+    async fn send_draft(&self, message: &SendMessage) -> Result<Option<String>> {
+        let snapshot =
+            (self.config_resolver)().context("ICT send_draft: config resolver failed")?;
+        if snapshot.stream_mode == StreamMode::Off {
+            return Ok(None);
+        }
+
+        // ICT has no platform-side message_id for a draft, so we mint a
+        // client-local handle. The orchestrator only uses this id to
+        // correlate subsequent update_draft / finalize_draft calls back
+        // to *this* channel instance, so locally-unique is sufficient.
+        let draft_id = format!("ict-draft-{}", uuid::Uuid::new_v4());
+
+        // Resolve the request_id from session_routes (the source of truth)
+        // so subsequent frames reuse the same correlation token. If there
+        // is no inbound route yet (e.g. proactive), generate a fresh id.
+        let request_id = self.resolve_request_id(message).await?;
+        let session_id = message.recipient.clone();
+
+        {
+            let mut drafts = self.drafts.lock().await;
+            drafts.insert(
+                draft_id.clone(),
+                IctDraftState {
+                    session_id: session_id.clone(),
+                    sent_length: 0,
+                    last_activity: Instant::now(),
+                },
+            );
+        }
+
+        // The orchestrator's draft first frame is conventionally "..."
+        // or the empty placeholder. We do not emit a wire frame for the
+        // first call — the first delta in update_draft will carry the
+        // actual content. This matches the historical ictmsg.rs
+        // send_text / edit_message split (the draft never emitted an
+        // empty frame; the first non-empty edit did).
+        ict_log_debug!(
+            "ICT send_draft opened draft_id={draft_id} session_id={session_id} request_id={request_id}"
+        );
+        Ok(Some(draft_id))
+    }
+
+    async fn update_draft(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
+        let snapshot =
+            (self.config_resolver)().context("ICT update_draft: config resolver failed")?;
+        if snapshot.stream_mode == StreamMode::Off {
+            return Ok(());
+        }
+
+        self.enqueue_incremental_chunk(recipient, message_id, text)
+            .await?;
+        Ok(())
+    }
+
+    async fn update_draft_progress(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _text: &str,
+    ) -> Result<()> {
+        // ICT only renders answer text. Tool progress/status updates are
+        // intentionally omitted from the reply stream.
+        Ok(())
+    }
+
+    async fn update_draft_reasoning(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _reasoning: &str,
+    ) -> Result<()> {
+        // ICT does not have a separate reasoning surface. Reasoning
+        // deltas are dropped on the floor (matches the historical
+        // ictmsg.rs which had no reasoning channel either). The
+        // orchestrator is expected to fold reasoning into the final
+        // text before finalize_draft if it wants the peer to see it.
+        Ok(())
+    }
+
+    async fn finalize_draft(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
+        let snapshot =
+            (self.config_resolver)().context("ICT finalize_draft: config resolver failed")?;
+        if snapshot.stream_mode == StreamMode::Off {
+            // Even when stream_mode is off we must drain any draft
+            // bookkeeping left behind by an earlier send_draft call so
+            // a re-enable doesn't pick up stale state.
+            self.drafts.lock().await.remove(message_id);
+            return Ok(());
+        }
+
+        // Flush any remaining incremental chunk the caller has buffered
+        // since the last update_draft, then emit the [DONE] marker.
+        self.enqueue_incremental_chunk(recipient, message_id, text)
+            .await?;
+
+        let (session_id, request_id) = {
+            let mut drafts = self.drafts.lock().await;
+            match drafts.remove(message_id) {
+                Some(state) => (state.session_id, None),
+                None => {
+                    ict_log_warn!("ICT finalize_draft with no open draft message_id={message_id}");
+                    (recipient.to_string(), None)
+                }
+            }
+        };
+
+        // We deliberately resolve request_id fresh instead of caching it
+        // on IctDraftState: session_routes is the source of truth and we
+        // don't want a stale snapshot if a reconnect cleared it.
+        let request_id = match request_id {
+            Some(id) => id,
+            None => self
+                .session_routes
+                .lock()
+                .await
+                .get(&session_id)
+                .cloned()
+                .unwrap_or_default(),
+        };
+
+        if request_id.is_empty() {
+            ict_log_warn!(
+                "ICT finalize_draft: no request_id resolved for session {session_id}; skipping [DONE]"
+            );
+            return Ok(());
+        }
+
+        let ws_tx = self
+            .ws_tx
+            .lock()
+            .await
+            .clone()
+            .context("ICT channel is not connected")?;
+        if let Err(err) = ws_tx.try_send(IctOutbound::Done {
+            session_id,
+            request_id,
+        }) {
+            ict_log_warn!("ICT [DONE] marker enqueue failed: {err:#}");
+        }
+        Ok(())
+    }
+
+    async fn cancel_draft(&self, _recipient: &str, message_id: &str) -> Result<()> {
+        // Drop local state; do not emit a [DONE] (the peer would treat
+        // it as a complete turn). Already-sent incremental frames remain
+        // on the wire — the upstream platform chooses whether to render
+        // them as a truncated prefix.
+        self.drafts.lock().await.remove(message_id);
         Ok(())
     }
 
@@ -1105,6 +1376,7 @@ mod tests {
                 app_secret: app_secret.clone(),
                 heartbeat_interval_secs,
                 expiration_time_secs,
+                stream_mode: StreamMode::Off,
             })
         })
     }
@@ -1840,5 +2112,343 @@ connection: close
             msg.contains("ICT channel is not connected"),
             "expected 'not connected' error, got: {msg}"
         );
+    }
+
+    /// Build a config resolver that opts into the supplied stream mode.
+    fn snapshot_for_stream_mode(
+        register_url: String,
+        ws_url: String,
+        stream_mode: StreamMode,
+        app_id: String,
+        app_secret: String,
+    ) -> Arc<dyn Fn() -> Result<IctConfigSnapshot> + Send + Sync> {
+        Arc::new(move || {
+            Ok(IctConfigSnapshot {
+                url: register_url.clone(),
+                app_id: app_id.clone(),
+                app_secret: app_secret.clone(),
+                heartbeat_interval_secs: 60,
+                expiration_time_secs: 600,
+                stream_mode,
+            })
+        })
+    }
+
+    /// Build a channel wired to a registration + WS pair with the
+    /// supplied `stream_mode`.
+    fn build_streaming_channel(
+        register_url: String,
+        ws_url: String,
+        stream_mode: StreamMode,
+        http_client: reqwest::Client,
+    ) -> IctChannel {
+        IctChannel::new_with_client(
+            "default",
+            snapshot_for_stream_mode(
+                register_url,
+                ws_url,
+                stream_mode,
+                "test-app".to_string(),
+                "test-secret".to_string(),
+            ),
+            http_client,
+        )
+    }
+
+    #[test]
+    fn supports_draft_updates_reflects_stream_mode() {
+        let off_channel = build_channel(
+            "default",
+            "http://127.0.0.1:1/never".into(),
+            "ws://127.0.0.1:1".into(),
+            600,
+            reqwest::Client::new(),
+        );
+        assert!(
+            !off_channel.supports_draft_updates(),
+            "stream_mode=Off must report no draft support"
+        );
+        assert!(
+            !off_channel.supports_multi_message_streaming(),
+            "ICT must never report multi_message support (no independent-message surface)"
+        );
+
+        let partial_channel = IctChannel::new_with_client(
+            "default",
+            snapshot_for_stream_mode(
+                "http://127.0.0.1:1/never".into(),
+                "ws://127.0.0.1:1".into(),
+                StreamMode::Partial,
+                "test-app".into(),
+                "test-secret".into(),
+            ),
+            reqwest::Client::new(),
+        );
+        assert!(
+            partial_channel.supports_draft_updates(),
+            "stream_mode=Partial must report draft support"
+        );
+    }
+
+    /// Full round-trip: register, authenticate, deliver an inbound
+    /// frame, then drive send_draft / update_draft (multiple) /
+    /// finalize_draft. The WS server must observe exactly the
+    /// incremental frames plus a terminal [DONE] marker, all sharing
+    /// the same requestId / sessionId.
+    #[tokio::test]
+    async fn draft_hook_full_round_trip() {
+        let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_addr = ws_listener.local_addr().unwrap();
+        let ws_url = format!("ws://{ws_addr}");
+
+        let captured_frames: Arc<StdMutex<Vec<IctWireMessage>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let captured_for_server = Arc::clone(&captured_frames);
+        let ws_server = tokio::spawn(async move {
+            let (socket, _) = ws_listener.accept().await.unwrap();
+            let ws_stream =
+                accept_hdr_async(socket, |_req: &Request, response: Response| Ok(response))
+                    .await
+                    .unwrap();
+            let (mut ws_write, mut ws_read) = ws_stream.split();
+
+            let auth = serde_json::to_string(&IctWireMessage {
+                msg_type: 998,
+                data: Some("ok".into()),
+                request_id: None,
+                session_id: None,
+                timestamp: Some(chrono::Utc::now().timestamp_millis()),
+            })
+            .unwrap();
+            ws_write.send(WsMessage::Text(auth.into())).await.unwrap();
+
+            let inbound = serde_json::to_string(&IctWireMessage {
+                msg_type: 1,
+                data: Some("hi".into()),
+                request_id: Some("req-stream-2".into()),
+                session_id: Some("sess-stream-2".into()),
+                timestamp: Some(chrono::Utc::now().timestamp_millis()),
+            })
+            .unwrap();
+            ws_write
+                .send(WsMessage::Text(inbound.into()))
+                .await
+                .unwrap();
+
+            loop {
+                let frame = timeout(Duration::from_secs(5), ws_read.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                let text = match frame {
+                    WsMessage::Text(text) => text.to_string(),
+                    WsMessage::Close(_) => break,
+                    other => panic!("unexpected reply frame: {other:?}"),
+                };
+                let parsed: IctWireMessage = serde_json::from_str(&text).unwrap();
+                let is_done = parsed.msg_type == 1 && parsed.data.as_deref() == Some("[DONE]");
+                captured_for_server.lock().unwrap().push(parsed);
+                if is_done {
+                    break;
+                }
+            }
+        });
+
+        let register_captured: Arc<StdMutex<Option<(String, String, String, String, String)>>> =
+            Arc::new(StdMutex::new(None));
+        let register_url = spawn_registration_server(
+            Arc::clone(&register_captured),
+            "HTTP/1.1 200 OK",
+            registry_response_body(&ws_url, "u", "p", "m"),
+        )
+        .await;
+
+        let channel = build_streaming_channel(
+            register_url,
+            ws_url.clone(),
+            StreamMode::Partial,
+            reqwest::Client::new(),
+        );
+
+        let (out_tx, _out_rx) = mpsc::channel::<ChannelMessage>(8);
+        let listen_channel = channel.clone();
+        let listen_handle = tokio::spawn(async move { listen_channel.listen(out_tx).await });
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let draft_id = channel
+            .send_draft(&SendMessage::new("...", "sess-stream-2"))
+            .await
+            .expect("send_draft")
+            .expect("draft id");
+        assert!(!draft_id.is_empty(), "draft id must be non-empty");
+
+        channel
+            .update_draft("sess-stream-2", &draft_id, "Hello")
+            .await
+            .expect("update_draft 1");
+        channel
+            .update_draft_progress("sess-stream-2", &draft_id, "Thinking...")
+            .await
+            .expect("update_draft_progress");
+        channel
+            .update_draft_reasoning("sess-stream-2", &draft_id, "private reasoning")
+            .await
+            .expect("update_draft_reasoning");
+        channel
+            .update_draft("sess-stream-2", &draft_id, "Hello, world")
+            .await
+            .expect("update_draft 2");
+        channel
+            .finalize_draft("sess-stream-2", &draft_id, "Hello, world!")
+            .await
+            .expect("finalize_draft");
+
+        let frames = {
+            let mut last_seen_done = false;
+            for _ in 0..50 {
+                let guard = captured_frames.lock().unwrap();
+                if guard
+                    .iter()
+                    .any(|f| f.msg_type == 1 && f.data.as_deref() == Some("[DONE]"))
+                {
+                    last_seen_done = true;
+                    break;
+                }
+                drop(guard);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(last_seen_done, "server never observed [DONE] marker");
+            captured_frames.lock().unwrap().clone()
+        };
+
+        let business_chunks: Vec<&IctWireMessage> = frames
+            .iter()
+            .filter(|f| f.msg_type == 1 && f.data.as_deref() != Some("[DONE]"))
+            .collect();
+        let done_frames: Vec<&IctWireMessage> = frames
+            .iter()
+            .filter(|f| f.msg_type == 1 && f.data.as_deref() == Some("[DONE]"))
+            .collect();
+        // 3 chunks: "Hello" + ", world" + "!"
+        assert_eq!(business_chunks.len(), 3, "expected 3 incremental chunks");
+        assert_eq!(done_frames.len(), 1, "expected exactly one [DONE]");
+
+        let joined: String = business_chunks
+            .iter()
+            .filter_map(|f| f.data.as_deref())
+            .collect();
+        assert_eq!(joined, "Hello, world!");
+
+        for frame in &frames {
+            assert_eq!(frame.request_id.as_deref(), Some("req-stream-2"));
+            assert_eq!(frame.session_id.as_deref(), Some("sess-stream-2"));
+        }
+
+        listen_handle.abort();
+        let _ = ws_server.await;
+    }
+
+    #[tokio::test]
+    async fn cancel_draft_does_not_emit_done() {
+        let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_addr = ws_listener.local_addr().unwrap();
+        let ws_url = format!("ws://{ws_addr}");
+
+        let captured_frames: Arc<StdMutex<Vec<IctWireMessage>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let captured_for_server = Arc::clone(&captured_frames);
+        let ws_server = tokio::spawn(async move {
+            let (socket, _) = ws_listener.accept().await.unwrap();
+            let ws_stream =
+                accept_hdr_async(socket, |_req: &Request, response: Response| Ok(response))
+                    .await
+                    .unwrap();
+            let (mut ws_write, mut ws_read) = ws_stream.split();
+
+            let auth = serde_json::to_string(&IctWireMessage {
+                msg_type: 998,
+                data: Some("ok".into()),
+                request_id: None,
+                session_id: None,
+                timestamp: Some(chrono::Utc::now().timestamp_millis()),
+            })
+            .unwrap();
+            ws_write.send(WsMessage::Text(auth.into())).await.unwrap();
+
+            let inbound = serde_json::to_string(&IctWireMessage {
+                msg_type: 1,
+                data: Some("hi".into()),
+                request_id: Some("req-cancel".into()),
+                session_id: Some("sess-cancel".into()),
+                timestamp: Some(chrono::Utc::now().timestamp_millis()),
+            })
+            .unwrap();
+            ws_write
+                .send(WsMessage::Text(inbound.into()))
+                .await
+                .unwrap();
+
+            let _ = timeout(Duration::from_millis(400), async {
+                while let Some(Ok(WsMessage::Text(text))) = ws_read.next().await {
+                    if let Ok(parsed) = serde_json::from_str::<IctWireMessage>(&text) {
+                        captured_for_server.lock().unwrap().push(parsed);
+                    }
+                }
+            })
+            .await;
+        });
+
+        let register_captured: Arc<StdMutex<Option<(String, String, String, String, String)>>> =
+            Arc::new(StdMutex::new(None));
+        let register_url = spawn_registration_server(
+            Arc::clone(&register_captured),
+            "HTTP/1.1 200 OK",
+            registry_response_body(&ws_url, "u", "p", "m"),
+        )
+        .await;
+
+        let channel = build_streaming_channel(
+            register_url,
+            ws_url.clone(),
+            StreamMode::Partial,
+            reqwest::Client::new(),
+        );
+
+        let (out_tx, _out_rx) = mpsc::channel::<ChannelMessage>(8);
+        let listen_channel = channel.clone();
+        let _listen_handle = tokio::spawn(async move { listen_channel.listen(out_tx).await });
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let draft_id = channel
+            .send_draft(&SendMessage::new("...", "sess-cancel"))
+            .await
+            .expect("send_draft")
+            .expect("draft id");
+
+        channel
+            .update_draft("sess-cancel", &draft_id, "partial")
+            .await
+            .expect("update_draft");
+        channel
+            .cancel_draft("sess-cancel", &draft_id)
+            .await
+            .expect("cancel_draft");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let frames = captured_frames.lock().unwrap().clone();
+        let done_seen = frames
+            .iter()
+            .any(|f| f.msg_type == 1 && f.data.as_deref() == Some("[DONE]"));
+        assert!(
+            !done_seen,
+            "cancel_draft must NOT emit a [DONE] marker; saw frames: {:?}",
+            frames
+        );
+
+        let _ = ws_server.await;
     }
 }

@@ -6194,6 +6194,7 @@ fn build_channel_by_id(
                         app_secret: ict.app_secret.clone(),
                         heartbeat_interval_secs: ict.heartbeat_interval_secs,
                         expiration_time_secs: ict.expiration_time_secs,
+                        stream_mode: ict.stream_mode,
                     })
                 })
             };
@@ -8060,6 +8061,7 @@ fn collect_configured_channels(
                     app_secret: ict.app_secret.clone(),
                     heartbeat_interval_secs: ict.heartbeat_interval_secs,
                     expiration_time_secs: ict.expiration_time_secs,
+                    stream_mode: ict.stream_mode,
                 })
             })
         };
