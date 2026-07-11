@@ -3090,11 +3090,8 @@ impl Channel for LarkChannel {
             return Ok(None);
         }
 
-        let placeholder = if message.content.is_empty() {
-            "_processing…"
-        } else {
-            message.content.as_str()
-        };
+        // Use a fixed placeholder, matching DingTalk's "正在思考中…"
+        let placeholder = "🤔 思考中...";
 
         match self.cardkit_create(&message.recipient, placeholder).await {
             Ok(card_id) => {
@@ -3340,18 +3337,6 @@ impl Channel for LarkChannel {
 
         // Return immediately - the API call is happening in the background
         Ok(())
-    }
-
-    /// Same wire shape as `update_draft`; kept as a separate trait method so
-    /// callers can later distinguish progress chrome from response content
-    /// without changing the calling sites.
-    async fn update_draft_progress(
-        &self,
-        recipient: &str,
-        message_id: &str,
-        text: &str,
-    ) -> anyhow::Result<()> {
-        self.update_draft(recipient, message_id, text).await
     }
 
     /// Commit the final response into the draft card using Cardkit path.
@@ -6871,17 +6856,16 @@ mod tests {
             .mount_as_scoped(&server)
             .await;
 
-        let placeholder = "正在回答：天津有哪些美食\n\n🤔 思考中...";
         let mut ch = make_channel().with_streaming(StreamMode::Partial, 50);
         ch.api_base_override = Some(server.uri());
 
         let draft_id = ch
-            .send_draft(&SendMessage::new(placeholder, "oc_test_chat_id"))
+            .send_draft(&SendMessage::new("🤔 思考中...", "oc_test_chat_id"))
             .await
             .expect("send_draft ok")
             .expect("send_draft should return card-backed message id");
 
-        ch.update_draft("oc_test_chat_id", &draft_id, placeholder)
+        ch.update_draft("oc_test_chat_id", &draft_id, "🤔 思考中...")
             .await
             .expect("duplicate placeholder update_draft ok");
         tokio::time::sleep(StdDuration::from_millis(120)).await;
