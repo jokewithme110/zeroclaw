@@ -6,6 +6,7 @@ use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::NoPadding};
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use rand::RngExt;
+use regex::Regex;
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -24,6 +25,7 @@ const WECOM_WS_URL: &str = "wss://openws.work.weixin.qq.com";
 const WECOM_BACKOFF_INITIAL_SECS: u64 = 5;
 const WECOM_BACKOFF_MAX_SECS: u64 = 60;
 const WECOM_PING_INTERVAL_SECS: u64 = 30;
+const WECOM_PING_MAX_FAILURES: usize = 3;
 const WECOM_SUBSCRIBE_TIMEOUT_SECS: u64 = 10;
 const WECOM_COMMAND_TIMEOUT_SECS: u64 = 10;
 const WECOM_HTTP_TIMEOUT_SECS: u64 = 60;
@@ -45,6 +47,15 @@ const WECOM_EMOJIS: &[&str] = &[
     "\u{1F44C}",
 ];
 const WECOM_FILE_CLEANUP_INTERVAL_SECS: u64 = 1800;
+
+// ── Outbound media (image/voice/video/file) ────────────────────────
+const WECOM_MEDIA_CHUNK_BYTES: usize = 512 * 1024;
+const WECOM_MEDIA_MAX_CHUNKS: usize = 100;
+const WECOM_MEDIA_DOWNGRADE_IMAGE_MB: usize = 10;
+const WECOM_MEDIA_DOWNGRADE_VOICE_MB: usize = 2;
+const WECOM_MEDIA_MAX_FILE_MB: usize = 20;
+const WECOM_UPLOAD_TIMEOUT_SECS: u64 = 60;
+
 macro_rules! wecom_log_debug {
     ($($arg:tt)*) => {
         ::zeroclaw_log::record!(
@@ -238,7 +249,7 @@ pub struct WeComWsChannel {
     client: reqwest::Client,
     ws_tx: Arc<tokio::sync::Mutex<Option<mpsc::Sender<WsOutbound>>>>,
     pending_responses:
-        Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<()>>>>>,
+        Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<Value>>>>>,
     respond_msg_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     last_cleanup: Arc<Mutex<Instant>>,
     /// Runtime hook invoked after the channel persists a media
@@ -248,6 +259,21 @@ pub struct WeComWsChannel {
     file_persisted_hook: Option<zeroclaw_api::channel::FilePersistedHook>,
     idempotency: Arc<SimpleIdempotencyStore>,
     req_id_map: Arc<Mutex<HashMap<String, String>>>, // stream_id → req_id
+    /// Connection quality metrics for diagnostics
+    connection_stats: Arc<Mutex<ConnectionStats>>,
+}
+
+/// Track connection quality and stability metrics
+#[derive(Default)]
+struct ConnectionStats {
+    /// Total reconnection attempts
+    reconnect_attempts: u64,
+    /// Consecutive failed reconnection attempts
+    consecutive_failures: u64,
+    /// Last successful connection timestamp
+    last_connected: Option<std::time::Instant>,
+    /// Ping failures in current session
+    ping_failures: usize,
 }
 
 // ── Construction + WS helpers ────────────────────────────────────────
@@ -304,6 +330,7 @@ impl WeComWsChannel {
             idempotency: Arc::new(SimpleIdempotencyStore::new()),
             req_id_map: Arc::new(Mutex::new(HashMap::new())),
             file_persisted_hook: None,
+            connection_stats: Arc::new(Mutex::new(ConnectionStats::default())),
         })
     }
     /// Install the runtime hook that the channel will invoke after
@@ -358,7 +385,10 @@ impl WeComWsChannel {
         }
 
         match tokio::time::timeout(Duration::from_secs(WECOM_COMMAND_TIMEOUT_SECS), rx).await {
-            Ok(Ok(result)) => result,
+            Ok(Ok(result)) => {
+                let _ = result?; // Discard the Value, we only care about success
+                Ok(())
+            }
             Ok(Err(_)) => anyhow::bail!(
                 "WeCom WS {command} response channel closed before ack (req_id={req_id})"
             ),
@@ -367,6 +397,42 @@ impl WeComWsChannel {
                 anyhow::bail!(
                     "WeCom WS {command} ack timeout after {}s (req_id={req_id})",
                     WECOM_COMMAND_TIMEOUT_SECS
+                );
+            }
+        }
+    }
+
+    /// Send a JSON frame through the WebSocket and wait for a response body.
+    async fn ws_send_frame_and_wait_for_body(
+        &self,
+        frame: Value,
+        req_id: &str,
+        command: &str,
+        timeout_secs: u64,
+    ) -> Result<Value> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending_responses
+            .lock()
+            .await
+            .insert(req_id.to_string(), tx);
+
+        if let Err(err) = self.ws_send_frame(frame).await {
+            self.pending_responses.lock().await.remove(req_id);
+            return Err(err);
+        }
+
+        match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
+            Ok(Ok(result)) => {
+                let frame = result?;
+                Ok(frame)
+            }
+            Ok(Err(_)) => anyhow::bail!(
+                "WeCom WS {command} response channel closed before body (req_id={req_id})"
+            ),
+            Err(_) => {
+                self.pending_responses.lock().await.remove(req_id);
+                anyhow::bail!(
+                    "WeCom WS {command} body timeout after {timeout_secs}s (req_id={req_id})"
                 );
             }
         }
@@ -392,7 +458,7 @@ impl WeComWsChannel {
 
         if let Some(waiter) = self.pending_responses.lock().await.remove(req_id) {
             let result = if errcode == 0 {
-                Ok(())
+                Ok(frame.clone())
             } else {
                 Err(anyhow::Error::msg(format!(
                     "WeCom command failed: req_id={req_id} errcode={errcode} errmsg={errmsg}"
@@ -518,6 +584,25 @@ impl WeComWsChannel {
         let frame = Self::build_respond_msg_frame(req_id, stream_id, content, finish);
         if req_id.is_empty() {
             return self.ws_send_frame(frame).await;
+        }
+
+        // Create idempotency key to prevent duplicate messages
+        // This handles the case where the same stream update is sent multiple times
+        let idempotency_key = format!(
+            "respond_msg:{}_{}_{}_{}",
+            req_id,
+            stream_id,
+            finish,
+            content.len()
+        );
+
+        // Check if we've already sent this exact message
+        if !self.idempotency.record_if_new(&idempotency_key) {
+            wecom_log_debug!(
+                "[wecom_ws] ws_send_respond_msg: skipping duplicate message (idempotency_key={})",
+                idempotency_key
+            );
+            return Ok(());
         }
 
         let stream_lock = self.respond_msg_lock_for_req_id(req_id).await;
@@ -883,8 +968,16 @@ impl WeComWsChannel {
                 false
             }
             "disconnected_event" => {
-                wecom_log_warn!("[wecom_ws] received disconnected_event, triggering reconnect");
-                true
+                // This event is sent by the server when a NEW connection is established.
+                // The server is notifying this (old) connection that it will be closed.
+                // We MUST NOT reconnect here, otherwise we enter an infinite loop:
+                //   new connection → server sends disconnected_event to old → old reconnects
+                //   → new connection established again → server kicks old again → repeat
+                wecom_log_warn!(
+                    "[wecom_ws] received disconnected_event: server closing this connection due to new connection, will NOT reconnect"
+                );
+                // Return false to prevent reconnection - this is normal server behavior
+                false
             }
             other => {
                 wecom_log_debug!("[wecom_ws] ignoring event_type={other}");
@@ -1447,6 +1540,391 @@ impl WeComWsChannel {
 
         Ok(())
     }
+
+    // ── Outbound media methods ────────────────────────────────────────
+
+    /// Validate that a file path is within allowed directories.
+    fn guard_outbound_path(&self, path: &Path) -> Result<PathBuf> {
+        let abs = path.canonicalize().with_context(|| {
+            format!(
+                "WeCom outbound media: failed to canonicalize path: {}",
+                path.display()
+            )
+        })?;
+
+        // Check if the path is within workspace_dir OR the parent install directory
+        // This allows media files in /data/coclaw/ and subdirectories
+        let install_dir = self
+            .cfg
+            .workspace_dir
+            .parent()
+            .unwrap_or(&self.cfg.workspace_dir);
+        let allowed = abs.starts_with(&self.cfg.workspace_dir) || abs.starts_with(install_dir);
+
+        if !allowed {
+            anyhow::bail!(
+                "WeCom outbound media: path {} is outside allowed directories (workspace: {}, install: {})",
+                abs.display(),
+                self.cfg.workspace_dir.display(),
+                install_dir.display()
+            );
+        }
+
+        Ok(abs)
+    }
+
+    /// Upload media to WeCom via the three-step chunk protocol.
+    async fn upload_media(
+        &self,
+        buffer: &[u8],
+        media_type: &str,
+        filename: &str,
+    ) -> Result<String> {
+        let total_size = buffer.len();
+        let total_chunks = total_size.div_ceil(WECOM_MEDIA_CHUNK_BYTES);
+        let total_chunks = total_chunks.min(WECOM_MEDIA_MAX_CHUNKS);
+
+        wecom_log_info!(
+            "[wecom_ws] uploading media: type={} filename={} size={}MB chunks={}",
+            media_type,
+            filename,
+            total_size / (1024 * 1024),
+            total_chunks
+        );
+
+        // Step 1: Initialize upload
+        let init_req_id = random_ascii_token(16);
+        let init_frame = serde_json::json!({
+            "cmd": "aibot_upload_media_init",
+            "headers": { "req_id": init_req_id },
+            "body": {
+                "type": media_type,
+                "filename": filename,
+                "total_size": total_size,
+                "total_chunks": total_chunks
+            }
+        });
+
+        let init_response = self
+            .ws_send_frame_and_wait_for_body(
+                init_frame,
+                &init_req_id,
+                "aibot_upload_media_init",
+                WECOM_UPLOAD_TIMEOUT_SECS,
+            )
+            .await?;
+
+        let upload_id = init_response
+            .get("body")
+            .and_then(|body| body.get("upload_id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                wecom_log_warn!("[wecom_ws] upload_media_init: missing upload_id in response");
+                anyhow::Error::msg("WeCom upload_media_init: missing upload_id in response")
+            })?
+            .to_string();
+
+        wecom_log_debug!("[wecom_ws] upload_media_init: upload_id={}", upload_id);
+
+        // Step 2: Upload chunks sequentially
+        let mut chunk_index = 0;
+        while chunk_index < total_chunks {
+            let start = chunk_index * WECOM_MEDIA_CHUNK_BYTES;
+            let end = (start + WECOM_MEDIA_CHUNK_BYTES).min(total_size);
+            let chunk_data = &buffer[start..end];
+            let base64_data = base64::engine::general_purpose::STANDARD.encode(chunk_data);
+
+            let mut attempts = 0;
+            loop {
+                let chunk_req_id = random_ascii_token(16);
+                let chunk_frame = serde_json::json!({
+                    "cmd": "aibot_upload_media_chunk",
+                    "headers": { "req_id": chunk_req_id },
+                    "body": {
+                        "upload_id": upload_id,
+                        "chunk_index": chunk_index,
+                        "base64_data": base64_data
+                    }
+                });
+
+                match self
+                    .ws_send_frame_and_wait_for_body(
+                        chunk_frame,
+                        &chunk_req_id,
+                        "aibot_upload_media_chunk",
+                        WECOM_UPLOAD_TIMEOUT_SECS,
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        wecom_log_debug!(
+                            "[wecom_ws] upload_media_chunk: chunk {}/{} uploaded",
+                            chunk_index + 1,
+                            total_chunks
+                        );
+                        break;
+                    }
+                    Err(err) => {
+                        attempts += 1;
+                        if attempts >= 2 {
+                            wecom_log_warn!(
+                                "[wecom_ws] upload_media_chunk: chunk {}/{} failed after {} attempts: {err:#}",
+                                chunk_index + 1,
+                                total_chunks,
+                                attempts
+                            );
+                            return Err(err);
+                        }
+                        wecom_log_warn!(
+                            "[wecom_ws] upload_media_chunk: chunk {}/{} failed (attempt {}), retrying in {}ms",
+                            chunk_index + 1,
+                            total_chunks,
+                            attempts,
+                            500 * attempts
+                        );
+                        tokio::time::sleep(Duration::from_millis(500 * attempts as u64)).await;
+                    }
+                }
+            }
+            chunk_index += 1;
+        }
+
+        // Step 3: Finish upload
+        let finish_req_id = random_ascii_token(16);
+        let finish_frame = serde_json::json!({
+            "cmd": "aibot_upload_media_finish",
+            "headers": { "req_id": finish_req_id },
+            "body": {
+                "upload_id": upload_id
+            }
+        });
+
+        let finish_response = self
+            .ws_send_frame_and_wait_for_body(
+                finish_frame,
+                &finish_req_id,
+                "aibot_upload_media_finish",
+                WECOM_UPLOAD_TIMEOUT_SECS,
+            )
+            .await?;
+
+        let media_id = finish_response
+            .get("body")
+            .and_then(|body| body.get("media_id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                wecom_log_warn!("[wecom_ws] upload_media_finish: missing media_id in response");
+                anyhow::Error::msg("WeCom upload_media_finish: missing media_id in response")
+            })?
+            .to_string();
+
+        wecom_log_info!(
+            "[wecom_ws] media upload completed: media_id={} type={}",
+            media_id,
+            media_type
+        );
+
+        Ok(media_id)
+    }
+
+    /// Upload local media file and return (media_id, effective_type).
+    /// The requested_type parameter comes from the marker tag ([IMAGE:], [FILE:], etc.)
+    async fn upload_local_media(
+        &self,
+        path: &Path,
+        requested_type: &str,
+    ) -> Result<(String, &'static str)> {
+        wecom_log_info!(
+            "[wecom_ws] upload_local_media: starting upload for path={}, requested_type={}",
+            path.display(),
+            requested_type
+        );
+
+        // Validate path
+        let abs_path = self.guard_outbound_path(path).map_err(|e| {
+            wecom_log_warn!(
+                "[wecom_ws] upload_local_media: guard_outbound_path failed for path={}: {}",
+                path.display(),
+                e
+            );
+            e
+        })?;
+
+        wecom_log_info!(
+            "[wecom_ws] upload_local_media: validated path, abs_path={}",
+            abs_path.display()
+        );
+
+        // Read file
+        let buffer = tokio::fs::read(&abs_path).await.with_context(|| {
+            let msg = format!(
+                "WeCom outbound media: failed to read file: {}",
+                abs_path.display()
+            );
+            wecom_log_warn!("[wecom_ws] upload_local_media: {}", msg);
+            msg
+        })?;
+
+        wecom_log_info!(
+            "[wecom_ws] upload_local_media: read file, size={} bytes",
+            buffer.len()
+        );
+
+        // Use the requested type from the marker tag
+        let filename = abs_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        let extension = file_extension(filename);
+
+        // Apply size downgrade rules based on requested type
+        let effective_type = apply_size_downgrade(requested_type, buffer.len(), extension);
+        if effective_type == "rejected" {
+            anyhow::bail!(
+                "WeCom outbound media: file {} exceeds maximum size ({} bytes)",
+                abs_path.display(),
+                buffer.len()
+            );
+        }
+
+        wecom_log_info!(
+            "[wecom_ws] upload_local_media: filename={}, requested_type={}, effective_type={}, size_bytes={}",
+            filename,
+            requested_type,
+            effective_type,
+            buffer.len()
+        );
+
+        // Upload
+        let media_id = self.upload_media(&buffer, effective_type, filename).await?;
+        Ok((media_id, effective_type))
+    }
+
+    /// Send a media message via aibot_send_msg.
+    async fn send_media_message(
+        &self,
+        chatid: &str,
+        chat_type: u8,
+        media_type: &str,
+        media_id: &str,
+    ) -> Result<()> {
+        let req_id = random_ascii_token(16);
+        let frame = serde_json::json!({
+            "cmd": "aibot_send_msg",
+            "headers": { "req_id": req_id },
+            "body": {
+                "chatid": chatid,
+                "chat_type": chat_type,
+                "msgtype": media_type,
+                media_type: { "media_id": media_id }
+            }
+        });
+
+        self.ws_send_frame_and_wait_for_response(frame, &req_id, "aibot_send_msg")
+            .await?;
+
+        wecom_log_info!(
+            "[wecom_ws] media message sent: chatid={} type={} media_id={}",
+            chatid,
+            media_type,
+            media_id
+        );
+
+        Ok(())
+    }
+
+    /// Reply with media via aibot_respond_msg.
+    async fn reply_media(&self, req_id: &str, media_type: &str, media_id: &str) -> Result<()> {
+        let stream_id = next_stream_id();
+        let frame = Self::build_respond_msg_frame(req_id, &stream_id, "", true);
+        let mut frame_obj = frame.as_object().unwrap().clone();
+
+        // Replace content with media object
+        let body = frame_obj.get_mut("body").unwrap().as_object_mut().unwrap();
+        body.insert("msgtype".to_string(), serde_json::json!(media_type));
+        body.insert(
+            media_type.to_string(),
+            serde_json::json!({
+                "media_id": media_id
+            }),
+        );
+        body.remove("content");
+        body.remove("stream");
+
+        let frame = serde_json::Value::Object(frame_obj);
+        self.ws_send_frame(frame).await?;
+
+        wecom_log_info!(
+            "[wecom_ws] media reply sent: req_id={} type={} media_id={}",
+            req_id,
+            media_type,
+            media_id
+        );
+
+        Ok(())
+    }
+
+    /// Send media markers in batch. Failures are logged but don't abort the batch.
+    async fn send_media_batch(
+        &self,
+        message: &SendMessage,
+        markers: &[OutboundMediaMarker],
+    ) -> Result<()> {
+        if markers.is_empty() {
+            return Ok(());
+        }
+
+        wecom_log_info!(
+            "[wecom_ws] send_media_batch: sending {} media markers",
+            markers.len()
+        );
+
+        let (chat_type, chatid) = parse_scope(&message.recipient)?;
+        let is_streaming = message
+            .thread_ts
+            .as_ref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+
+        for marker in markers {
+            wecom_log_info!(
+                "[wecom_ws] uploading media: path={}, type={}",
+                marker.path,
+                marker.media_type
+            );
+            match self
+                .upload_local_media(Path::new(&marker.path), marker.media_type)
+                .await
+            {
+                Ok((media_id, media_type)) => {
+                    let send_result = if is_streaming {
+                        let req_id = message.thread_ts.as_deref().unwrap_or("");
+                        self.reply_media(req_id, media_type, &media_id).await
+                    } else {
+                        self.send_media_message(chatid, chat_type as u8, media_type, &media_id)
+                            .await
+                    };
+
+                    if let Err(err) = send_result {
+                        wecom_log_warn!(
+                            "[wecom_ws] failed to send media marker {:?}: {err:#}",
+                            marker
+                        );
+                        // Continue with next marker, don't abort
+                    }
+                }
+                Err(err) => {
+                    wecom_log_warn!(
+                        "[wecom_ws] failed to upload media marker path={}: {err:#}",
+                        marker.path
+                    );
+                    // Continue with next marker, don't abort
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 // ── Channel trait impl ───────────────────────────────────────────────
@@ -1476,14 +1954,53 @@ impl Channel for WeComWsChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
+        // Step 1: Parse content for media markers
+        let (residual_text, markers) = parse_media_markers(&message.content);
+
+        wecom_log_info!(
+            "[wecom_ws] send: recipient={}, markers={}, residual_text_len={}, is_streaming={}",
+            message.recipient,
+            markers.len(),
+            residual_text.len(),
+            message
+                .thread_ts
+                .as_ref()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+        );
+
+        // Step 2: Deliver any media markers first (best-effort)
+        if !markers.is_empty() {
+            self.send_media_batch(message, &markers).await?;
+        }
+
+        // Step 3: Deliver residual text via existing markdown / stream path
+        let final_text = filter_media_markers(&residual_text);
+
+        // Skip sending text if empty
+        if final_text.trim().is_empty() {
+            if !markers.is_empty() {
+                wecom_log_info!("[wecom_ws] send: only media sent, skipping empty text");
+            } else {
+                wecom_log_warn!("[wecom_ws] send: no media and no text, nothing to send");
+            }
+            return Ok(());
+        }
+
         if let Some(req_id) = message
             .thread_ts
             .as_deref()
             .filter(|req_id| !req_id.is_empty())
         {
             let stream_id = next_stream_id();
-            let (stream_content, overflow) = split_stream_content_and_overflow(&message.content);
+            let (stream_content, overflow) = split_stream_content_and_overflow(&final_text);
 
+            wecom_log_info!(
+                "[wecom_ws] send: streaming reply (stream_id={}, content_len={}, overflow={})",
+                stream_id,
+                stream_content.len(),
+                overflow.is_some()
+            );
             self.ws_send_respond_msg(req_id, &stream_id, &stream_content, true)
                 .await?;
 
@@ -1499,7 +2016,11 @@ impl Channel for WeComWsChannel {
             return Ok(());
         }
 
-        self.send_markdown_chunks_to_scope(&message.recipient, &message.content)
+        wecom_log_info!(
+            "[wecom_ws] send: non-streaming markdown send (text_len={})",
+            final_text.len()
+        );
+        self.send_markdown_chunks_to_scope(&message.recipient, &final_text)
             .await
     }
 
@@ -1512,7 +2033,18 @@ impl Channel for WeComWsChannel {
         let mut backoff = WECOM_BACKOFF_INITIAL_SECS;
 
         loop {
-            wecom_log_info!("[wecom_ws] connecting to {WECOM_WS_URL}");
+            let (attempt, consecutive) = {
+                let mut stats = self.connection_stats.lock();
+                stats.reconnect_attempts += 1;
+                (stats.reconnect_attempts, stats.consecutive_failures)
+            };
+
+            wecom_log_info!(
+                "[wecom_ws] connecting to {} (attempt={}, consecutive_failures={})",
+                WECOM_WS_URL,
+                attempt,
+                consecutive
+            );
 
             let ws_stream = match zeroclaw_config::schema::ws_connect_with_proxy(
                 WECOM_WS_URL,
@@ -1522,13 +2054,23 @@ impl Channel for WeComWsChannel {
             .await
             {
                 Ok((stream, _)) => {
-                    wecom_log_info!("[wecom_ws] WebSocket connected");
+                    wecom_log_info!("[wecom_ws] WebSocket connected (attempt={})", attempt);
+                    {
+                        let mut stats = self.connection_stats.lock();
+                        stats.consecutive_failures = 0;
+                        stats.last_connected = Some(std::time::Instant::now());
+                    }
                     stream
                 }
                 Err(err) => {
                     wecom_log_warn!(
-                        "[wecom_ws] WebSocket connect failed: {err:#}, retrying in {backoff}s"
+                        "[wecom_ws] WebSocket connect failed (attempt={}): {err:#}, retrying in {backoff}s",
+                        attempt
                     );
+                    {
+                        let mut stats = self.connection_stats.lock();
+                        stats.consecutive_failures += 1;
+                    }
                     tokio::time::sleep(Duration::from_secs(backoff)).await;
                     backoff = (backoff * 2).min(WECOM_BACKOFF_MAX_SECS);
                     continue;
@@ -1645,8 +2187,29 @@ impl Channel for WeComWsChannel {
                             .send(WsMessage::Text(ping.to_string().into()))
                             .await
                         {
-                            wecom_log_warn!("[wecom_ws] ping send failed: {err:#}");
-                            break;
+                            let mut stats = self.connection_stats.lock();
+                            stats.ping_failures += 1;
+                            let failures = stats.ping_failures;
+                            drop(stats);
+
+                            wecom_log_warn!(
+                                "[wecom_ws] ping send failed (failures={}): {err:#}",
+                                failures
+                            );
+
+                            // Allow some ping failures before reconnecting
+                            if failures >= WECOM_PING_MAX_FAILURES {
+                                wecom_log_warn!(
+                                    "[wecom_ws] too many ping failures ({}), triggering reconnect",
+                                    failures
+                                );
+                                break;
+                            }
+                        } else {
+                            // Reset ping failures on success
+                            let mut stats = self.connection_stats.lock();
+                            stats.ping_failures = 0;
+                            drop(stats);
                         }
                     }
                     Some(outbound) = out_rx.recv() => {
@@ -1704,12 +2267,31 @@ impl Channel for WeComWsChannel {
             *self.ws_tx.lock().await = None;
             self.fail_pending_responses("socket disconnected").await;
 
+            let (connected_duration, ping_failures) = {
+                let stats = self.connection_stats.lock();
+                (
+                    stats
+                        .last_connected
+                        .map(|t| t.elapsed().as_secs())
+                        .unwrap_or(0),
+                    stats.ping_failures,
+                )
+            };
+
             if should_reconnect {
                 // Server-initiated disconnect — reconnect quickly
-                wecom_log_info!("[wecom_ws] disconnected (server event), reconnecting immediately");
+                wecom_log_warn!(
+                    "[wecom_ws] disconnected by server (connected_for={}s, ping_failures={}), reconnecting immediately",
+                    connected_duration,
+                    ping_failures
+                );
                 backoff = WECOM_BACKOFF_INITIAL_SECS;
             } else {
-                wecom_log_info!("[wecom_ws] disconnected, will reconnect in {backoff}s");
+                wecom_log_warn!(
+                    "[wecom_ws] disconnected (connected_for={}s, ping_failures={}), reconnecting in {backoff}s",
+                    connected_duration,
+                    ping_failures
+                );
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
                 backoff = (backoff * 2).min(WECOM_BACKOFF_MAX_SECS);
             }
@@ -1755,7 +2337,11 @@ impl Channel for WeComWsChannel {
         if req_id.is_empty() {
             return Ok(());
         }
-        self.ws_send_respond_msg(&req_id, message_id, content, false)
+
+        // Filter media markers from streaming content to avoid showing raw markers
+        let clean_content = filter_media_markers(content);
+
+        self.ws_send_respond_msg(&req_id, message_id, &clean_content, false)
             .await?;
         Ok(())
     }
@@ -1767,9 +2353,47 @@ impl Channel for WeComWsChannel {
             .remove(message_id)
             .unwrap_or_default();
 
-        let (stream_content, overflow) = split_stream_content_and_overflow(content);
+        // Parse and send media markers
+        let (residual_text, markers) = parse_media_markers(content);
+
+        wecom_log_info!(
+            "[wecom_ws] finalize_draft: markers={}, residual_text_len={}, req_id={}, message_id={}",
+            markers.len(),
+            residual_text.len(),
+            req_id,
+            message_id
+        );
+
+        // Send media markers first (best-effort)
+        if !markers.is_empty() {
+            let dummy_message = SendMessage::new("", recipient).in_thread(Some(req_id.clone()));
+            if let Err(err) = self.send_media_batch(&dummy_message, &markers).await {
+                wecom_log_warn!("[wecom_ws] finalize_draft: failed to send media batch: {err:#}");
+            }
+        }
+
+        // Filter any remaining markers from residual text
+        let final_text = filter_media_markers(&residual_text);
+
+        // Check if we should skip sending text
+        if final_text.trim().is_empty() {
+            if !markers.is_empty() {
+                wecom_log_info!("[wecom_ws] finalize_draft: only media sent, skipping empty text");
+            } else {
+                wecom_log_warn!("[wecom_ws] finalize_draft: no media and no text, nothing to send");
+            }
+            return Ok(());
+        }
+
+        // Only send text if there's actual content
+        let (stream_content, overflow) = split_stream_content_and_overflow(&final_text);
 
         if !req_id.is_empty() {
+            wecom_log_info!(
+                "[wecom_ws] finalize_draft: sending text content (len={}, overflow={})",
+                stream_content.len(),
+                overflow.is_some()
+            );
             self.ws_send_respond_msg(&req_id, message_id, &stream_content, true)
                 .await?;
         }
@@ -2078,6 +2702,10 @@ fn normalize_scope_component(raw: &str) -> String {
             }
         })
         .collect()
+}
+
+fn file_extension(filename: &str) -> Option<&str> {
+    filename.rsplit('.').next().filter(|ext| !ext.is_empty())
 }
 
 fn image_file_extension(bytes: &[u8]) -> &'static str {
@@ -2638,6 +3266,177 @@ async fn cleanup_inbox_files(root: PathBuf, retention: Duration) {
     }
 }
 
+// ── Outbound media helpers ──────────────────────────────────────────
+
+/// Outbound media marker parsed from content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OutboundMediaMarker {
+    media_type: &'static str, // "image" | "voice" | "video" | "file"
+    path: String,
+}
+
+static IMAGE_REGEX: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+static FILE_REGEX: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+static DOCUMENT_REGEX: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+
+fn image_regex() -> &'static Regex {
+    IMAGE_REGEX.get_or_init(|| Regex::new(r"\[IMAGE:([^\]]+)\]").unwrap())
+}
+
+fn file_regex() -> &'static Regex {
+    FILE_REGEX.get_or_init(|| Regex::new(r"\[FILE:([^\]]+)\]").unwrap())
+}
+
+fn document_regex() -> &'static Regex {
+    DOCUMENT_REGEX.get_or_init(|| Regex::new(r"\[DOCUMENT:([^\]]+)\]").unwrap())
+}
+
+/// Parse `[IMAGE:/path]`, `[FILE:/path]`, `[DOCUMENT:/path]` markers from content.
+/// Returns (residual_text, markers) where residual_text has markers stripped.
+/// Only absolute paths (starting with `/`) are treated as markers.
+fn parse_media_markers(content: &str) -> (String, Vec<OutboundMediaMarker>) {
+    wecom_log_info!(
+        "[wecom_ws] parse_media_markers: parsing content (len={}, preview={})",
+        content.len(),
+        content.chars().take(100).collect::<String>()
+    );
+
+    let mut markers_with_pos = Vec::new();
+
+    // Collect all markers with their start positions
+    for cap in image_regex().captures_iter(content) {
+        if let Some(path_match) = cap.get(1) {
+            let path = path_match.as_str();
+            wecom_log_info!(
+                "[wecom_ws] parse_media_markers: found IMAGE marker, path={}, starts_with_slash={}",
+                path,
+                path.starts_with('/')
+            );
+            if path.starts_with('/') {
+                let full_match = cap.get(0).unwrap();
+                markers_with_pos.push((
+                    full_match.start(),
+                    full_match.end(),
+                    OutboundMediaMarker {
+                        media_type: "image",
+                        path: path.to_string(),
+                    },
+                ));
+            }
+        }
+    }
+
+    for cap in file_regex().captures_iter(content) {
+        if let Some(path_match) = cap.get(1) {
+            let path = path_match.as_str();
+            wecom_log_info!(
+                "[wecom_ws] parse_media_markers: found FILE marker, path={}, starts_with_slash={}",
+                path,
+                path.starts_with('/')
+            );
+            if path.starts_with('/') {
+                let full_match = cap.get(0).unwrap();
+                markers_with_pos.push((
+                    full_match.start(),
+                    full_match.end(),
+                    OutboundMediaMarker {
+                        media_type: "file",
+                        path: path.to_string(),
+                    },
+                ));
+            }
+        }
+    }
+
+    for cap in document_regex().captures_iter(content) {
+        if let Some(path_match) = cap.get(1) {
+            let path = path_match.as_str();
+            wecom_log_info!(
+                "[wecom_ws] parse_media_markers: found DOCUMENT marker, path={}, starts_with_slash={}",
+                path,
+                path.starts_with('/')
+            );
+            if path.starts_with('/') {
+                let full_match = cap.get(0).unwrap();
+                markers_with_pos.push((
+                    full_match.start(),
+                    full_match.end(),
+                    OutboundMediaMarker {
+                        media_type: "file",
+                        path: path.to_string(),
+                    },
+                ));
+            }
+        }
+    }
+
+    wecom_log_info!(
+        "[wecom_ws] parse_media_markers: parsed {} markers total",
+        markers_with_pos.len()
+    );
+
+    // Sort by start position
+    markers_with_pos.sort_by_key(|(start, _, _)| *start);
+
+    // Build residual text by removing markers
+    let mut residual = String::with_capacity(content.len());
+    let mut last_end = 0;
+    let mut markers = Vec::with_capacity(markers_with_pos.len());
+
+    for (start, end, marker) in markers_with_pos {
+        residual.push_str(&content[last_end..start]);
+        markers.push(marker);
+        last_end = end;
+    }
+    residual.push_str(&content[last_end..]);
+
+    (residual, markers)
+}
+
+/// Filter media markers from content, returning only the residual text.
+/// This is a convenience wrapper around parse_media_markers.
+fn filter_media_markers(content: &str) -> String {
+    let (text, _) = parse_media_markers(content);
+    text
+}
+
+/// Check if a file should be downgraded based on size and type.
+/// Returns the effective media type after applying downgrade rules.
+fn apply_size_downgrade(
+    media_type: &str,
+    file_size_bytes: usize,
+    extension: Option<&str>,
+) -> &'static str {
+    let size_mb = file_size_bytes / (1024 * 1024);
+
+    // Check downgrade/rejection conditions
+    if media_type == "image" && size_mb > WECOM_MEDIA_DOWNGRADE_IMAGE_MB {
+        return "file";
+    }
+    if media_type == "voice" && size_mb > WECOM_MEDIA_DOWNGRADE_VOICE_MB {
+        return "file";
+    }
+    if media_type == "voice" && extension.is_some_and(|e| e.to_lowercase() != "amr") {
+        return "file";
+    }
+    if media_type == "video" && size_mb > WECOM_MEDIA_DOWNGRADE_IMAGE_MB {
+        return "file";
+    }
+    if media_type == "file" && size_mb > WECOM_MEDIA_MAX_FILE_MB {
+        return "rejected";
+    }
+
+    // Return the original media type as a static string
+    // This works because we only accept known types from callers
+    match media_type {
+        "image" => "image",
+        "voice" => "voice",
+        "video" => "video",
+        "file" => "file",
+        _ => "file", // Unknown types default to file
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2681,6 +3480,84 @@ mod tests {
         let chunks = split_markdown_chunks("");
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0], "");
+    }
+
+    // ── Media marker parsing tests ────────────────────────────────────
+
+    #[test]
+    fn parse_media_markers_image() {
+        let (text, m) = parse_media_markers("hi [IMAGE:/tmp/a.png] there");
+        assert_eq!(text, "hi  there");
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].media_type, "image");
+        assert_eq!(m[0].path, "/tmp/a.png");
+    }
+
+    #[test]
+    fn parse_media_markers_file_and_document_both_become_file() {
+        let (text, m) = parse_media_markers("a [FILE:/f.pdf] b [DOCUMENT:/d.docx] c");
+        assert_eq!(text, "a  b  c");
+        assert_eq!(m.len(), 2);
+        assert!(m.iter().all(|x| x.media_type == "file"));
+    }
+
+    #[test]
+    fn parse_media_markers_document_with_chinese_path() {
+        // Regression test for issue where [DOCUMENT:/path/with/中文.pdf] was not parsed
+        let input = "这是路由器使用报告：\n\n[DOCUMENT:/data/coclaw/.zeroclaw/agents/router/workspace/skills/view-router-reports/路由器使用报告.pdf]";
+        let (text, m) = parse_media_markers(input);
+
+        assert_eq!(m.len(), 1, "should parse one DOCUMENT marker");
+        assert_eq!(m[0].media_type, "file");
+        assert!(
+            m[0].path.contains("路由器使用报告.pdf"),
+            "path should contain Chinese filename"
+        );
+        assert!(
+            text.contains("这是路由器使用报告："),
+            "text should preserve the prefix"
+        );
+        assert!(
+            !text.contains("[DOCUMENT:"),
+            "text should not contain the marker"
+        );
+    }
+
+    #[test]
+    fn parse_media_markers_no_markers() {
+        let (text, m) = parse_media_markers("plain text");
+        assert_eq!(text, "plain text");
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn parse_media_markers_non_absolute_path_preserved() {
+        let (text, m) = parse_media_markers("[IMAGE:relative.png] hi");
+        assert!(m.is_empty());
+        assert_eq!(text, "[IMAGE:relative.png] hi");
+    }
+
+    #[test]
+    fn parse_media_markers_unknown_kind_preserved() {
+        let (text, m) = parse_media_markers("[VIDEO:/v.mp4] hi");
+        assert!(m.is_empty()); // VIDEO not in our set
+        assert_eq!(text, "[VIDEO:/v.mp4] hi");
+    }
+
+    #[test]
+    fn parse_media_markers_mixed_order() {
+        let (_text, m) = parse_media_markers("a [FILE:/1] b [IMAGE:/2] c [DOCUMENT:/3]");
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[0].path, "/1");
+        assert_eq!(m[1].path, "/2");
+        assert_eq!(m[2].path, "/3");
+    }
+
+    #[test]
+    fn filter_media_markers_strips() {
+        assert_eq!(filter_media_markers("a [IMAGE:/x] b"), "a  b");
+        assert_eq!(filter_media_markers("plain"), "plain");
+        assert_eq!(filter_media_markers(""), "");
     }
 
     #[test]
