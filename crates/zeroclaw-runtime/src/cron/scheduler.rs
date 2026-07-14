@@ -365,23 +365,55 @@ async fn skip_missed_jobs_on_startup(config: &Config) {
 pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
     use zeroclaw_log::Instrument;
     let Some(agent_alias) = resolve_owning_agent(config, job) else {
-        return (
-            false,
-            format!(
-                "cron job {id:?} has no owning agent; add the alias to an [agents.<x>].cron_jobs list",
-                id = job.id
-            ),
+        let output = format!(
+            "cron job {id:?} has no owning agent; add the alias to an [agents.<x>].cron_jobs list",
+            id = job.id
         );
+        return (false, render_job_output(job, false, output));
     };
     let agent_alias = agent_alias.to_string();
     let security = match SecurityPolicy::for_agent(config, &agent_alias) {
         Ok(s) => s,
-        Err(e) => return (false, format!("agent {agent_alias} risk profile: {e}")),
+        Err(e) => {
+            let output = format!("agent {agent_alias} risk profile: {e}");
+            return (false, render_job_output(job, false, output));
+        }
     };
     let span = zeroclaw_log::attribution_span!(job);
-    Box::pin(execute_job_with_retry(config, &security, &agent_alias, job))
+    let (success, output) = Box::pin(execute_job_with_retry(config, &security, &agent_alias, job))
         .instrument(span)
-        .await
+        .await;
+    (success, render_job_output(job, success, output))
+}
+
+fn render_job_output(job: &CronJob, success: bool, output: String) -> String {
+    if !matches!(job.job_type, JobType::Shell) {
+        return output;
+    }
+
+    if success {
+        let output = output.trim();
+        return if output.is_empty() {
+            crate::i18n::get_required_cli_string("cron-shell-command-succeeded-no-output")
+        } else {
+            output.to_string()
+        };
+    }
+
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "job_id": job.id,
+                "agent_alias": job.agent_alias,
+                "error_key": "cron.shell.command_failed",
+                "diagnostic": zeroclaw_providers::sanitize_api_error(&output),
+            })),
+        "Cron shell command failed"
+    );
+
+    crate::i18n::get_required_cli_string("cron-shell-command-failed")
 }
 
 fn cron_agent_run_security_policy(base: &SecurityPolicy, job: &CronJob) -> SecurityPolicy {
@@ -513,6 +545,7 @@ async fn execute_and_persist_job(
     let (success, output) = Box::pin(execute_job_with_retry(config, security, agent_alias, job))
         .instrument(span)
         .await;
+    let output = render_job_output(job, success, output);
     let finished_at = Utc::now();
     let success = Box::pin(persist_job_result(
         config,
@@ -1008,6 +1041,24 @@ async fn run_job_command_with_timeout(
         Ok(Ok(output)) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
+            if output.status.success() {
+                let stderr = stderr.trim();
+                if !stderr.is_empty() {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_attrs(::serde_json::json!({
+                                "job_id": job.id,
+                                "agent_alias": job.agent_alias,
+                                "error_key": "cron.shell.command_warning",
+                                "diagnostic": zeroclaw_providers::sanitize_api_error(stderr),
+                            })),
+                        "Cron shell command completed with stderr output"
+                    );
+                }
+                return (true, stdout.trim().to_string());
+            }
             let combined = format!(
                 "status={}\nstdout:\n{}\nstderr:\n{}",
                 output.status,
@@ -1057,7 +1108,7 @@ fn build_cron_shell_command(
 mod tests {
     use super::*;
     use crate::cron::{self, DeliveryConfig};
-    use crate::security::SecurityPolicy;
+    use crate::security::{AutonomyLevel, SecurityPolicy};
     use chrono::{Duration as ChronoDuration, Utc};
     use tempfile::TempDir;
     use zeroclaw_config::schema::Config;
@@ -1249,8 +1300,7 @@ mod tests {
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(success);
-        assert!(output.contains("scheduler-ok"));
-        assert!(output.contains("status=exit status: 0"));
+        assert_eq!(output, "scheduler-ok");
     }
 
     #[tokio::test]
@@ -1264,6 +1314,126 @@ mod tests {
         assert!(!success);
         assert!(output.contains("definitely_missing_file_for_scheduler_test"));
         assert!(output.contains("status=exit status:"));
+    }
+
+    #[tokio::test]
+    async fn execute_job_now_hides_shell_failure_diagnostics() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.reliability.scheduler_retries = 0;
+        let risk_profile = config.risk_profiles.entry(TEST_AGENT.into()).or_default();
+        risk_profile.level = AutonomyLevel::Full;
+        risk_profile.allowed_commands = vec!["sh".into()];
+        let job = test_job("sh skills/wecom-leak-repro/scripts/missing.sh");
+
+        let (success, output) = execute_job_now(&config, &job).await;
+
+        assert!(!success);
+        assert_eq!(
+            output,
+            crate::i18n::get_required_cli_string("cron-shell-command-failed")
+        );
+        assert!(!output.contains("wecom-leak-repro"));
+        assert!(!output.contains("status="));
+        assert!(!output.contains("stderr:"));
+    }
+
+    #[tokio::test]
+    async fn execute_job_now_shell_success_returns_only_stdout() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = test_job("echo public-output");
+
+        let (success, output) = execute_job_now(&config, &job).await;
+
+        assert!(success);
+        assert_eq!(output, "public-output");
+        assert!(!output.contains("status="));
+        assert!(!output.contains("stderr:"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_shell_success_logs_stderr_without_exposing_it() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        let risk_profile = config.risk_profiles.entry(TEST_AGENT.into()).or_default();
+        risk_profile.level = AutonomyLevel::Full;
+        risk_profile.allowed_commands = vec!["sh".into()];
+        tokio::fs::write(
+            config.data_dir.join("warning.sh"),
+            "printf 'public-output'\nprintf 'internal-warning' >&2\n",
+        )
+        .await
+        .unwrap();
+        let job = test_job("sh warning.sh");
+        let security = test_security(&config);
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut logs = zeroclaw_log::subscribe_or_install();
+        while logs.try_recv().is_ok() {}
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+
+        assert!(success);
+        assert_eq!(output, "public-output");
+        assert!(!output.contains("internal-warning"));
+        let warning = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match logs.recv().await {
+                    Ok(event)
+                        if event
+                            .pointer("/attributes/error_key")
+                            .and_then(|v| v.as_str())
+                            == Some("cron.shell.command_warning") =>
+                    {
+                        break event;
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        panic!("log stream closed before command warning was recorded");
+                    }
+                }
+            }
+        })
+        .await
+        .expect("command warning should be recorded");
+        assert_eq!(
+            warning
+                .pointer("/attributes/diagnostic")
+                .and_then(|v| v.as_str()),
+            Some("internal-warning")
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_shell_failure_persists_only_safe_output() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.reliability.scheduler_retries = 0;
+        let job = cron::add_job(
+            &config,
+            TEST_AGENT,
+            "*/5 * * * *",
+            "ls definitely_missing_file_for_persisted_cron_test",
+        )
+        .unwrap();
+        let security = test_security(&config);
+        let component = unique_component("persisted-shell-failure");
+
+        let (_, success, output) =
+            execute_and_persist_job(&config, &security, TEST_AGENT, &job, &component).await;
+
+        assert!(!success);
+        assert_eq!(
+            output,
+            crate::i18n::get_required_cli_string("cron-shell-command-failed")
+        );
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        let persisted = runs[0].output.as_deref().unwrap_or_default();
+        assert_eq!(persisted, output);
+        assert!(!persisted.contains("definitely_missing_file_for_persisted_cron_test"));
+        assert!(!persisted.contains("status="));
+        assert!(!persisted.contains("stderr:"));
     }
 
     #[tokio::test]
@@ -2133,7 +2303,7 @@ mod tests {
         assert_eq!(event["type"], "cron_result");
         assert_eq!(event["job_id"], "test-job");
         assert_eq!(event["success"], true);
-        assert!(event["output"].as_str().unwrap().contains("broadcast-ok"));
+        assert_eq!(event["output"], "broadcast-ok");
         assert!(event["timestamp"].as_str().is_some());
     }
 
@@ -2141,6 +2311,7 @@ mod tests {
     async fn broadcast_sends_cron_result_on_failure() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
+        config.reliability.scheduler_retries = 0;
         let job = test_job("ls definitely_missing_file_for_broadcast_fail_test");
         config
             .agents
@@ -2159,6 +2330,16 @@ mod tests {
         assert_eq!(event["type"], "cron_result");
         assert_eq!(event["job_id"], "test-job");
         assert_eq!(event["success"], false);
+        assert_eq!(
+            event["output"],
+            crate::i18n::get_required_cli_string("cron-shell-command-failed")
+        );
+        assert!(
+            !event["output"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("definitely_missing_file_for_broadcast_fail_test")
+        );
         assert!(event["timestamp"].as_str().is_some());
     }
 

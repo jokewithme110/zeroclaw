@@ -513,6 +513,9 @@ cli-cron-cmd3 = {"  "}Cmd      : {$v}
 cli-cron-at = {"  "}At    : {$v}
 cli-cron-at2 = {"  "}At  : {$v}
 cli-cron-every = {"  "}Every(ms): {$v}
+cron-shell-command-succeeded-no-output = The scheduled command completed successfully.
+cron-shell-command-failed = The scheduled command failed. Check the server logs for details.
+cron-shell-command-blocked = The scheduled command was blocked by security policy. Check the server logs for details.
 
 # ── main / status / quickstart / pairing / desktop ──
 cli-no-command = No command provided.
