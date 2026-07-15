@@ -1,0 +1,709 @@
+locale = "en"
+schema_version = 3
+
+# -----------Provider配置 Start-----------------
+# Provider的配置信息，该配置可供Agent引用
+# `doubao`: provider提供商名
+#
+[providers.models.doubao.local_custom]
+api_key = "xxxxx"
+model = "deepseek-v4-flash-260425"
+uri = "http://localhost:8888"
+temperature = 0.3
+timeout_secs = 180
+
+[providers.models.doubao.remote]
+api_key = "xxxxx"
+model = "deepseek-v4-flash-260425"
+temperature = 0.3
+timeout_secs = 180
+ 
+# -----------Provider配置 End------------------
+
+# -----------Agent Skill Bundles Start---------
+# 配置agent额外绑定的skill路径, 默认会在工作目录下的shared/skills/[common]生成目录，
+# skill放在此处agent可进行引用
+[skill_bundles.common]
+
+# -----------Agent Skill Bundles End---------
+
+# -----------Agent Config Start---------------
+#  配置领域agent，可绑定channel进行消息处理
+# `channels`: 哪些channel的消息由此agent进行处理
+# 
+[agents.movie_agent]
+channels = ["webchat.default","lark.default","wecom_ws.default"]
+max_tool_iterations = 25
+model_provider = "doubao.remote"
+risk_profile = "common"
+runtime_profile = "default"
+skill_bundles = ["common"]
+identity = { format = "openclaw"}
+
+# generic agent
+[agents.generic_agent]
+channels = ["qq.default"]
+max_tool_iterations = 25
+model_provider = "doubao.local_custom"
+risk_profile = "common"
+runtime_profile = "default"
+identity = { format = "openclaw"}
+skill_bundles = ["common"]
+
+[agents.haobai_agent]
+max_tool_iterations = 25
+model_provider = "doubao.local_custom"
+risk_profile = "common"
+runtime_profile = "default"
+skill_bundles = ["common"]
+
+
+[agents.router_agent]
+model_provider = "doubao.local_custom"
+risk_profile = "common"
+runtime_profile = "default"
+skill_bundles = ["common"]
+
+# -----------Agent Config End---------------
+
+# -----------Channels Config Start---------------
+# 配置消息渠道
+#
+[channels]
+ack_reactions = true
+cli = true
+debounce_ms = 0
+message_timeout_secs = 300
+session_backend = "jsonl"
+session_persistence = true
+session_ttl_hours = 3
+show_tool_calls = false
+
+[channels.qq.default]
+app_id = "xxxx"
+app_secret = "xxxxx"
+enabled = true
+
+#[channels.webchat.default]
+#port = 42618
+#listen_path = "/response"
+#support_reasoning = true
+
+# [channels.lark.default]
+# enabled = true
+# app_id = "xxxxx"
+# app_secret = "xxxxx"
+# encrypt_key = "xxxxx"
+# verification_token = "xxxxx"
+# allowed_users = ["*"]
+# use_feishu = true
+# receive_mode = "websocket"
+# mention_only = false
+# stream_mode = "partial"
+# draft_update_interval_ms = 50
+# approval_timeout_secs = 5
+
+# [channels.wecom_ws.default]
+# enabled = true
+# bot_id = "aibtzCRDebVL-xxxxxxxx"
+# secret = "xxxxxxx|cVgErte4EgGR"
+# allowed_users = ["*"]  # 允许的用户 ID 列表，"*" 表示允许所有
+# allowed_groups = ["*"]         # 允许的群聊 ID 列表，"*" 表示允许所有
+# stream_mode = "partial"             # 流模式：partial/full（可选，默认 partial）
+# draft_update_interval_ms = 1000     # 草稿更新间隔（可选）
+# file_retention_days = 7             # 文件保留天数（可选，默认 7）
+# max_file_size_mb = 20               # 最大文件大小 MB（可选，默认 20）
+# proxy_url = "" # 代理 URL（可选）
+# excluded_tools = []                 # 排除的工具列表（可选）
+
+
+[peer_groups.qq_default]
+agents = ["generic_agent"]
+channel = "qq"
+external_peers = ["*"]
+
+[peer_groups.lark_default]
+agents = ["generic_agent"]
+channel = "lark"
+external_peers = ["*"]
+
+# -----------Channels Config End---------------
+
+[backup]
+compress = true
+destination_dir = "state/backups"
+enabled = true
+encrypt = false
+include_dirs = [
+    "config",
+    "memory",
+    "audit",
+    "knowledge",
+]
+max_keep = 10
+
+[browser]
+allowed_domains = ["*"]
+backend = "agent_browser"
+enabled = true
+native_headless = true
+native_webdriver_url = "http://127.0.0.1:9515"
+
+[browser.computer_use]
+allow_remote_endpoint = false
+endpoint = "http://127.0.0.1:8787/v1/actions"
+timeout_ms = 15000
+window_allowlist = []
+
+[browser_delegate]
+allowed_domains = []
+blocked_domains = []
+chrome_profile_dir = ""
+cli_binary = "claude"
+enabled = false
+task_timeout_secs = 120
+
+[claude_code]
+enabled = false
+
+[claude_code_runner]
+enabled = false
+
+[cloud_ops]
+cost_threshold_monthly_usd = 100.0
+default_cloud = "aws"
+enabled = false
+iac_tools = ["terraform"]
+supported_clouds = [
+    "aws",
+    "azure",
+    "gcp",
+]
+well_architected_frameworks = ["aws-waf"]
+
+[codex_cli]
+enabled = false
+
+[composio]
+enabled = false
+entity_id = "default"
+
+[cost]
+allow_override = false
+daily_limit_usd = 10.0
+enabled = true
+monthly_limit_usd = 100.0
+warn_at_percent = 80
+
+[cost.enforcement]
+mode = "warn"
+reserve_percent = 10
+
+[cron.heartbeat_ping]
+command = "curl -fsS https://uptime.example.com/ping"
+enabled = true
+job_type = "shell"
+
+[cron.heartbeat_ping.schedule]
+every_ms = 60000
+kind = "every"
+
+[cron.morning_briefing]
+enabled = false
+job_type = "agent"
+model = "gpt-4o-mini"
+name = "Morning briefing"
+prompt = "Summarize overnight events."
+session_target = "isolated"
+
+[cron.morning_briefing.schedule]
+expr = "0 7 * * *"
+kind = "cron"
+tz = "UTC"
+
+[data_retention]
+categories = []
+dry_run = false
+enabled = false
+retention_days = 90
+
+[delegate]
+agentic_timeout_secs = 300
+timeout_secs = 120
+
+# [[embedding_routes]]
+# dimensions = 1536
+# hint = "default"
+# model = "text-embedding-3-small"
+# model_provider = "openai.default"
+
+# -----------Gateway Config Start---------------
+# 网关配置
+[gateway]
+allow_public_bind = false
+host = "127.0.0.1"
+idempotency_max_keys = 10000
+idempotency_ttl_secs = 300
+pair_rate_limit_per_minute = 10
+paired_tokens = []
+port = 42617
+rate_limit_max_keys = 10000
+require_pairing = false
+session_persistence = true
+session_ttl_hours = 0
+trust_forwarded_headers = false
+webhook_rate_limit_per_minute = 60
+
+#[gateway.node_control]
+#enabled = true
+#allowed_node_ids = []
+
+#[gateway.a2a]
+#enabled = false
+#stream_enabled = true
+#auth_enabled = false
+#skills = []
+#agent_skills = []
+
+[gateway.pairing_dashboard]
+code_length = 8
+code_ttl_secs = 3600
+lockout_secs = 300
+max_failed_attempts = 5
+max_pending_codes = 3
+
+# -----------Gateway Config End---------------
+
+[gemini_cli]
+enabled = false
+
+[google_workspace]
+allowed_operations = []
+allowed_services = []
+audit_log = false
+enabled = false
+rate_limit_per_minute = 60
+timeout_secs = 30
+
+[hardware]
+enabled = false
+transport = "None"
+
+[heartbeat]
+agent = "generic_agent"
+enabled = false
+interval_minutes = 30
+two_phase = true
+
+[hooks]
+enabled = true
+
+[hooks.builtin]
+command_logger = false
+
+[hooks.builtin.webhook_audit]
+enabled = false
+include_args = false
+max_args_bytes = 4096
+tool_patterns = []
+url = ""
+
+[hooks.builtin.custom_prompt]
+enabled = false
+target_agent = "generic_agent"     
+prompt_template_path = "system_prompt.md" 
+skill_allowlist = []              
+
+[http_request]
+allow_private_hosts = false
+allowed_domains = ["*"]
+enabled = true
+max_response_size = 1000000
+timeout_secs = 30
+
+[image_gen]
+enabled = false
+
+[jira]
+allowed_actions = ["get_ticket"]
+api_token = ""
+base_url = ""
+email = ""
+enabled = false
+timeout_secs = 30
+
+[knowledge]
+auto_capture = false
+cross_workspace_search = false
+db_path = "knowledge.db"
+enabled = false
+max_nodes = 100000
+suggest_on_query = true
+
+[link_enricher]
+enabled = false
+max_links = 3
+timeout_secs = 10
+
+[linkedin]
+enabled = false
+
+[mcp]
+
+[media_pipeline]
+describe_images = true
+enabled = false
+summarize_video = true
+transcribe_audio = true
+
+[memory]
+archive_after_days = 7
+audit_enabled = false
+audit_retention_days = 30
+auto_hydrate = true
+auto_save = true
+backend = "markdown"
+chunk_max_tokens = 512
+conflict_threshold = 0.85
+conversation_retention_days = 30
+default_namespace = "default"
+embedding_cache_size = 10000
+embedding_dimensions = 1536
+embedding_model = "text-embedding-3-small"
+embedding_provider = "none"
+fts_early_return_score = 0.85
+hygiene_enabled = true
+keyword_weight = 0.3
+min_relevance_score = 0.4
+purge_after_days = 30
+rerank_enabled = false
+rerank_threshold = 5
+response_cache_enabled = false
+response_cache_hot_entries = 256
+response_cache_max_entries = 5000
+response_cache_ttl_minutes = 60
+retrieval_stages = [
+    "cache",
+    "fts",
+    "vector",
+]
+search_mode = "hybrid"
+snapshot_enabled = false
+snapshot_on_hygiene = false
+vector_weight = 0.7
+
+[memory.policy]
+max_entries_per_category = 0
+max_entries_per_namespace = 0
+read_only_namespaces = []
+
+[microsoft365]
+auth_flow = "client_credentials"
+enabled = false
+scopes = ["https://graph.microsoft.com/.default"]
+token_cache_encrypted = true
+
+[multimodal]
+allow_remote_fetch = false
+max_image_size_mb = 5
+max_images = 4
+
+[node_transport]
+allowed_peers = []
+connection_pool_size = 4
+enabled = true
+max_request_age_secs = 300
+mutual_tls = false
+require_https = true
+shared_secret = ""
+
+[nodes]
+
+[notion]
+api_key = ""
+database_id = ""
+enabled = false
+input_property = "Input"
+max_concurrent = 4
+poll_interval_secs = 5
+recover_stale = true
+result_property = "Result"
+status_property = "Status"
+
+[observability]
+backend = "otel"
+otel_endpoint = "http://localhost:4318"
+otel_service_name = "zeroclaw-fixture"
+runtime_trace_max_entries = 200
+runtime_trace_mode = "rolling"
+runtime_trace_path = "state/runtime-trace.jsonl"
+
+[opencode_cli]
+enabled = false
+
+[pacing]
+loop_detection_enabled = true
+loop_detection_max_repeats = 3
+loop_detection_window_size = 20
+loop_ignore_tools = []
+
+
+[peripherals]
+
+[pipeline]
+allowed_tools = []
+enabled = false
+max_steps = 20
+
+[plugins]
+enabled = false
+native_paths = ["/home/dev_code/AIOS/dt_aios/dynamic-plugins"]
+
+[project_intel]
+default_language = "en"
+enabled = false
+include_git_data = true
+include_jira_data = false
+report_output_dir = "~/.zeroclaw/project-reports"
+risk_sensitivity = "medium"
+
+
+[proxy]
+
+[query_classification]
+enabled = false
+rules = []
+
+[reliability]
+api_keys = []
+channel_initial_backoff_secs = 2
+channel_max_backoff_secs = 60
+provider_backoff_ms = 500
+provider_retries = 2
+scheduler_poll_secs = 15
+scheduler_retries = 2
+
+
+# -----------Risk Config Start---------------
+# 风险配置模块，可控制Agent的工具使用情况
+[risk_profiles.common]
+allowed_tools = [
+
+]
+excluded_tools = [
+  "skill_scan_report",
+  "a2a_client",
+  "glob_search",
+  "content_search",
+  "memory_store",
+  "memory_recall",
+  "memory_forget",
+  "memory_export",
+  "memory_purge",
+  "schedule",
+  "spawn_subagent",
+  "send_message_to_peer",
+  "model_routing_config",
+  "model_switch",
+  "proxy_config",
+  "git_operations",
+  "pushover",
+  "calculator",
+  "weather",
+  "canvas",
+  "llm_task",
+  "browser_open",
+  "browser",
+  "web_fetch",
+  "web_search_tool",
+  "backup",
+  "screenshot",
+  "image_info",
+  "sessions_current",
+  "sessions_list",
+  "sessions_history",
+  "sessions_send",
+  "poll",
+  "reaction",
+  "ask_user",
+  "escalate_to_human",
+  "channel_send",
+  "delegate"
+]
+auto_approve = ["http_request","nodes"]
+
+[risk_profiles.default]
+allowed_commands = [
+    "ls",
+    "git",
+    "cat",
+]
+allowed_roots = ["~/workspace"]
+always_ask = []
+auto_approve = ["weather"]
+block_high_risk_commands = true
+excluded_tools = ["browser"]
+forbidden_paths = [
+    "/etc",
+    "/root",
+]
+level = "supervised"
+require_approval_for_medium_risk = true
+shell_env_passthrough = [
+    "PATH",
+    "HOME",
+]
+workspace_only = true
+
+# -----------Risk Config Start---------------
+
+# -----------Runtime Config Start------------
+# 运行时配置，主要控制agent运行时的一些参数
+[runtime]
+kind = "native"
+reasoning_effort = "minimal"
+reasoning_enabled = false
+
+[runtime.docker]
+allowed_workspace_roots = []
+cpu_limit = 1.0
+image = "alpine:3.20"
+memory_limit_mb = 512
+mount_workspace = true
+network = "none"
+read_only_rootfs = true
+
+
+[runtime_profiles.default]
+compact_context = true
+context_aware_tools = false
+keep_tool_context_turns = 5
+max_actions_per_hour = 100
+max_context_tokens = 32000
+max_cost_per_day_cents = 1000
+max_history_messages = 50
+max_system_prompt_chars = 0
+max_tool_iterations = 10
+max_tool_result_chars = 50000
+parallel_tools = true
+shell_timeout_secs = 60
+tool_call_dedup_exempt = []
+tool_dispatcher = "auto"
+
+# -----------Runtime Config End---------------
+
+[scheduler]
+catch_up_on_startup = true
+enabled = true
+max_concurrent = 4
+max_run_history = 50
+max_tasks = 64
+
+[secrets]
+encrypt = true
+
+[security]
+
+[security_ops]
+auto_triage = false
+enabled = false
+max_auto_severity = "low"
+playbooks_dir = "~/.zeroclaw/playbooks"
+report_output_dir = "~/.zeroclaw/security-reports"
+require_approval_for_actions = true
+
+[shell_tool]
+timeout_secs = 60
+
+
+[skills]
+allow_scripts = false
+open_skills_enabled = false
+prompt_injection_mode = "compact"
+
+[skills.skill_creation]
+enabled = false
+max_skills = 500
+similarity_threshold = 0.85
+
+[skills.skill_improvement]
+cooldown_secs = 3600
+enabled = true
+
+[skills.scan]
+enabled = false
+startup_scan = true
+periodic_scan_enabled = true
+interval_secs = 20
+poll_interval_secs = 10
+poll_timeout_secs = 300
+max_allowed_severity = "LOW"
+
+[skills.scan.api]
+upload_url = "https://skillscan.tokauth.com/oapi/v1/skill-scan/upload"
+result_url = "https://skillscan.tokauth.com/oapi/v1/skill-scan/result"
+
+
+# [skills.retrieval]
+# enabled = false
+# max_results = 2
+# similarity_threshold_high = 0.8
+# similarity_threshold_low = 0.7
+# keyword_match_threshold = 0.9
+# strategy = "vectoronly"
+
+# [skills.retrieval.embedding_provider]
+# provider = "custom:https://maas-apigateway.dt.zte.com.cn/model/zte-dmt-bge-vector/bge-m3"
+# api_key = "5c9d02e14ed84eef8b634e4500debc01"
+# model = "bge_m3"
+# dimensions = 1024
+# timeout_secs = 30
+
+[sop]
+
+[storage.qdrant.default]
+collection = "zeroclaw_memories"
+url = "http://127.0.0.1:6333"
+
+[text_browser]
+enabled = false
+timeout_secs = 30
+
+[transcription]
+
+[trust]
+
+[tts]
+
+[tunnel]
+tunnel_provider = "none"
+
+[verifiable_intent]
+
+[web_fetch]
+allowed_domains = ["*"]
+allowed_private_hosts = []
+blocked_domains = []
+enabled = true
+max_response_size = 500000
+timeout_secs = 30
+
+[web_fetch.firecrawl]
+api_key_env = "FIRECRAWL_API_KEY"
+api_url = "https://api.firecrawl.dev/v1"
+enabled = false
+mode = "scrape"
+
+[web_search]
+enabled = true
+max_results = 5
+search_provider = "duckduckgo"
+timeout_secs = 15
+
+[workspace]
+cross_workspace_search = false
+enabled = false
+isolate_audit = true
+isolate_memory = true
+isolate_secrets = true
+workspaces_dir = "/home/0668001438/.zeroclaw/workspace"
